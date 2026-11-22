@@ -257,9 +257,9 @@ pub struct Spu {
     /// 512): CD audio left and right, voices 1 and 3, written to RAM at
     /// 0x000, 0x400, 0x800 and 0xC00 as they play (games read them, and
     /// set the IRQ address there: CTR fades its music on that interrupt).
-    /// Not in save states.
+    /// Saved apart (`crate::Timing`).
     #[serde(skip)]
-    capture: u32,
+    pub(crate) capture: u32,
 }
 
 impl Default for Spu {

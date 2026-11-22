@@ -43,9 +43,10 @@ pub struct Bus {
     pub pending: u32,
     /// A GPU command list transferred, its transfer ending when the GPU
     /// has drawn all but its last commands (see `tick`): the drawing they
-    /// leave. Not in save states: restored, it ends at once (`settle`).
+    /// leave. Saved apart (`crate::Timing`); older states end it at once
+    /// (`settle`).
     #[serde(skip)]
-    gpu_list: Option<u64>,
+    pub(crate) gpu_list: Option<u64>,
     pub irq: Irq,
     pub dma: Dma,
     pub timers: Timers,
@@ -377,8 +378,9 @@ impl Bus {
     }
 
     /// Advances every peripheral by `cycles` CPU cycles.
-    /// After a state is restored: a command list's transfer that was
-    /// waiting for its drawing ends (the drawing time is not saved).
+    /// After a state of an older format is restored: a command list's
+    /// transfer that was waiting for its drawing ends (their drawing time
+    /// was not saved).
     pub fn settle(&mut self) {
         let gpu = self.dma.channel(Port::Gpu);
         if gpu.busy() && gpu.sync_mode() == 2 && self.dma.finish(Port::Gpu) {
