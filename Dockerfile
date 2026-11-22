@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1.28.0@sha256:bb22d9815c728170f72750f4e5b0d672e06176142e1d602c7e66c050100b7e5b
+# syntax=docker/dockerfile:1.29.0@sha256:572cebbc2b15e6f84c077742952674889cb63cd5e9b80abdffcbe587b6f19183
 
 # All images are pinned by multi-arch index digest; Renovate keeps them up
 # to date.
@@ -32,7 +32,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     done
 
 # --- The web app -----------------------------------------------------------
-FROM docker.io/library/node:26.9.0-alpine3.24@sha256:dbaa92e5758cbbcf85d65d5403fdb530fe3442cbe8c6dbfb7ef23365450d5070 AS web
+FROM docker.io/library/node:26.13.1-alpine3.24@sha256:6bd9ab43c0ec0190ca7b2d193906cb8b7edf6e7f4afa43ddeccd6452710bffb5 AS web
 
 WORKDIR /src/frontend
 COPY frontend/package.json frontend/pnpm-lock.yaml ./
