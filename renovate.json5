@@ -1,0 +1,121 @@
+// Renovate configuration: https://docs.renovatebot.com/configuration-options/
+{
+  $schema: "https://docs.renovatebot.com/renovate-schema.json",
+  extends: [
+    "config:recommended",
+    // Keep GitHub Actions pinned by commit SHA, with the version as comment.
+    "helpers:pinGitHubActionDigests",
+  ],
+
+  timezone: "Europe/Paris",
+  schedule: ["* 0-5 * * *"],
+  automergeSchedule: ["* 0-5 * * *"],
+  prHourlyLimit: 0,
+  prConcurrentLimit: 10,
+
+  // Everything but majors merges itself once the required checks pass.
+  automerge: true,
+  platformAutomerge: true,
+  automergeStrategy: "squash",
+  // Let fresh releases settle before they are proposed.
+  minimumReleaseAge: "3 days",
+
+  semanticCommits: "enabled",
+  // Cargo.lock, pnpm-lock.yaml and flake.lock.
+  lockFileMaintenance: {
+    enabled: true,
+    schedule: ["* 0-5 * * *"],
+  },
+  nix: { enabled: true },
+  vulnerabilityAlerts: {
+    labels: ["security"],
+    schedule: ["at any time"],
+    minimumReleaseAge: null,
+  },
+
+  packageRules: [
+    {
+      description: "Majors are reviewed by hand.",
+      matchUpdateTypes: ["major"],
+      automerge: false,
+      labels: ["major"],
+    },
+    {
+      description: "In Cargo, a 0.x minor bump (0.8 -> 0.9) is semver-incompatible: treat it as a major.",
+      matchManagers: ["cargo"],
+      matchCurrentVersion: "<1.0.0",
+      matchUpdateTypes: ["minor"],
+      automerge: false,
+      labels: ["major"],
+    },
+    {
+      description: "wasm-bindgen must match wasm-bindgen-cli_0_2_* in flake.nix exactly: update both by hand.",
+      matchManagers: ["cargo"],
+      matchPackageNames: ["wasm-bindgen"],
+      automerge: false,
+      labels: ["manual"],
+    },
+    {
+      description: "Raise Cargo.toml requirements, not only Cargo.lock.",
+      matchManagers: ["cargo"],
+      rangeStrategy: "bump",
+    },
+    {
+      groupName: "Rust crates (non-major)",
+      matchManagers: ["cargo"],
+      matchUpdateTypes: ["minor", "patch"],
+      matchCurrentVersion: ">=1.0.0",
+    },
+    {
+      groupName: "Rust crates (0.x patch)",
+      matchManagers: ["cargo"],
+      matchUpdateTypes: ["patch"],
+      matchCurrentVersion: "<1.0.0",
+    },
+    {
+      groupName: "Rust toolchain",
+      description: "rust-toolchain.toml and the Rust build image move together.",
+      matchDepNames: ["rust", "docker.io/library/rust"],
+    },
+    {
+      groupName: "npm packages (non-major)",
+      matchManagers: ["npm"],
+      matchUpdateTypes: ["minor", "patch"],
+    },
+    {
+      groupName: "GitHub Actions",
+      matchManagers: ["github-actions"],
+      matchDepTypes: ["action"],
+      matchUpdateTypes: ["minor", "patch", "digest", "pin", "pinDigest"],
+    },
+    {
+      groupName: "Container images",
+      matchDatasources: ["docker"],
+      matchUpdateTypes: ["minor", "patch", "digest", "pin", "pinDigest"],
+    },
+    {
+      description: "The project's own image in the deployment example tracks `edge` on purpose.",
+      matchPackageNames: ["ghcr.io/sebastka/texel"],
+      enabled: false,
+    },
+  ],
+
+  customManagers: [
+    {
+      description: "Rust toolchain in rust-toolchain.toml.",
+      customType: "regex",
+      managerFilePatterns: ["/^rust-toolchain\\.toml$/"],
+      matchStrings: ['channel = "(?<currentValue>\\d+\\.\\d+\\.\\d+)"'],
+      depNameTemplate: "rust",
+      datasourceTemplate: "github-releases",
+      packageNameTemplate: "rust-lang/rust",
+    },
+    {
+      description: "yamllint version run by CI through pipx.",
+      customType: "regex",
+      managerFilePatterns: ["/^\\.github/workflows/.+\\.yaml$/"],
+      matchStrings: ["pipx run (?<depName>yamllint)==(?<currentValue>[\\d.]+)"],
+      datasourceTemplate: "pypi",
+    },
+  ],
+}

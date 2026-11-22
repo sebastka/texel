@@ -1,0 +1,592 @@
+// The emulator, in a dedicated worker: it runs frames, draws them on the
+// transferred canvas, feeds the audio ring and saves memory cards.
+
+import init, { Emulator } from "./wasm/texel_web.js";
+// Types only: the PS2's module is imported when a PS2 session starts.
+import type { Ps2Emulator } from "./wasm/texel_web_ps2.js";
+import { RING_FRAMES, Ring } from "./audio";
+import type { FromDrawer, ToDrawer } from "./draw-worker";
+import { Painter } from "./paint";
+import { Session } from "./netplay";
+import type { Axes, FromWorker, StartMessage, ToWorker } from "./protocol";
+
+const scope = self as unknown as DedicatedWorkerGlobalScope;
+const post = (msg: FromWorker) => scope.postMessage(msg);
+
+/** Audio kept queued: enough to ride out a slow frame, little latency. */
+const AUDIO_TARGET = 3 * 1024;
+const MEMCARD_SLOTS = [0, 1];
+
+let emu: Emulator | null = null;
+/** Drawing on the GPU (the PS2's GS, the PlayStation's scaled drawing):
+ * frames go to the canvas through WebGPU. */
+let gpu: { present(width: number, height: number, smooth: boolean, hidden: number): void; readonly renderer: string | undefined } | null =
+  null;
+/** The PS2's EE code is compiled to WebAssembly. */
+let compiled = false;
+/** A PS2 game's disc is in the drive (inserted by its own path). */
+let ps2Disc = false;
+let ring: Ring | null = null;
+/** Paints pictures drawn here (software, without a drawing worker). */
+let painter: Painter | null = null;
+/** The PlayStation's scaled picture drawn in another worker (see
+ * draw-worker.ts): it, whether it is ready for more, the recordings not
+ * sent yet, a screenshot awaited. */
+let drawer: Worker | null = null;
+let drawerReady = false;
+let drawings: ArrayBuffer[] = [];
+let screenshotWanted: ((b: Blob | null) => void) | null = null;
+/** Resolution: as chosen, and as drawn (lower while emulation lags). */
+let chosenScale = 1;
+let autoScale = 1;
+/** Milliseconds per frame, averaged: emulating it, drawing it elsewhere. */
+let emuMs = 0;
+let drawMs = 0;
+/** Seconds running behind (or with room to spare), and until when not to
+ * change the resolution again. */
+let behindFor = 0;
+let roomFor = 0;
+let holdUntil = 0;
+let canvas: OffscreenCanvas | null = null;
+/** The frame at its native size, scaled from there onto `canvas`. */
+let viewport = { width: 640, height: 480 };
+let smooth = false;
+let gameId: string | null = null;
+/** The game whose memory cards are inserted (and saved): `gameId`'s, or one
+ * chosen to start a console without a disc. */
+let cardsId: string | null = null;
+/** Recorded with save states, which load only with it. */
+let biosId = "";
+let paused = false;
+/** Fast-forward (not in netplay): frames back to back, no sound. */
+let fast = false;
+/** The page's audio plays (browsers wait for a click): frames follow it. */
+let audioRunning = false;
+let timer: ReturnType<typeof setTimeout> | undefined;
+let nextFrameAt = 0;
+let frames = 0;
+let statsAt = 0;
+/** Netplay session, if any. */
+let net: Session | null = null;
+/** Local controllers, applied before each frame (or sent, in netplay). */
+const local: { buttons: [number, number]; axes: [Axes, Axes] } = {
+  buttons: [0, 0],
+  axes: [
+    [128, 128, 128, 128],
+    [128, 128, 128, 128],
+  ],
+};
+
+function wsUrl(path: string): string {
+  const url = new URL(path, self.location.href);
+  url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+  return url.href;
+}
+
+function openSession(host: boolean, path: string) {
+  net?.close();
+  net = new Session(host, wsUrl(path), {
+    emu: () => emu,
+    runFrame,
+    status: (status) => post({ type: "net", status }),
+    chat: (line) => post({ type: "net-chat", line }),
+    gzip: (data, decompress = false) => compress(data, "gzip", decompress),
+    onStarted: () => draw(),
+  });
+  net.input = { buttons: local.buttons[0], axes: local.axes[0] };
+}
+
+/**
+ * Reads bytes of a disc image file. Synchronous: the core reads sectors in
+ * the middle of an instruction. Allowed in workers; the core caches chunks.
+ */
+function readFile(file: number, offset: number, length: number): Uint8Array {
+  const xhr = new XMLHttpRequest();
+  xhr.open("GET", `/api/games/${encodeURIComponent(gameId ?? "")}/files/${file}`, false);
+  xhr.responseType = "arraybuffer";
+  xhr.setRequestHeader("Range", `bytes=${offset}-${offset + length - 1}`);
+  xhr.send();
+  if (xhr.status !== 206 && xhr.status !== 200) {
+    throw new Error(`reading file ${file} at ${offset}: HTTP ${xhr.status}`);
+  }
+  const data = new Uint8Array(xhr.response as ArrayBuffer);
+  // A server ignoring Range sends the whole file.
+  return xhr.status === 200 ? data.subarray(offset, offset + length) : data;
+}
+
+async function fetchBytes(url: string): Promise<Uint8Array | null> {
+  const resp = await fetch(url, { cache: "no-store" });
+  if (resp.status === 404) return null;
+  if (!resp.ok) throw new Error(`${url}: HTTP ${resp.status}`);
+  return new Uint8Array(await resp.arrayBuffer());
+}
+
+/** The SBI file of a disc protected by LibCrypt: the subchannel data its
+ * protection checks, which disc images do not keep. */
+function fetchSbi(id: string): Promise<Uint8Array | null> {
+  return fetchBytes(`/api/games/${encodeURIComponent(id)}/sbi`);
+}
+
+/** What the PS2 runs on, for the player's status: the GS on the GPU, the
+ * EE's code compiled. */
+function renderer(): string | null {
+  const parts = [gpu ? (gpu.renderer ? `WebGPU (${gpu.renderer})` : "WebGPU") : null, compiled ? "EE compiled" : null];
+  const shown = parts.filter((p) => p !== null);
+  return shown.length > 0 ? shown.join(" · ") : null;
+}
+
+/** Whether this browser has WebGPU, with an adapter: asked before the
+ * canvas is given to it, since a canvas has one kind of context for good. */
+async function webgpu(): Promise<boolean> {
+  const gpu = (navigator as unknown as { gpu?: { requestAdapter(): Promise<unknown> } }).gpu;
+  if (!gpu) return false;
+  try {
+    return (await gpu.requestAdapter()) !== null;
+  } catch {
+    return false;
+  }
+}
+
+function gpuFailed(e: unknown): null {
+  console.warn("Drawing on the GPU failed, drawing in software:", e);
+  return null;
+}
+
+/** Netplay's hidden half, for the GPU's presentation. */
+const HIDDEN_CODES = { top: 1, bottom: 2, left: 3, right: 4 } as const;
+
+async function start(msg: StartMessage) {
+  biosId = msg.biosId;
+  const bios = await fetchBytes(`/api/bios/${encodeURIComponent(msg.biosId)}/data`);
+  if (!bios) throw new Error("BIOS not found");
+  if (msg.console === "ps2") {
+    // Its own module, with the PlayStation's interface where they overlap.
+    const ps2 = await import("./wasm/texel_web_ps2.js");
+    await ps2.default();
+    const onGpu: Ps2Emulator | null = (await webgpu()) ? await ps2.Ps2Emulator.withGpu(bios, msg.canvas).catch(gpuFailed) : null;
+    gpu = onGpu;
+    const ps2emu = onGpu ?? new ps2.Ps2Emulator(bios);
+    // The EE's code compiled to WebAssembly as it runs; interpreted if this
+    // browser will not make modules.
+    try {
+      ps2emu.setCompiler(true);
+      compiled = true;
+    } catch (e) {
+      console.warn("The EE's compiler is not available, interpreting:", e);
+    }
+    emu = ps2emu as unknown as Emulator;
+    gameId = null;
+    if (msg.gameId) {
+      // Its disc; its memory cards below, as the PlayStation's. (readFile
+      // reads the game's.)
+      gameId = msg.gameId;
+      ps2Disc = true;
+      ps2emu.insertDisc(
+        msg.cue ?? undefined,
+        msg.files.map((f) => f.name),
+        Float64Array.from(msg.files.map((f) => f.size)),
+        readFile,
+      );
+    }
+  } else {
+    await init();
+    // Scaled drawing on the GPU, where the browser has WebGPU.
+    const onGpu = (await webgpu()) ? await Emulator.withGpu(bios, msg.canvas).catch(gpuFailed) : null;
+    gpu = onGpu;
+    emu = onGpu ?? new Emulator(bios);
+    gameId = msg.gameId;
+  }
+  if (gameId && !ps2Disc) {
+    emu.insertDisc(
+      msg.cue ?? undefined,
+      msg.files.map((f) => f.name),
+      Float64Array.from(msg.files.map((f) => f.size)),
+      readFile,
+      (msg.sbi ? await fetchSbi(gameId) : undefined) ?? undefined,
+    );
+  }
+  cardsId = msg.cardsId ?? gameId;
+  // A guest gets the host's memory cards with the game's state.
+  for (const slot of msg.join ? [] : MEMCARD_SLOTS) {
+    const card = cardsId ? await fetchBytes(`/api/games/${encodeURIComponent(cardsId)}/memcards/${slot + 1}`) : null;
+    emu.insertMemoryCard(slot, card ?? undefined);
+  }
+  canvas = msg.canvas;
+  // Without the GPU, the PlayStation's scaled picture is drawn in another
+  // worker where there are cores to spare; the canvas is then its own.
+  if (!gpu && msg.console !== "ps2" && navigator.hardwareConcurrency >= 3) {
+    drawer = new Worker(new URL("./draw-worker.ts", import.meta.url), { type: "module" });
+    drawer.onmessage = (e: MessageEvent<FromDrawer>) => fromDrawer(e.data);
+    drawer.postMessage({ type: "start", canvas } satisfies ToDrawer, [canvas]);
+    emu.setDrawingElsewhere(true);
+  } else if (!gpu) {
+    // On the GPU, the canvas is WebGPU's: no 2D context.
+    painter = new Painter(canvas);
+  }
+  smooth = msg.smooth;
+  ring = msg.audio ? new Ring(msg.audio) : null;
+  chosenScale = autoScale = msg.scale;
+  emu.setResolutionScale(msg.scale);
+  post({ type: "started", pal: emu.isPal, bios: emu.biosInfo(), renderer: renderer() });
+  if (msg.join) {
+    openSession(false, `/api/netplay/join/${encodeURIComponent(msg.join.code)}?name=${encodeURIComponent(msg.join.name)}`);
+  }
+  nextFrameAt = performance.now();
+  statsAt = nextFrameAt;
+  schedule(0);
+}
+
+function schedule(ms: number) {
+  clearTimeout(timer);
+  timer = setTimeout(tick, ms);
+}
+
+/** Fast-forward runs frames for this long, then lets messages in. */
+const FAST_SLICE_MS = 15;
+
+function frameInterval(): number {
+  return 1000 / (emu?.isPal ? 49.76 : 59.83);
+}
+
+/** Runs frames as needed, paced by the audio queue when there is audio. */
+function tick() {
+  if (!emu || paused) return;
+  try {
+    const now = performance.now();
+    let ran = 0;
+    if (fast && !net) {
+      // As many frames as fit in a slice of time, then the page's turn.
+      while (performance.now() - now < FAST_SLICE_MS && advance()) ran++;
+    } else if (ring && audioRunning) {
+      // Keep the audio queue filled; the audio clock paces emulation.
+      while (ring.available() < AUDIO_TARGET && ran < 4 && advance()) ran++;
+    } else {
+      while (now >= nextFrameAt && ran < 4 && advance()) {
+        nextFrameAt += frameInterval();
+        ran++;
+      }
+      if (now - nextFrameAt > 250) nextFrameAt = now;
+    }
+    // Behind the room (the tab was hidden, or just joined): catch up.
+    while (net && net.behind > 0 && ran < 12 && advance()) ran++;
+    if (ran > 0) {
+      draw();
+      if (frames % 120 === 0) void saveMemoryCards();
+    }
+    if (now - statsAt >= 1000) {
+      post({ type: "stats", fps: (frames * 1000) / (now - statsAt), width: emu.frameWidth, height: emu.frameHeight });
+      frames = 0;
+      statsAt = now;
+      adaptScale();
+    }
+  } catch (e) {
+    post({ type: "error", message: String(e) });
+    paused = true;
+    return;
+  }
+  if (fast && !net) schedule(0);
+  else schedule(ring && audioRunning ? 4 : Math.max(0, nextFrameAt - performance.now()));
+}
+
+/** Runs the next frame, unless netplay waits for the other side's input. */
+function advance(): boolean {
+  if (net?.lockstep) return net.step();
+  if (net?.waiting) return false;
+  for (const port of [0, 1]) {
+    const a = local.axes[port]!;
+    emu?.setButtons(port, local.buttons[port]!);
+    emu?.setAxes(port, a[0], a[1], a[2], a[3]);
+  }
+  runFrame();
+  return true;
+}
+
+/** Last reported controller state, per port. */
+const padState = ["", ""];
+
+function reportPads() {
+  if (!emu) return;
+  for (const port of [0, 1]) {
+    const analog = emu.isAnalog(port);
+    const rumble = emu.rumble(port);
+    const key = `${analog}:${rumble}`;
+    if (key === padState[port]) continue;
+    padState[port] = key;
+    post({ type: "pad", port, analog, small: (rumble >> 8) / 255, large: (rumble & 0xff) / 255 });
+  }
+}
+
+function runFrame() {
+  if (!emu) return;
+  const started = performance.now();
+  emu.runFrame();
+  emuMs = emuMs * 0.9 + (performance.now() - started) * 0.1;
+  reportPads();
+  frames++;
+  const samples = emu.takeAudio();
+  // Without audio playing, samples would pile up: drop them; so does
+  // fast-forward (sound at several times its speed only crackles).
+  if (ring && audioRunning && !fast && ring.available() + samples.length / 2 < RING_FRAMES) ring.push(samples);
+}
+
+/**
+ * Draws the last frame. The canvas has the size it has on screen, in device
+ * pixels, so the browser does no scaling of its own: the scaling mode is
+ * ours (CSS `image-rendering` is not reliably applied to canvases drawn
+ * from a worker).
+ */
+function draw() {
+  if (gpu && canvas) {
+    if (canvas.width !== viewport.width || canvas.height !== viewport.height) {
+      canvas.width = viewport.width;
+      canvas.height = viewport.height;
+    }
+    const hidden = net?.hiddenHalf;
+    gpu.present(viewport.width, viewport.height, smooth, hidden ? HIDDEN_CODES[hidden] : 0);
+    return;
+  }
+  if (!emu) return;
+  const hidden = net?.hiddenHalf;
+  if (drawer) {
+    drawings.push((emu as Emulator).takeDrawing().buffer as ArrayBuffer);
+    sendDrawings();
+    return;
+  }
+  painter?.paint(emu.frame() as Uint8ClampedArray<ArrayBuffer>, emu.frameWidth, emu.frameHeight, viewport, smooth, hidden);
+}
+
+async function compress(data: Uint8Array, format: "gzip", decompress = false): Promise<Uint8Array> {
+  const stream = new Blob([data as Uint8Array<ArrayBuffer>])
+    .stream()
+    .pipeThrough(decompress ? new DecompressionStream(format) : new CompressionStream(format));
+  return new Uint8Array(await new Response(stream).arrayBuffer());
+}
+
+function stateUrl(slot: number, suffix = ""): string {
+  return `/api/games/${encodeURIComponent(gameId ?? "")}/states/${slot}${suffix}`;
+}
+
+/** Sends the drawing worker what was recorded, when it is ready for it. */
+function sendDrawings(screenshot = false) {
+  if (!drawer || !drawerReady) return;
+  drawerReady = false;
+  const sent = drawings;
+  drawings = [];
+  const msg: ToDrawer = { type: "draw", drawings: sent, viewport, smooth, hidden: net?.hiddenHalf ?? null, screenshot };
+  drawer.postMessage(msg, sent);
+}
+
+function fromDrawer(msg: FromDrawer) {
+  if (msg.type === "error") {
+    post({ type: "error", message: msg.message });
+    return;
+  }
+  drawerReady = true;
+  if (msg.ms > 0) drawMs = drawMs * 0.9 + msg.ms * 0.1;
+  if (screenshotWanted) {
+    screenshotWanted(msg.screenshot);
+    screenshotWanted = null;
+  }
+  // What was recorded meanwhile goes at once.
+  if (drawings.length > 0) sendDrawings();
+}
+
+/** The picture now, as PNG (for a save state's screenshot). */
+async function screenshot(): Promise<Blob | null> {
+  if (drawer) {
+    const shot = new Promise<Blob | null>((resolve) => (screenshotWanted = resolve));
+    // When the drawing worker is busy, the next round asks for it.
+    if (drawerReady) sendDrawings(true);
+    else drawings.push(new ArrayBuffer(0));
+    return shot;
+  }
+  return painter ? painter.picture.convertToBlob({ type: "image/png" }) : null;
+}
+
+/** Each second: lowers the resolution while emulation (or drawing) lags
+ * behind the console's pace, and raises it back, up to the one chosen,
+ * once there is clearly room for it. */
+function adaptScale() {
+  if (!emu || gpu || fast || paused) return;
+  const budget = 1000 / (emu.isPal ? 50 : 60);
+  const behind = emuMs > 0.9 * budget || drawMs > budget;
+  behindFor = behind ? behindFor + 1 : 0;
+  const now = performance.now();
+  if (behindFor >= 2 && autoScale > 1 && now >= holdUntil) {
+    setAutoScale(autoScale - 1);
+    holdUntil = now + 5000;
+    return;
+  }
+  // The next resolution's cost, guessed: drawing grows with its pixels;
+  // emulation does not when drawing is elsewhere.
+  const growth = ((autoScale + 1) / autoScale) ** 2;
+  const next = drawer ? Math.max(emuMs, drawMs * growth) : emuMs * growth;
+  roomFor = autoScale < chosenScale && next < 0.6 * budget ? roomFor + 1 : 0;
+  if (roomFor >= 10 && now >= holdUntil) {
+    setAutoScale(autoScale + 1);
+    roomFor = 0;
+    holdUntil = now + 15000;
+  }
+}
+
+function setAutoScale(scale: number) {
+  autoScale = scale;
+  emu?.setResolutionScale(scale);
+  emuMs = 0;
+  drawMs = 0;
+  post({ type: "auto-scale", scale, chosen: chosenScale });
+}
+
+async function saveState(slot: number) {
+  if (!emu || !gameId) return;
+  // Taken between frames, so the state and the screenshot match (the
+  // PS2's is a promise, its GS memory read back from the GPU).
+  const state = await emu.saveState();
+  const shot = await screenshot();
+  const body = await compress(state, "gzip");
+  const resp = await fetch(`${stateUrl(slot)}?bios=${encodeURIComponent(biosId)}`, {
+    method: "PUT",
+    body: body as Uint8Array<ArrayBuffer>,
+  });
+  if (!resp.ok) throw new Error(`saving the state: HTTP ${resp.status} ${await resp.text()}`);
+  if (shot) await fetch(stateUrl(slot, "/screenshot"), { method: "PUT", body: shot });
+  post({ type: "state-saved", slot });
+}
+
+async function loadState(slot: number) {
+  if (!emu || !gameId) return;
+  const resp = await fetch(stateUrl(slot), { cache: "no-store" });
+  if (!resp.ok) throw new Error(resp.status === 404 ? `slot ${slot} is empty` : `loading the state: HTTP ${resp.status}`);
+  const state = await compress(new Uint8Array(await resp.arrayBuffer()), "gzip", true);
+  emu.loadState(state);
+  draw();
+  post({ type: "state-loaded", slot });
+}
+
+async function saveMemoryCards() {
+  // The host keeps the saves: a guest's cards are copies.
+  if (!emu || !cardsId || (net && !net.isHost)) return;
+  for (const slot of MEMCARD_SLOTS) {
+    const data = emu.takeWrittenMemoryCard(slot);
+    if (!data) continue;
+    const resp = await fetch(`/api/games/${encodeURIComponent(cardsId)}/memcards/${slot + 1}`, {
+      method: "PUT",
+      body: data as Uint8Array<ArrayBuffer>,
+    });
+    if (resp.ok) post({ type: "saved", slot });
+    else post({ type: "error", message: `saving memory card ${slot + 1}: HTTP ${resp.status}` });
+  }
+}
+
+scope.onmessage = (e: MessageEvent<ToWorker>) => {
+  const msg = e.data;
+  switch (msg.type) {
+    case "start":
+      start(msg).catch((err: unknown) => post({ type: "error", message: String(err) }));
+      break;
+    case "buttons":
+      local.buttons = msg.ports;
+      if (net) net.input = { ...net.input, buttons: msg.ports[0] };
+      break;
+    case "axes":
+      local.axes = msg.ports;
+      if (net) net.input = { ...net.input, axes: msg.ports[0] };
+      break;
+    case "analog-button":
+      if (net?.lockstep || net?.waiting) net.pressAnalog();
+      else {
+        emu?.pressAnalogButton(msg.port);
+        reportPads();
+      }
+      break;
+    case "net-host":
+      openSession(
+        true,
+        `/api/netplay/host?game=${encodeURIComponent(msg.gameId)}&bios=${encodeURIComponent(msg.biosId)}&name=${encodeURIComponent(msg.name)}`,
+      );
+      break;
+    case "net-ports":
+      net?.setPorts(msg.ports);
+      break;
+    case "net-view":
+      net?.setView(msg.view);
+      break;
+    case "net-chat":
+      net?.say(msg.text);
+      break;
+    case "net-leave":
+      net?.close();
+      net = null;
+      break;
+    case "audio":
+      audioRunning = msg.running;
+      // Switching to the timer: start counting from now.
+      nextFrameAt = performance.now();
+      break;
+    case "precise":
+      // The PlayStation's only (the PS2's module has none), and on the GPU
+      // only: software drawing has no precise triangles.
+      (emu as { setPreciseGeometry?: (on: boolean) => void } | null)?.setPreciseGeometry?.(msg.on && gpu !== null);
+      break;
+    case "widescreen":
+      (emu as { setWidescreen?: (on: boolean) => void } | null)?.setWidescreen?.(msg.on);
+      break;
+    case "fast":
+      fast = msg.on;
+      // Back to real time from now.
+      nextFrameAt = performance.now();
+      schedule(0);
+      break;
+    case "pause":
+      paused = msg.paused;
+      if (paused) void saveMemoryCards();
+      else schedule(0);
+      break;
+    case "reset":
+      emu?.reset();
+      break;
+    case "save-state":
+      saveState(msg.slot).catch((err: unknown) => post({ type: "error", message: String(err) }));
+      break;
+    case "load-state":
+      loadState(msg.slot).catch((err: unknown) => post({ type: "error", message: String(err) }));
+      break;
+    case "swap":
+      if (!emu) break;
+      void saveMemoryCards();
+      emu.openLid();
+      // Games poll the lid: leave it open a moment, like a person would.
+      void Promise.all([
+        msg.sbi ? fetchSbi(msg.gameId) : Promise.resolve(null),
+        new Promise((resolve) => setTimeout(resolve, 1500)),
+      ]).then(([sbi]) => {
+        if (!emu) return;
+        gameId = msg.gameId;
+        cardsId = msg.gameId;
+        emu.insertDisc(
+          msg.cue ?? undefined,
+          msg.files.map((f) => f.name),
+          Float64Array.from(msg.files.map((f) => f.size)),
+          readFile,
+          sbi ?? undefined,
+        );
+        post({ type: "swapped", gameId: msg.gameId });
+      });
+      break;
+    case "viewport":
+      viewport = { width: Math.max(1, msg.width), height: Math.max(1, msg.height) };
+      // Redraw now: when paused, no frame would follow.
+      draw();
+      break;
+    case "scale":
+      chosenScale = autoScale = msg.scale;
+      holdUntil = 0;
+      emu?.setResolutionScale(msg.scale);
+      post({ type: "auto-scale", scale: msg.scale, chosen: msg.scale });
+      break;
+    case "smooth":
+      smooth = msg.smooth;
+      draw();
+      break;
+  }
+};

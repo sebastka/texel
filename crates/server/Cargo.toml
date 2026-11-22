@@ -1,0 +1,48 @@
+[package]
+name = "texel-server"
+description = "Serves the Texel web app, the BIOS and game library, saves and game metadata"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "texel"
+path = "src/main.rs"
+
+[dependencies]
+texel-ps1.workspace = true
+texel-ps2.workspace = true
+texel-disc.workspace = true
+anyhow = "1.0.104"
+argon2 = { version = "0.5.3", default-features = false, features = ["alloc", "password-hash"] }
+base64 = "0.22.1"
+axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "tokio", "query", "ws"] }
+chd = "0.4.0"
+flate2 = { version = "1.1.11", default-features = false, features = ["zlib-rs"] }
+clap = { version = "4.6.9", default-features = false, features = ["std", "derive", "env", "help", "usage", "error-context"] }
+getrandom = "0.4.3"
+hex = "0.4.3"
+quick-xml = "0.42.0"
+ring = "0.17.14"
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls-no-provider", "json", "http2", "query", "form"] }
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde-saphyr = { version = "2.1.1", default-features = false, features = ["deserialize"] }
+serde_json = "1.0.154"
+sha1 = "0.11.0"
+sha2 = "0.11.1"
+sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "mysql", "migrate", "macros", "tls-rustls-ring-native-roots"] }
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net", "time", "signal", "sync", "fs", "io-util"] }
+tower = { version = "0.5.3", default-features = false, features = ["util"] }
+tower-http = { version = "0.7.1", default-features = false, features = ["fs", "set-header", "trace", "limit"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["std", "fmt", "ansi", "env-filter", "json"] }
+zip = { version = "9.8.1", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+
+[dev-dependencies]
+# The memory card size the server accepts for PS2 games.
+texel-ps2.workspace = true
+
+[lints]
+workspace = true

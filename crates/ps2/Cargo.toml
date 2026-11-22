@@ -1,0 +1,22 @@
+[package]
+name = "texel-ps2"
+description = "PlayStation 2 emulation, in progress: the EE, the IOP and the SIF between them"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+texel-disc.workspace = true
+texel-ps1.workspace = true
+# Save states, as the PlayStation's.
+postcard = { version = "1.1.3", default-features = false, features = ["use-std"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde-big-array = "0.5.1"
+
+[dev-dependencies]
+# Validates the WebAssembly the EE's compiler makes.
+wasmparser = "=0.263.0"
+
+[lints]
+workspace = true

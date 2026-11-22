@@ -1,0 +1,10 @@
+[package]
+name = "texel-disc"
+description = "Disc image layouts (CUE/BIN, ISO; CD and DVD), raw sector access and ISO 9660 for PlayStation and PlayStation 2 discs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true

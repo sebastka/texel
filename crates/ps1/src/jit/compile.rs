@@ -1,0 +1,709 @@
+//! A block of CPU code compiled to one WebAssembly function: from its first
+//! instruction to the delay slot of its first branch (or `MAX_LEN`
+//! instructions). The function takes the CPU and the bus (their addresses
+//! in this module's memory) and returns the instructions it ran.
+//!
+//! Each instruction: its fetch's cycles (through the instruction cache, as
+//! `Cpu::fetch_cycles` counts them); the instruction, in WebAssembly, or
+//! through the interpreter (`helpers::exec`); the load the previous one
+//! issued lands (the load delay slot, resolved here: the next instruction
+//! is known); its cycles counted, into the CPU's and the bus's pending
+//! ones. The block stops where `step`'s caller would do anything but run
+//! the next instruction: at 64 cycles pending (the peripherals catch up),
+//! after the interpreter ran something beyond the CPU; and leaves the CPU
+//! as `step` would have.
+//!
+//! In WebAssembly: ALU instructions, branches and jumps, loads and stores
+//! of RAM and the scratchpad (aligned; stores with the cache not isolated).
+//! The rest goes through the interpreter: multiplications and divisions,
+//! ADD, ADDI and SUB (they trap on overflow), coprocessors, LWL and
+//! friends, and accesses elsewhere.
+
+use super::wasm::{self, Code, FuncType, I32, I64, op};
+use crate::bus::{Bus, RAM_SIZE};
+use crate::cpu::{BIOS_ACCESS, Cpu, ICACHE_FILL, IO_ACCESS, RAM_ACCESS};
+
+/// Instructions per block, at most.
+pub const MAX_LEN: usize = 64;
+
+/// The type index of the interpreter's function (see `Backend`).
+const EXEC_TYPE: u32 = 1;
+
+/// Where compiled code finds things: offsets in the CPU and the bus (from
+/// the addresses the function is given), and the addresses of RAM and the
+/// instruction cache (valid until the machine is reset or restored, when
+/// blocks are dropped).
+pub struct Layout {
+    regs: u32,
+    out_regs: u32,
+    pc: u32,
+    next_pc: u32,
+    branch: u32,
+    load_reg: u32,
+    load_val: u32,
+    cycles: u32,
+    sr: u32,
+    pending: u32,
+    scratchpad: u32,
+    ram: u32,
+    icache: u32,
+}
+
+impl Layout {
+    pub fn new(cpu: &Cpu, bus: &Bus) -> Self {
+        let c = cpu as *const Cpu as usize;
+        let b = bus as *const Bus as usize;
+        let at = |p: usize, base: usize| (p - base) as u32;
+        Self {
+            regs: at(cpu.regs.as_ptr() as usize, c),
+            out_regs: at(cpu.out_regs.as_ptr() as usize, c),
+            pc: at(&cpu.pc as *const u32 as usize, c),
+            next_pc: at(&cpu.next_pc as *const u32 as usize, c),
+            branch: at(&cpu.branch as *const bool as usize, c),
+            load_reg: at(&cpu.load.0 as *const usize as usize, c),
+            load_val: at(&cpu.load.1 as *const u32 as usize, c),
+            cycles: at(&cpu.cycles as *const u64 as usize, c),
+            sr: at(&cpu.sr as *const u32 as usize, c),
+            pending: at(&bus.pending as *const u32 as usize, b),
+            scratchpad: at(bus.scratchpad.as_ptr() as usize, b),
+            ram: bus.ram.as_ptr() as usize as u32,
+            icache: cpu.icache.as_ptr() as usize as u32,
+        }
+    }
+}
+
+pub struct Compiled {
+    pub module: Vec<u8>,
+    /// Instructions in the block, and those compiled to WebAssembly.
+    pub len: u32,
+    pub native: u32,
+}
+
+// Locals: the parameters, then ours.
+const CPU: u32 = 0;
+const BUS: u32 = 1;
+const N: u32 = 2;
+const PEND: u32 = 3;
+const CYC: u32 = 4;
+const EXTRA: u32 = 5;
+const ADDR: u32 = 6;
+const KIND: u32 = 7;
+const NEXT: u32 = 8;
+const TAKEN: u32 = 9;
+const RET: u32 = 10;
+const SMC: u32 = 11;
+/// Two locals for loaded values, alternating: one landing, one in flight.
+const LOADED: [u32; 2] = [12, 13];
+
+/// Where the CPU stands after an instruction, for leaving the block there.
+#[derive(Clone, Copy)]
+enum After {
+    /// A plain instruction: the next one at `pc`.
+    Plain { pc: u32 },
+    /// A branch: its delay slot at `pc`, then NEXT (taken: TAKEN).
+    Branch { pc: u32 },
+    /// A delay slot: NEXT.
+    Delay,
+}
+
+struct Emitter<'a> {
+    c: Code,
+    l: &'a Layout,
+    /// Blocks and ifs open inside the block the function's exit is.
+    depth: u32,
+}
+
+impl Emitter<'_> {
+    fn reg(&mut self, r: usize) {
+        if r == 0 {
+            self.c.i32_const(0);
+        } else {
+            self.c.local_get(CPU).mem(op::I32_LOAD, 2, self.l.regs + 4 * r as u32);
+        }
+    }
+
+    /// Stores the value in local `from` into register `r` (both copies).
+    fn set_reg_from(&mut self, r: usize, from: u32) {
+        if r == 0 {
+            return;
+        }
+        for base in [self.l.regs, self.l.out_regs] {
+            self.c
+                .local_get(CPU)
+                .local_get(from)
+                .mem(op::I32_STORE, 2, base + 4 * r as u32);
+        }
+    }
+
+    /// Computes a value (pushed by `value`) into register `r`, through RET.
+    fn set_reg(&mut self, r: usize, value: impl FnOnce(&mut Self)) {
+        if r == 0 {
+            return;
+        }
+        value(self);
+        self.c.local_set(RET);
+        self.set_reg_from(r, RET);
+    }
+
+    fn store_cpu(&mut self, offset: u32, value: impl FnOnce(&mut Code)) {
+        self.c.local_get(CPU);
+        value(&mut self.c);
+        self.c.mem(op::I32_STORE, 2, offset);
+    }
+
+    /// Leaves the CPU as `step` would after the instruction (`load`: the
+    /// load it issued, still to land), and exits.
+    fn leave(&mut self, after: After, load: Option<(usize, u32)>) {
+        let l = self.l;
+        match after {
+            After::Plain { pc } => {
+                self.store_cpu(l.pc, |c| {
+                    c.i32_const(pc as i32);
+                });
+                self.store_cpu(l.next_pc, |c| {
+                    c.i32_const(pc.wrapping_add(4) as i32);
+                });
+            }
+            After::Branch { pc } => {
+                self.store_cpu(l.pc, |c| {
+                    c.i32_const(pc as i32);
+                });
+                self.store_cpu(l.next_pc, |c| {
+                    c.local_get(NEXT);
+                });
+                self.c.local_get(CPU).local_get(TAKEN).mem(op::I32_STORE8, 0, l.branch);
+            }
+            After::Delay => {
+                self.store_cpu(l.pc, |c| {
+                    c.local_get(NEXT);
+                });
+                self.store_cpu(l.next_pc, |c| {
+                    c.local_get(NEXT).i32_const(4).op(op::I32_ADD);
+                });
+            }
+        }
+        if let Some((reg, local)) = load {
+            self.store_cpu(l.load_reg, |c| {
+                c.i32_const(reg as i32);
+            });
+            self.store_cpu(l.load_val, |c| {
+                c.local_get(local);
+            });
+        }
+        self.c.br(self.depth);
+    }
+
+    /// The fetch's extra cycles, into EXTRA (as `Cpu::fetch_cycles`, less
+    /// the instruction's own cycle).
+    fn fetch(&mut self, pc: u32, icache: bool) {
+        let p = pc & 0x1fff_ffff;
+        let uncached = match p {
+            0x0000_0000..=0x007f_ffff => RAM_ACCESS,
+            0x1fc0_0000..=0x1fc7_ffff => BIOS_ACCESS,
+            _ => IO_ACCESS,
+        };
+        if pc >> 29 == 5 || !icache {
+            self.c.i32_const(uncached.saturating_sub(1) as i32).local_set(EXTRA);
+            return;
+        }
+        let line = self.l.icache + 4 * ((pc >> 4) & 0xff);
+        let tag = (p >> 12) + 1;
+        let fill = if uncached == RAM_ACCESS {
+            ICACHE_FILL
+        } else {
+            uncached * 4
+        };
+        self.c
+            .i32_const(line as i32)
+            .mem(op::I32_LOAD, 2, 0)
+            .i32_const(tag as i32)
+            .op(op::I32_EQ);
+        self.c.if_i32().i32_const(0).op(op::ELSE);
+        self.c
+            .i32_const(line as i32)
+            .i32_const(tag as i32)
+            .mem(op::I32_STORE, 2, 0);
+        self.c
+            .i32_const(fill.saturating_sub(1) as i32)
+            .op(op::END)
+            .local_set(EXTRA);
+    }
+
+    /// Counts the instruction's cycles (1 + EXTRA), then leaves when 64 are
+    /// pending (and, for a store, when it wrote the block's own code).
+    fn commit(&mut self, after: After, load: Option<(usize, u32)>, smc: bool) {
+        self.c.local_get(EXTRA).i32_const(1).op(op::I32_ADD).local_set(RET);
+        self.c.local_get(PEND).local_get(RET).op(op::I32_ADD).local_set(PEND);
+        self.c
+            .local_get(CYC)
+            .local_get(RET)
+            .op(op::I64_EXTEND_I32_U)
+            .op(op::I64_ADD)
+            .local_set(CYC);
+        self.c.local_get(N).i32_const(1).op(op::I32_ADD).local_set(N);
+        self.c.local_get(PEND).i32_const(64).op(op::I32_GE_U);
+        if smc {
+            self.c.local_get(SMC).op(op::I32_OR);
+        }
+        self.c.if_();
+        self.depth += 1;
+        self.leave(after, load);
+        self.depth -= 1;
+        self.c.op(op::END);
+    }
+
+    /// Runs the instruction through the interpreter (`in_delay`: in a delay
+    /// slot, taken when TAKEN is set), with the load landing after it;
+    /// leaves the block when it says to, or when 64 cycles are pending.
+    /// `stop`: it always says to.
+    fn interpret(&mut self, instr: u32, pc: u32, in_delay: bool, landing: Option<(usize, u32)>, exec: u32, stop: bool) {
+        let l = self.l;
+        self.store_cpu(l.next_pc, |c| {
+            if in_delay {
+                c.local_get(NEXT);
+            } else {
+                c.i32_const(pc.wrapping_add(4) as i32);
+            }
+        });
+        if let Some((reg, local)) = landing {
+            self.store_cpu(l.load_reg, |c| {
+                c.i32_const(reg as i32);
+            });
+            self.store_cpu(l.load_val, |c| {
+                c.local_get(local);
+            });
+        }
+        // The interpreter sees the cycles and pending cycles so far; it may
+        // sync the bus (an I/O access), so the pending cycles are the bus's
+        // afterwards, plus the instruction's.
+        self.c.local_get(CPU).local_get(CYC).mem(op::I64_STORE, 3, l.cycles);
+        self.c.local_get(BUS).local_get(PEND).mem(op::I32_STORE, 2, l.pending);
+        self.c
+            .local_get(CPU)
+            .local_get(BUS)
+            .i32_const(instr as i32)
+            .i32_const(pc as i32);
+        if in_delay {
+            self.c.local_get(TAKEN);
+        } else {
+            self.c.i32_const(0);
+        }
+        self.c.local_get(EXTRA).i32_const(1).op(op::I32_SHL).op(op::I32_OR);
+        self.c.i32_const(exec as i32).call_indirect(EXEC_TYPE).local_set(RET);
+        self.c.local_get(CPU).mem(op::I64_LOAD, 3, l.cycles).local_set(CYC);
+        self.c.local_get(BUS).mem(op::I32_LOAD, 2, l.pending);
+        self.c
+            .local_get(RET)
+            .i32_const(0x7fff_ffff)
+            .op(op::I32_AND)
+            .op(op::I32_ADD)
+            .local_set(PEND);
+        self.c.local_get(N).i32_const(1).op(op::I32_ADD).local_set(N);
+        // The interpreter left the CPU as `step` would.
+        if stop {
+            self.c.br(self.depth);
+            return;
+        }
+        self.c.local_get(RET).i32_const(31).op(op::I32_SHR_U);
+        self.c
+            .local_get(PEND)
+            .i32_const(64)
+            .op(op::I32_GE_U)
+            .op(op::I32_OR)
+            .br_if(self.depth);
+    }
+}
+
+/// What an instruction is, for compiling.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Class {
+    /// In WebAssembly.
+    Native,
+    /// A branch or jump (in WebAssembly).
+    Branch,
+    /// Through the interpreter; the block may go on after it.
+    Pure,
+    /// Through the interpreter; the block stops after it.
+    Stop,
+}
+
+fn class(i: u32) -> Class {
+    let op = i >> 26;
+    match op {
+        0x00 => match i & 0x3f {
+            0x00 | 0x02 | 0x03 | 0x04 | 0x06 | 0x07 | 0x21 | 0x23..=0x27 | 0x2a | 0x2b => Class::Native,
+            0x08 | 0x09 => Class::Branch,
+            0x10..=0x1b | 0x20 | 0x22 => Class::Pure,
+            _ => Class::Stop,
+        },
+        0x01..=0x07 => Class::Branch,
+        0x08 => Class::Pure,
+        0x09..=0x0f => Class::Native,
+        0x12 => {
+            let rs = (i >> 21) & 0x1f;
+            if rs & 0x10 != 0 || rs == 0x04 || rs == 0x06 {
+                Class::Pure
+            } else {
+                Class::Stop
+            }
+        }
+        // Loads and stores: in WebAssembly when they hit RAM or the
+        // scratchpad, else they stop the block.
+        0x20 | 0x21 | 0x23 | 0x24 | 0x25 | 0x28 | 0x29 | 0x2b => Class::Native,
+        _ => Class::Stop,
+    }
+}
+
+/// Compiles the block at `pc` from its words (`words[0]` is its first
+/// instruction; the rest may be more than it uses), assuming the
+/// instruction cache on or off (`icache`); `ram`: where its code is in RAM
+/// (stores there stop it), if it is; `exec`: the interpreter's function's
+/// table index.
+pub fn compile(
+    pc: u32,
+    words: &[u32],
+    icache: bool,
+    ram: Option<(u32, u32)>,
+    exec: u32,
+    layout: &Layout,
+) -> Option<Compiled> {
+    // How many instructions: to the first branch's delay slot (a branch
+    // with no delay slot here, or a branch in it, ends the block before).
+    let mut len = 0;
+    while len < words.len().min(MAX_LEN) {
+        match class(words[len]) {
+            Class::Branch => {
+                let slot_ok = len + 1 < words.len() && class(words[len + 1]) != Class::Branch;
+                if slot_ok {
+                    len += 2;
+                }
+                break;
+            }
+            Class::Stop => {
+                len += 1;
+                break;
+            }
+            _ => len += 1,
+        }
+    }
+    if len == 0 {
+        return None;
+    }
+    let mut e = Emitter {
+        c: Code::default(),
+        l: layout,
+        depth: 0,
+    };
+    let mut native = 0;
+    // The function: a block its exits branch out of, then the pending
+    // cycles and the CPU's cycles written back, and the count returned.
+    e.c.local_get(BUS).mem(op::I32_LOAD, 2, layout.pending).local_set(PEND);
+    e.c.local_get(CPU).mem(op::I64_LOAD, 3, layout.cycles).local_set(CYC);
+    e.c.block();
+    // The load landing after the current instruction: register, local.
+    let mut landing: Option<(usize, u32)> = None;
+    let mut in_delay = false;
+    for k in 0..len {
+        let i = words[k];
+        let at = pc.wrapping_add(4 * k as u32);
+        let next = at.wrapping_add(4);
+        let after = if in_delay {
+            After::Delay
+        } else {
+            After::Plain { pc: next }
+        };
+        let ops = (
+            i >> 26,
+            ((i >> 21) & 0x1f) as usize,
+            ((i >> 16) & 0x1f) as usize,
+            ((i >> 11) & 0x1f) as usize,
+        );
+        let (opcode, rs, rt, rd) = ops;
+        let shamt = ((i >> 6) & 0x1f) as i32;
+        let imm = i & 0xffff;
+        let imm_se = imm as i16 as i32;
+        let class = class(i);
+        e.fetch(at, icache);
+        match class {
+            Class::Pure | Class::Stop => {
+                e.interpret(i, at, in_delay, landing, exec, class == Class::Stop);
+                landing = None;
+            }
+            Class::Native => {
+                native += 1;
+                let mine = LOADED[k % 2];
+                let mut issued: Option<(usize, u32)> = None;
+                let mut smc = false;
+                let mut wrote = 0;
+                match opcode {
+                    0x00 => {
+                        wrote = rd;
+                        let f = i & 0x3f;
+                        e.set_reg(rd, |e| {
+                            match f {
+                                0x00 | 0x02 | 0x03 => {
+                                    e.reg(rt);
+                                    e.c.i32_const(shamt);
+                                }
+                                0x04 | 0x06 | 0x07 => {
+                                    e.reg(rt);
+                                    e.reg(rs);
+                                }
+                                _ => {
+                                    e.reg(rs);
+                                    e.reg(rt);
+                                }
+                            }
+                            match f {
+                                0x00 | 0x04 => e.c.op(op::I32_SHL),
+                                0x02 | 0x06 => e.c.op(op::I32_SHR_U),
+                                0x03 | 0x07 => e.c.op(op::I32_SHR_S),
+                                0x21 => e.c.op(op::I32_ADD),
+                                0x23 => e.c.op(op::I32_SUB),
+                                0x24 => e.c.op(op::I32_AND),
+                                0x25 => e.c.op(op::I32_OR),
+                                0x26 => e.c.op(op::I32_XOR),
+                                0x27 => e.c.op(op::I32_OR).i32_const(-1).op(op::I32_XOR),
+                                0x2a => e.c.op(op::I32_LT_S),
+                                _ => e.c.op(op::I32_LT_U),
+                            };
+                        });
+                    }
+                    0x09..=0x0f => {
+                        wrote = rt;
+                        e.set_reg(rt, |e| {
+                            if opcode == 0x0f {
+                                e.c.i32_const((imm << 16) as i32);
+                                return;
+                            }
+                            e.reg(rs);
+                            match opcode {
+                                0x09 => e.c.i32_const(imm_se).op(op::I32_ADD),
+                                0x0a => e.c.i32_const(imm_se).op(op::I32_LT_S),
+                                0x0b => e.c.i32_const(imm_se).op(op::I32_LT_U),
+                                0x0c => e.c.i32_const(imm as i32).op(op::I32_AND),
+                                0x0d => e.c.i32_const(imm as i32).op(op::I32_OR),
+                                _ => e.c.i32_const(imm as i32).op(op::I32_XOR),
+                            };
+                        });
+                    }
+                    _ => {
+                        // Loads and stores: RAM or the scratchpad, aligned
+                        // (stores: the cache not isolated), else the
+                        // interpreter (and the block stops).
+                        let store = opcode >= 0x28;
+                        let align: i32 = match opcode & 7 {
+                            1 | 5 => 1,
+                            3 => 3,
+                            _ => 0,
+                        };
+                        e.reg(rs);
+                        e.c.i32_const(imm_se).op(op::I32_ADD).local_set(ADDR);
+                        // KIND: 1 RAM, 2 the scratchpad, 0 elsewhere (or
+                        // misaligned, or a store with the cache isolated).
+                        e.c.local_get(ADDR)
+                            .i32_const(0x1fff_ffff)
+                            .op(op::I32_AND)
+                            .local_tee(KIND);
+                        e.c.i32_const(0x0080_0000)
+                            .op(op::I32_LT_U)
+                            .if_i32()
+                            .i32_const(1)
+                            .op(op::ELSE);
+                        e.c.local_get(KIND)
+                            .i32_const(!0x3ff)
+                            .op(op::I32_AND)
+                            .i32_const(0x1f80_0000)
+                            .op(op::I32_EQ);
+                        e.c.i32_const(1).op(op::I32_SHL).op(op::END);
+                        e.c.local_get(ADDR)
+                            .i32_const(align)
+                            .op(op::I32_AND)
+                            .op(op::I32_EQZ)
+                            .op(op::I32_MUL);
+                        if store {
+                            e.c.local_get(CPU)
+                                .mem(op::I32_LOAD, 2, layout.sr)
+                                .i32_const(0x1_0000)
+                                .op(op::I32_AND)
+                                .op(op::I32_EQZ);
+                            e.c.op(op::I32_MUL);
+                        }
+                        e.c.local_set(KIND);
+                        e.c.local_get(KIND).op(op::I32_EQZ).if_();
+                        e.depth += 1;
+                        e.interpret(i, at, in_delay, landing, exec, true);
+                        e.depth -= 1;
+                        e.c.op(op::END);
+                        // The offset in RAM or the scratchpad, and its base.
+                        e.c.local_get(KIND).i32_const(1).op(op::I32_EQ).if_i32();
+                        e.c.local_get(ADDR).i32_const(RAM_SIZE as i32 - 1).op(op::I32_AND);
+                        e.c.i32_const(layout.ram as i32).op(op::I32_ADD).op(op::ELSE);
+                        e.c.local_get(ADDR)
+                            .i32_const(0x3ff)
+                            .op(op::I32_AND)
+                            .local_get(BUS)
+                            .op(op::I32_ADD);
+                        e.c.i32_const(layout.scratchpad as i32).op(op::I32_ADD).op(op::END);
+                        if store {
+                            // The data, stored.
+                            e.reg(rt);
+                            let (o, a) = match opcode {
+                                0x28 => (op::I32_STORE8, 0),
+                                0x29 => (op::I32_STORE16, 1),
+                                _ => (op::I32_STORE, 2),
+                            };
+                            e.c.mem(o, a, 0);
+                            if let Some((lo, hi)) = ram {
+                                // Its own code written: stop after it.
+                                smc = true;
+                                e.c.local_get(KIND).i32_const(1).op(op::I32_EQ);
+                                e.c.local_get(ADDR)
+                                    .i32_const(RAM_SIZE as i32 - 1)
+                                    .op(op::I32_AND)
+                                    .local_set(ADDR);
+                                e.c.local_get(ADDR)
+                                    .i32_const(lo as i32)
+                                    .op(op::I32_GE_U)
+                                    .op(op::I32_AND);
+                                e.c.local_get(ADDR)
+                                    .i32_const(hi as i32)
+                                    .op(op::I32_LT_U)
+                                    .op(op::I32_AND);
+                                e.c.local_set(SMC);
+                            }
+                        } else {
+                            let (o, a) = match opcode {
+                                0x20 => (op::I32_LOAD8_S, 0),
+                                0x21 => (op::I32_LOAD16_S, 1),
+                                0x24 => (op::I32_LOAD8_U, 0),
+                                0x25 => (op::I32_LOAD16_U, 1),
+                                _ => (op::I32_LOAD, 2),
+                            };
+                            e.c.mem(o, a, 0).local_set(mine);
+                            // RAM costs its access time; the scratchpad none.
+                            e.c.local_get(EXTRA).local_get(KIND).i32_const(1).op(op::I32_EQ);
+                            e.c.i32_const(RAM_ACCESS as i32)
+                                .op(op::I32_MUL)
+                                .op(op::I32_ADD)
+                                .local_set(EXTRA);
+                            if rt != 0 {
+                                issued = Some((rt, mine));
+                            }
+                        }
+                    }
+                }
+                // The previous load lands, unless this instruction wrote
+                // the register.
+                if let Some((reg, local)) = landing
+                    && reg != wrote
+                {
+                    e.set_reg_from(reg, local);
+                }
+                e.commit(after, issued, smc);
+                landing = issued;
+            }
+            Class::Branch => {
+                native += 1;
+                let delay = next;
+                let mut link = None;
+                // TAKEN and NEXT.
+                match opcode {
+                    0x00 => {
+                        // JR, JALR: always taken.
+                        e.reg(rs);
+                        e.c.local_set(NEXT);
+                        e.c.i32_const(1).local_set(TAKEN);
+                        if i & 0x3f == 0x09 {
+                            link = Some(rd);
+                        }
+                    }
+                    0x02 | 0x03 => {
+                        let target = (at.wrapping_add(4) & 0xf000_0000) | ((i & 0x3ff_ffff) << 2);
+                        e.c.i32_const(target as i32).local_set(NEXT);
+                        e.c.i32_const(1).local_set(TAKEN);
+                        if opcode == 0x03 {
+                            link = Some(31);
+                        }
+                    }
+                    _ => {
+                        let target = delay.wrapping_add((imm_se << 2) as u32);
+                        match opcode {
+                            0x01 => {
+                                let ge = (i >> 16) & 1 != 0;
+                                e.reg(rs);
+                                e.c.i32_const(0).op(if ge { op::I32_GE_S } else { op::I32_LT_S });
+                                if (i >> 17) & 0xf == 0x8 {
+                                    link = Some(31);
+                                }
+                            }
+                            0x04 | 0x05 => {
+                                e.reg(rs);
+                                e.reg(rt);
+                                e.c.op(if opcode == 0x04 { op::I32_EQ } else { op::I32_NE });
+                            }
+                            0x06 => {
+                                e.reg(rs);
+                                e.c.i32_const(0).op(op::I32_LE_S);
+                            }
+                            _ => {
+                                e.reg(rs);
+                                e.c.i32_const(0).op(op::I32_GT_S);
+                            }
+                        }
+                        e.c.local_tee(TAKEN);
+                        e.c.if_i32().i32_const(target as i32).op(op::ELSE);
+                        e.c.i32_const(delay.wrapping_add(4) as i32).op(op::END).local_set(NEXT);
+                    }
+                }
+                let wrote = link.unwrap_or(0);
+                if let Some(r) = link {
+                    e.set_reg(r, |e| {
+                        e.c.i32_const(delay.wrapping_add(4) as i32);
+                    });
+                }
+                if let Some((reg, local)) = landing
+                    && reg != wrote
+                {
+                    e.set_reg_from(reg, local);
+                }
+                landing = None;
+                e.commit(After::Branch { pc: delay }, None, false);
+                in_delay = true;
+                continue;
+            }
+        }
+        if in_delay {
+            break;
+        }
+        in_delay = false;
+    }
+    // The end: the next instruction, or the branch's destination.
+    let last = pc.wrapping_add(4 * len as u32);
+    let end = if in_delay {
+        After::Delay
+    } else {
+        After::Plain { pc: last }
+    };
+    e.leave(end, landing);
+    e.c.op(op::END);
+    e.c.local_get(BUS).local_get(PEND).mem(op::I32_STORE, 2, layout.pending);
+    e.c.local_get(CPU).local_get(CYC).mem(op::I64_STORE, 3, layout.cycles);
+    e.c.local_get(N).op(op::END);
+    let types = [
+        FuncType {
+            params: &[I32, I32],
+            results: &[I32],
+        },
+        FuncType {
+            params: &[I32, I32, I32, I32, I32],
+            results: &[I32],
+        },
+    ];
+    let module = wasm::module(&types, &[(2, I32), (1, I64), (9, I32)], &e.c);
+    Some(Compiled {
+        module,
+        len: len as u32,
+        native,
+    })
+}

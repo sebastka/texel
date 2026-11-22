@@ -1,0 +1,27 @@
+[package]
+name = "texel-web-ps2"
+description = "WebAssembly bindings of the PlayStation 2 emulator"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+texel-ps2.workspace = true
+texel-web-disc.workspace = true
+# Must match the wasm-bindgen-cli version exactly (flake.nix, Dockerfile).
+wasm-bindgen = "=0.2.130"
+js-sys = "0.3.107"
+
+# The GS on the GPU, through WebGPU (browsers only).
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+texel-ps2-gpu.workspace = true
+wasm-bindgen-futures = "0.4.80"
+# The same as wgpu's: its surfaces take this OffscreenCanvas.
+web-sys = { version = "0.3.107", features = ["OffscreenCanvas"] }
+
+[lints]
+workspace = true

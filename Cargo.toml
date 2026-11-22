@@ -1,0 +1,50 @@
+[workspace]
+resolver = "3"
+members = ["crates/disc", "crates/ps1", "crates/ps2", "crates/web", "crates/ps2-gpu", "crates/ps1-gpu", "crates/web-ps2", "crates/web-disc", "crates/server"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.100"
+publish = false
+
+[workspace.dependencies]
+texel-disc = { path = "crates/disc" }
+texel-ps1 = { path = "crates/ps1" }
+texel-ps2 = { path = "crates/ps2" }
+texel-ps2-gpu = { path = "crates/ps2-gpu" }
+texel-ps1-gpu = { path = "crates/ps1-gpu" }
+texel-web-disc = { path = "crates/web-disc" }
+
+[workspace.lints.rust]
+# Denied, not forbidden: a module that needs unsafe code allows it, with
+# its reasons (see DECISIONS.md, D30).
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"
+
+# For profilers: release code, with symbols and line tables.
+[profile.profiling]
+inherits = "release"
+strip = "none"
+debug = "line-tables-only"
+
+# The emulators are unusably slow without optimisations, even when debugging.
+[profile.dev.package.texel-ps1]
+opt-level = 3
+
+[profile.dev.package.texel-ps2]
+opt-level = 3
+
+# The WebAssembly build: wasm-bindgen needs the `target_features` section,
+# which stripping removes; wasm-opt shrinks the result instead.
+[profile.wasm]
+inherits = "release"
+strip = "none"

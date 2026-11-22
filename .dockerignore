@@ -1,0 +1,10 @@
+# Ignore everything by default; allow only what the build needs.
+*
+!Cargo.toml
+!Cargo.lock
+!rust-toolchain.toml
+!crates/
+!frontend/
+frontend/node_modules/
+frontend/dist/
+frontend/src/wasm/

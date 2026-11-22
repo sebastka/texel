@@ -1,0 +1,30 @@
+[package]
+name = "texel-web"
+description = "WebAssembly bindings of the emulation core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+texel-ps1.workspace = true
+texel-disc.workspace = true
+texel-web-disc.workspace = true
+# Must match the wasm-bindgen-cli version exactly (flake.nix, Dockerfile).
+wasm-bindgen = "=0.2.130"
+js-sys = "0.3.107"
+# Recorded drawing, sent to the drawing worker (as save states are encoded).
+postcard = { version = "1.1.3", default-features = false, features = ["use-std"] }
+
+# Higher resolutions on the GPU, through WebGPU (browsers only).
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+texel-ps1-gpu.workspace = true
+wasm-bindgen-futures = "0.4.80"
+# The same as wgpu's: its surfaces take this OffscreenCanvas.
+web-sys = { version = "0.3.107", features = ["OffscreenCanvas"] }
+
+[lints]
+workspace = true

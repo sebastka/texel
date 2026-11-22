@@ -1,0 +1,28 @@
+# Everything starting with a dot is ignored, except what is listed below.
+.*
+!.github
+!.dockerignore
+!.envrc
+!.gitignore
+!.yamllint.yaml
+
+/target
+/result
+node_modules/
+/frontend/dist/
+/frontend/src/wasm/
+
+# Never commit copyrighted material: BIOS dumps, disc images, saves.
+*.bin
+*.BIN
+*.cue
+*.CUE
+*.iso
+*.ISO
+*.img
+*.chd
+*.pbp
+*.mcd
+*.mcr
+*.srm
+/data/

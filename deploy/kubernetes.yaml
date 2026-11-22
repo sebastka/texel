@@ -1,0 +1,89 @@
+# Texel on Kubernetes. Provide yourself:
+# - the `texel-library` PersistentVolumeClaim, holding `ps1/bios/`,
+#   `ps1/games/` (and `ps2/` for later)
+#   (mounted read-only; e.g. an NFS share);
+# - a MariaDB (or MySQL) database for saves, settings and hashes, and the
+#   `texel-database` Secret with its URL under `url`:
+#   mysql://user:password@host:3306/database (the server creates its tables);
+# - the `texel` Secret with the sign-in settings: TEXEL_OIDC_ISSUER,
+#   TEXEL_OIDC_CLIENT_ID, TEXEL_OIDC_CLIENT_SECRET, TEXEL_OIDC_ADMIN_GROUPS
+#   (or TEXEL_OIDC_ADMIN_USERS), and optionally TEXEL_IGDB_CLIENT_ID and
+#   TEXEL_IGDB_CLIENT_SECRET, for game descriptions from IGDB. Without
+#   OpenID Connect, invite users with `texel --create-invite "note"` (in
+#   the pod);
+# - TEXEL_PUBLIC_URL below: the address users reach Texel at (the OpenID
+#   Connect redirect URI is <it>/auth/oidc/callback);
+# - an Ingress in front of the Service, over HTTPS. It must pass WebSocket
+#   upgrades (netplay, under /api/netplay/).
+# Netplay rooms live in the server's memory: keep a single replica.
+# The state directory only holds caches (DATs, artwork, game details): an
+# emptyDir, filled again after a restart.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: texel
+  labels: { app.kubernetes.io/name: texel }
+spec:
+  replicas: 1
+  # One pod at a time: netplay rooms live in its memory.
+  strategy: { type: Recreate }
+  selector:
+    matchLabels: { app.kubernetes.io/name: texel }
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: texel }
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: texel
+          image: ghcr.io/sebastka/texel:edge
+          env:
+            - { name: TEXEL_LOG_FORMAT, value: json }
+            - { name: TEXEL_PUBLIC_URL, value: https://texel.example.com }
+            - name: TEXEL_DATABASE_URL
+              valueFrom:
+                secretKeyRef: { name: texel-database, key: url }
+          envFrom:
+            - secretRef: { name: texel, optional: true }
+          ports:
+            - { name: http, containerPort: 8080 }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: [ALL] }
+          resources:
+            requests: { cpu: 20m, memory: 64Mi }
+            # Parsing the Redump DAT (~13 MB of XML) peaks around 150 MiB.
+            limits: { memory: 384Mi }
+          startupProbe:
+            httpGet: { path: /readyz, port: http }
+            failureThreshold: 60
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+          readinessProbe:
+            httpGet: { path: /readyz, port: http }
+          volumeMounts:
+            - { name: library, mountPath: /library, readOnly: true }
+            - { name: state, mountPath: /state }
+      volumes:
+        - name: library
+          persistentVolumeClaim: { claimName: texel-library, readOnly: true }
+        - name: state
+          emptyDir: { sizeLimit: 1Gi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: texel
+  labels: { app.kubernetes.io/name: texel }
+spec:
+  selector: { app.kubernetes.io/name: texel }
+  ports:
+    - { name: http, port: 80, targetPort: http }
