@@ -43,6 +43,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/auth/invites/{token}", get(auth::invite))
         .route("/auth/logout", post(auth::logout))
         .route("/me", get(auth::me).patch(auth::update_me))
+        .route("/users/{id}/avatar", get(auth::user_avatar))
         .route("/admin/users", get(auth::list_users))
         .route("/admin/users/{id}", axum::routing::delete(auth::delete_user))
         .route("/admin/users/{id}/reset", post(auth::reset_user))
@@ -113,10 +114,13 @@ pub fn router(state: Arc<AppState>) -> Router {
         .layer(axum::middleware::from_fn_with_state(state.clone(), auth::same_origin))
         .with_state(state);
     for (name, value) in headers {
-        app = app.layer(SetResponseHeaderLayer::overriding(
-            HeaderName::from_static(name),
-            HeaderValue::from_static(value),
-        ));
+        let (name, value) = (HeaderName::from_static(name), HeaderValue::from_static(value));
+        // A response may set a stricter policy of its own (users' pictures).
+        app = if name == header::CONTENT_SECURITY_POLICY {
+            app.layer(SetResponseHeaderLayer::if_not_present(name, value))
+        } else {
+            app.layer(SetResponseHeaderLayer::overriding(name, value))
+        };
     }
     app.layer(tower_http::trace::TraceLayer::new_for_http())
 }

@@ -130,6 +130,8 @@ export interface User {
   email: string | null;
   /** Signed in with OpenID Connect: name and password are the provider's. */
   oidc: boolean;
+  /** Their picture (from the provider), served by Texel; else initials. */
+  avatar: string | null;
 }
 
 export interface AuthConfig {
@@ -150,6 +152,7 @@ export interface UserRow {
   role: Role;
   kind: "oidc" | "password";
   email: string | null;
+  avatar: string | null;
   createdAt: number;
   lastSeenAt: number | null;
 }

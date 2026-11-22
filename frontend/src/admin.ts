@@ -1,6 +1,7 @@
 // Administration: invitations (tokens handed over to friends, who type
 // them when registering), and users (reset tokens, deletion).
 
+import { avatar } from "./account-menu";
 import { ApiError, api, type InviteRow, type UserRow } from "./api";
 import { h } from "./dom";
 import type { Shell } from "./main";
@@ -87,7 +88,11 @@ export async function renderAdmin(shell: Shell) {
     h(
       "tr",
       {},
-      h("td", { "data-label": "Name" }, u.name, u.role === "admin" ? h("span.badge.accent", {}, "Admin") : null),
+      h(
+        "td",
+        { "data-label": "Name" },
+        h("span.user-cell", {}, avatar(u), u.name, u.role === "admin" ? h("span.badge.accent", {}, "Admin") : null),
+      ),
       h("td", { "data-label": "Signs in with" }, u.kind === "oidc" ? "Sign-in provider" : (u.email ?? "—")),
       h("td", { "data-label": "Since" }, when(u.createdAt)),
       h("td", { "data-label": "Last seen" }, when(u.lastSeenAt)),
