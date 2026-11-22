@@ -17,6 +17,7 @@
 //! are open to anyone with their code: it grants its room's BIOS and disc,
 //! nothing else (`Viewer`).
 
+mod avatar;
 pub mod jwt;
 pub mod oidc;
 mod password;
@@ -77,6 +78,8 @@ pub struct User {
     pub email: Option<String>,
     /// Signed in with OpenID Connect (their name comes from the provider).
     pub oidc: bool,
+    /// Their picture's URL (versioned), when the provider gave one.
+    pub avatar: Option<String>,
 }
 
 pub struct AuthConfig {
@@ -89,6 +92,8 @@ pub struct AuthConfig {
 
 pub struct Auth {
     pub oidc: Option<oidc::Provider>,
+    /// Fetches users' pictures (see `avatar`).
+    avatars: reqwest::Client,
     public_url: Option<String>,
     secure: bool,
     pub session_days: u64,
@@ -104,6 +109,7 @@ impl Auth {
             secure: public_url.as_deref().is_some_and(|u| u.starts_with("https://")),
             public_url,
             oidc: config.oidc.map(|c| oidc::Provider::new(c, http)),
+            avatars: avatar::client().expect("an HTTP client"),
             session_days: config.session_days.max(1),
             invite_days: config.invite_days.max(1),
             cache: Mutex::new(HashMap::new()),
@@ -673,6 +679,62 @@ pub async fn oidc_login(
     resp
 }
 
+/// Fetches the user's picture when its URL changed (or drops it, when the
+/// provider no longer gives one). Failures are logged: the user keeps the
+/// picture they had, or their initials.
+async fn update_picture(state: &AppState, user: u64, url: Option<&str>) {
+    let known = match state.db.avatar_url(user).await {
+        Ok(u) => u,
+        Err(e) => return tracing::warn!(error = %e, "reading a user's picture URL failed"),
+    };
+    let result = match url {
+        None if known.is_some() => state.db.set_avatar(user, None).await,
+        None => Ok(()),
+        Some(url) if known.as_deref() == Some(url) => Ok(()),
+        Some(url) => match avatar::fetch(&state.auth.avatars, url).await {
+            Ok(p) => state.db.set_avatar(user, Some((url, &p))).await,
+            Err(e) => {
+                tracing::warn!(user, error = %e, "fetching a user's picture failed");
+                Ok(())
+            }
+        },
+    };
+    match result {
+        Ok(()) => state.auth.forget_sessions(),
+        Err(e) => tracing::warn!(error = %e, "saving a user's picture failed"),
+    }
+}
+
+/// A user's picture, for signed-in users. Its URL carries its version: kept
+/// by browsers until it changes.
+pub async fn user_avatar(State(state): State<Arc<AppState>>, _: CurrentUser, Path(id): Path<u64>) -> Response {
+    match state.db.avatar(id).await {
+        Ok(Some((bytes, media_type))) => {
+            let Ok(media_type) = HeaderValue::from_str(&media_type) else {
+                return error(StatusCode::NOT_FOUND, "no picture");
+            };
+            (
+                [
+                    (header::CONTENT_TYPE, media_type),
+                    (
+                        header::CACHE_CONTROL,
+                        HeaderValue::from_static("private, max-age=31536000, immutable"),
+                    ),
+                    // Never a document, whatever is in it.
+                    (
+                        header::CONTENT_SECURITY_POLICY,
+                        HeaderValue::from_static("sandbox; default-src 'none'"),
+                    ),
+                ],
+                bytes,
+            )
+                .into_response()
+        }
+        Ok(None) => error(StatusCode::NOT_FOUND, "no picture"),
+        Err(e) => internal("reading a picture", &e),
+    }
+}
+
 /// Back to the sign-in page, saying what went wrong.
 fn sign_in_error(message: &str) -> Response {
     let encoded: String = message
@@ -747,6 +809,7 @@ pub async fn oidc_callback(
         Err(e) => return internal("signing in", &e),
     };
     tracing::info!(user = user.id, admin = identity.admin, "signed in with OpenID Connect");
+    update_picture(&state, user.id, identity.picture.as_deref()).await;
     let session = match state.auth.start_session(&state.db, user.id, Some(&id_token)).await {
         Ok(c) => c,
         Err(e) => return internal("signing in", &e),

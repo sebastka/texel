@@ -76,8 +76,9 @@ header {
   top: 0;
   z-index: 2;
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
-  gap: 10px;
+  gap: 8px 10px;
   padding: 10px 16px;
   background: color-mix(in srgb, var(--bg) 88%, transparent);
   backdrop-filter: blur(8px);
@@ -104,6 +105,10 @@ header {
 nav {
   display: flex;
   gap: 4px;
+  min-width: 0;
+  /* Narrow screens: the tabs scroll, rather than wrap. */
+  overflow-x: auto;
+  scrollbar-width: none;
 }
 
 .tab {
@@ -111,6 +116,28 @@ nav {
   border-radius: 8px;
   color: var(--muted);
   font-weight: 500;
+  white-space: nowrap;
+}
+
+/* The logo and the tabs share a line (the tabs scroll when it is short). */
+.header-main {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.brand {
+  flex: none;
+}
+
+.header-tools {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-left: auto;
+  min-width: 0;
 }
 
 .tab:hover {
@@ -121,10 +148,6 @@ nav {
 .tab.active {
   color: var(--text);
   background: var(--surface-2);
-}
-
-.spacer {
-  flex: 1;
 }
 
 .now {
@@ -1413,32 +1436,131 @@ main.join {
 
 /* --- Accounts ------------------------------------------------------------------- */
 
-.account {
-  display: flex;
+/* The avatar: initials on a colour of the user's own (white on these
+   mid-dark colours stays readable, and they show on light and dark pages). */
+.avatar {
+  display: inline-grid;
+  place-items: center;
+  flex: none;
+  border-radius: 50%;
+  font-weight: 700;
+  color: #fff;
+  letter-spacing: 0.02em;
+  user-select: none;
+  box-shadow: inset 0 0 0 1px rgb(255 255 255 / 18%);
+}
+
+.avatar-picture {
+  object-fit: cover;
+  background: var(--surface-2);
+}
+
+.user-cell {
+  display: inline-flex;
   align-items: center;
   gap: 8px;
 }
 
-.account-name {
-  color: var(--muted);
-  max-width: 14em;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+.avatar-small {
+  width: 32px;
+  height: 32px;
+  font-size: 13px;
 }
 
-.account-name:hover {
+.avatar-large {
+  width: 96px;
+  height: 96px;
+  font-size: 36px;
+}
+
+.avatar-c0 { background: #b4441c; }
+.avatar-c1 { background: #1d6a87; }
+.avatar-c2 { background: #6a4bb8; }
+.avatar-c3 { background: #2d7031; }
+.avatar-c4 { background: #a3164f; }
+.avatar-c5 { background: #485b65; }
+.avatar-c6 { background: #00695c; }
+.avatar-c7 { background: #8a4f00; }
+
+.account {
+  position: relative;
+  flex: none;
+}
+
+.avatar-button {
+  display: inline-grid;
+  place-items: center;
+  width: 38px;
+  height: 38px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+}
+
+.avatar-button:hover .avatar,
+.avatar-button[aria-expanded="true"] .avatar,
+.avatar-button:focus-visible .avatar {
+  box-shadow: 0 0 0 2px var(--accent);
+}
+
+.account-menu {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 6px);
+  z-index: 20;
+  min-width: 220px;
+  max-width: calc(100vw - 32px);
+  padding: 6px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: 0 8px 24px rgb(0 0 0 / 25%);
+}
+
+.account-head {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  padding: 6px 10px 8px;
+  margin-bottom: 4px;
+  border-bottom: 1px solid var(--border);
+  overflow-wrap: anywhere;
+}
+
+.account-title {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  margin-bottom: 16px;
+}
+
+.account-title h1 {
+  margin: 0;
+}
+
+.account-head .badge {
+  margin-top: 4px;
+}
+
+.menu-entry {
+  display: flex;
+  align-items: center;
+  width: 100%;
+  padding: 8px 10px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
   color: var(--text);
+  font: inherit;
+  text-align: left;
 }
 
-@media (max-width: 700px) {
-  header {
-    flex-wrap: wrap;
-  }
-
-  nav {
-    flex-wrap: wrap;
-  }
+.menu-entry:hover,
+.menu-entry:focus-visible {
+  background: var(--surface-2);
+  outline: none;
 }
 
 main.auth {

@@ -66,6 +66,8 @@ pub struct Identity {
     pub subject: String,
     pub name: String,
     pub admin: bool,
+    /// The `picture` claim: a URL of the user's picture.
+    pub picture: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -283,7 +285,13 @@ impl Provider {
             .chars()
             .take(64)
             .collect();
-        Ok(Identity { subject, name, admin })
+        let picture = text("picture").map(str::to_owned);
+        Ok(Identity {
+            subject,
+            name,
+            admin,
+            picture,
+        })
     }
 
     /// Where to send the browser to sign out at the provider too, if it

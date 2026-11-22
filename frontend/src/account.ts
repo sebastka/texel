@@ -2,6 +2,7 @@
 // password), registering with an invitation token (or setting a new
 // password with a reset token), and one's own account.
 
+import { avatar } from "./account-menu";
 import { ApiError, api } from "./api";
 import { h } from "./dom";
 import type { Shell } from "./main";
@@ -272,5 +273,8 @@ export function renderAccount(shell: Shell) {
       ),
     );
   }
-  shell.app.replaceChildren(shell.header("account"), h("main.auth", {}, h("h1", {}, "Your account"), error.el, done, ...parts));
+  shell.app.replaceChildren(
+    shell.header("account"),
+    h("main.auth", {}, h("div.account-title", {}, avatar(me, "large"), h("h1", {}, "Your account")), error.el, done, ...parts),
+  );
 }

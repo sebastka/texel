@@ -1,5 +1,6 @@
 import "./style.css";
 import { renderAccount, renderRegister, renderSignIn } from "./account";
+import { accountMenu } from "./account-menu";
 import { renderAdmin } from "./admin";
 import { api, gameRegion, image, type Bios, type Console, type Game, type GameDetail, type GameListItem, type SaveState, type User } from "./api";
 import { renderCards } from "./cards";
@@ -79,21 +80,20 @@ function header(active: Page | null, ...right: Node[]) {
       ]
     : [tab("join", "#/join", "Join")];
   const account = me
-    ? h(
-        "div.account",
-        {},
-        h("a.account-name", { href: "#/account", title: "Your account" }, me.name),
-        h("button.ghost.small-button", { onclick: () => void signOut() }, "Sign out"),
-      )
+    ? accountMenu(me, () => void signOut())
     : h("a.button.ghost.small-button", { href: "#/signin" }, "Sign in");
+  // The page's tools and the avatar stay together, on the right: when the
+  // header runs out of room, they go to the next line as one.
   return h(
     "header",
     {},
-    h("a.brand", { href: me ? `#/games/${shownConsole}` : "#/signin" }, h("span.logo", {}, ""), "Texel"),
-    h("nav", {}, ...tabs),
-    h("div.spacer"),
-    ...right,
-    account,
+    h(
+      "div.header-main",
+      {},
+      h("a.brand", { href: me ? `#/games/${shownConsole}` : "#/signin" }, h("span.logo", {}, ""), "Texel"),
+      h("nav", { "aria-label": "Sections" }, ...tabs),
+    ),
+    h("div.header-tools", {}, ...right, account),
   );
 }
 

@@ -16,6 +16,7 @@ pub struct UserRow {
     /// "oidc", or "password" (an invited user).
     pub kind: &'static str,
     pub email: Option<String>,
+    pub avatar: Option<String>,
     /// Unix seconds.
     pub created_at: u64,
     pub last_seen_at: Option<u64>,
@@ -53,13 +54,19 @@ fn user_from(r: &sqlx::mysql::MySqlRow) -> Result<User, sqlx::Error> {
         role: if role == "admin" { Role::Admin } else { Role::Guest },
         email: r.try_get("email")?,
         oidc: r.try_get::<Option<String>, _>("oidc_subject")?.is_some(),
+        avatar: r.try_get::<Option<String>, _>("avatar_version")?.map(|v| {
+            format!(
+                "/api/users/{}/avatar?v={v}",
+                r.try_get::<u64, _>("id").unwrap_or_default()
+            )
+        }),
     })
 }
 
 /// The columns `user_from` reads (a macro: queries stay literal strings).
 macro_rules! user_columns {
     () => {
-        "u.id, u.name, u.role, u.email, u.oidc_subject"
+        "u.id, u.name, u.role, u.email, u.oidc_subject, u.avatar_version"
     };
 }
 
@@ -210,6 +217,48 @@ impl Db {
         Ok(user_from(&row)?)
     }
 
+    // --- Pictures ---------------------------------------------------------------------
+
+    pub async fn avatar_url(&self, user: u64) -> anyhow::Result<Option<String>> {
+        Ok(sqlx::query_scalar("SELECT avatar_url FROM users WHERE id = ?")
+            .bind(user)
+            .fetch_optional(&self.pool)
+            .await?
+            .flatten())
+    }
+
+    /// Sets (with the URL it came from) or drops a user's picture.
+    pub async fn set_avatar(&self, user: u64, picture: Option<(&str, &super::avatar::Picture)>) -> anyhow::Result<()> {
+        let (url, bytes, media_type, version) = match picture {
+            Some((url, p)) => (
+                Some(url),
+                Some(&p.bytes[..]),
+                Some(p.media_type),
+                Some(p.version.as_str()),
+            ),
+            None => (None, None, None, None),
+        };
+        sqlx::query("UPDATE users SET avatar_url = ?, avatar = ?, avatar_type = ?, avatar_version = ? WHERE id = ?")
+            .bind(url)
+            .bind(bytes)
+            .bind(media_type)
+            .bind(version)
+            .bind(user)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// A user's picture and its media type.
+    pub async fn avatar(&self, user: u64) -> anyhow::Result<Option<(Vec<u8>, String)>> {
+        Ok(
+            sqlx::query_as("SELECT avatar, avatar_type FROM users WHERE id = ? AND avatar IS NOT NULL")
+                .bind(user)
+                .fetch_optional(&self.pool)
+                .await?,
+        )
+    }
+
     // --- Invited users --------------------------------------------------------------
 
     /// A user by e-mail address, with their password hash.
@@ -283,6 +332,7 @@ impl Db {
             role: Role::Guest,
             email: Some(email.to_owned()),
             oidc: false,
+            avatar: None,
         }))
     }
 
@@ -430,7 +480,7 @@ impl Db {
 
     pub async fn users(&self) -> anyhow::Result<Vec<UserRow>> {
         let rows = sqlx::query(
-            "SELECT id, name, role, email, oidc_subject, \
+            "SELECT id, name, role, email, oidc_subject, avatar_version, \
              CAST(UNIX_TIMESTAMP(created_at) AS UNSIGNED) AS created_at, \
              CAST(UNIX_TIMESTAMP(last_seen_at) AS UNSIGNED) AS last_seen_at \
              FROM users ORDER BY name",
@@ -446,6 +496,7 @@ impl Db {
                     role: u.role,
                     kind: if u.oidc { "oidc" } else { "password" },
                     email: u.email,
+                    avatar: u.avatar,
                     created_at: r.try_get("created_at")?,
                     last_seen_at: r.try_get("last_seen_at")?,
                 })
