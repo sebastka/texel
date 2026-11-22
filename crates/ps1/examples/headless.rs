@@ -102,23 +102,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let out = PathBuf::from(args.get(4).map_or(".", String::as_str));
     let start = std::time::Instant::now();
     let mut audio = Vec::new();
-    // PRESS="1900:cross,2100:start": hold a button for 6 frames from a frame.
-    let presses: Vec<(u32, u16)> = std::env::var("PRESS")
+    // PRESS="1900:cross,2100:start,2500:square:300": hold a button from a
+    // frame, for 6 frames or the number given.
+    let presses: Vec<(u32, u16, u32)> = std::env::var("PRESS")
         .unwrap_or_default()
         .split(',')
         .filter_map(|p| {
-            let (frame, name) = p.split_once(':')?;
-            let b = match name {
-                "cross" => texel_ps1::button::CROSS,
-                "circle" => texel_ps1::button::CIRCLE,
-                "start" => texel_ps1::button::START,
-                "up" => texel_ps1::button::UP,
-                "down" => texel_ps1::button::DOWN,
-                "left" => texel_ps1::button::LEFT,
-                "right" => texel_ps1::button::RIGHT,
+            let mut parts = p.split(':');
+            let frame = parts.next()?.parse().ok()?;
+            use texel_ps1::button::*;
+            let b = match parts.next()? {
+                "cross" => CROSS,
+                "circle" => CIRCLE,
+                "square" => SQUARE,
+                "triangle" => TRIANGLE,
+                "start" => START,
+                "select" => SELECT,
+                "up" => UP,
+                "down" => DOWN,
+                "left" => LEFT,
+                "right" => RIGHT,
+                "l1" => L1,
+                "r1" => R1,
+                "l2" => L2,
+                "r2" => R2,
                 _ => return None,
             };
-            Some((frame.parse().ok()?, b))
+            let len = parts.next().map_or(Some(6), |l| l.parse().ok())?;
+            Some((frame, b, len))
         })
         .collect();
     // SWAP="3000:3060": open the lid at a frame, close it on the disc again later.
@@ -140,9 +151,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for n in 1..=frames {
         let held = presses
             .iter()
-            .filter(|(f, _)| (*f..*f + 6).contains(&n))
-            .fold(0, |a, (_, b)| a | b);
+            .filter(|(f, _, len)| (*f..*f + len).contains(&n))
+            .fold(0, |a, (_, b, _)| a | b);
         system.set_buttons(0, held);
+        // ANALOG=600: press the Analog button at that frame (analog mode).
+        if std::env::var("ANALOG").is_ok_and(|f| f.parse() == Ok(n)) {
+            println!("analog mode: {}", system.press_analog_button(0));
+        }
         if let (Some((open, close)), Some(path)) = (swap, &disc_path) {
             if n == open {
                 system.open_lid();
@@ -202,6 +217,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 system.load_state(state)?;
                 println!("loaded state at frame {n}");
             }
+        }
+        // CHECKSUM=60: the machine's checksum (as netplay compares it) every
+        // so many frames.
+        if let Some(every) = std::env::var("CHECKSUM").ok().and_then(|v| v.parse::<u32>().ok())
+            && n % every == 0
+        {
+            println!("checksum {n}: {:016x}", system.state_checksum());
         }
         if n % 50 == 0 {
             peak_per_second.push(audio.iter().map(|s| s.unsigned_abs()).max().unwrap_or(0));

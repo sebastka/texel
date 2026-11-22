@@ -41,9 +41,21 @@ pub const AUDIO_RATE: u32 = 44_100;
 /// Save state header and format version: states of other versions are
 /// refused (bumped whenever the emulated state changes shape).
 const STATE_MAGIC: &[u8; 8] = b"TEXEL\0\0\0";
-/// Format 3 adds the CPU's debug registers after the rest; format 2
-/// states load with them zeroed.
-const STATE_VERSION: u32 = 3;
+/// Format 3 adds the CPU's debug registers after the rest, format 4 the
+/// timing of the GPU and SPU (`Timing`); older states load without them.
+const STATE_VERSION: u32 = 4;
+
+/// What the machine does next that the parts' own state leaves out, kept
+/// after it: the GPU's drawing under way and the command list waiting for
+/// it, the SPU's capture position. Without them, a restored machine runs
+/// differently from the one saved (netplay members, given the host's
+/// state, fell out of step again at once).
+#[derive(Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
+struct Timing {
+    gpu_drawing: u64,
+    gpu_list: Option<u64>,
+    spu_capture: u32,
+}
 
 #[derive(serde::Serialize)]
 struct SnapshotRef<'a> {
@@ -51,10 +63,20 @@ struct SnapshotRef<'a> {
     cpu: &'a Cpu,
     bus: &'a Bus,
     cpu_debug: [u32; 5],
+    timing: Timing,
+}
+
+struct Snapshot {
+    bios_hash: u64,
+    cpu: Cpu,
+    bus: Bus,
+    cpu_debug: [u32; 5],
+    /// None: an older state.
+    timing: Option<Timing>,
 }
 
 #[derive(serde::Deserialize)]
-struct Snapshot {
+struct SnapshotV3 {
     bios_hash: u64,
     cpu: Cpu,
     bus: Bus,
@@ -399,6 +421,11 @@ impl System {
             cpu: &self.cpu,
             bus: &self.bus,
             cpu_debug: self.cpu.debug_registers(),
+            timing: Timing {
+                gpu_drawing: self.bus.gpu.drawing,
+                gpu_list: self.bus.gpu_list,
+                spu_capture: self.bus.spu.capture,
+            },
         };
         postcard::to_extend(&snapshot, out).expect("serialising to memory cannot fail")
     }
@@ -415,7 +442,34 @@ impl System {
         let version = u32::from_le_bytes(version.try_into().expect("4 bytes"));
         let bad = |e: postcard::Error| Error::BadState(e.to_string());
         let snapshot: Snapshot = match version {
-            STATE_VERSION => postcard::from_bytes(body).map_err(bad)?,
+            STATE_VERSION => {
+                #[derive(serde::Deserialize)]
+                struct V4 {
+                    bios_hash: u64,
+                    cpu: Cpu,
+                    bus: Bus,
+                    cpu_debug: [u32; 5],
+                    timing: Timing,
+                }
+                let s: V4 = postcard::from_bytes(body).map_err(bad)?;
+                Snapshot {
+                    bios_hash: s.bios_hash,
+                    cpu: s.cpu,
+                    bus: s.bus,
+                    cpu_debug: s.cpu_debug,
+                    timing: Some(s.timing),
+                }
+            }
+            3 => {
+                let s: SnapshotV3 = postcard::from_bytes(body).map_err(bad)?;
+                Snapshot {
+                    bios_hash: s.bios_hash,
+                    cpu: s.cpu,
+                    bus: s.bus,
+                    cpu_debug: s.cpu_debug,
+                    timing: None,
+                }
+            }
             2 => {
                 let s: SnapshotV2 = postcard::from_bytes(body).map_err(bad)?;
                 Snapshot {
@@ -423,11 +477,12 @@ impl System {
                     cpu: s.cpu,
                     bus: s.bus,
                     cpu_debug: [0; 5],
+                    timing: None,
                 }
             }
             _ => {
                 return Err(Error::BadState(format!(
-                    "made by another version of the emulator (format {version}, this one reads 2 and {STATE_VERSION})"
+                    "made by another version of the emulator (format {version}, this one reads 2 to {STATE_VERSION})"
                 )));
             }
         };
@@ -444,7 +499,14 @@ impl System {
             pad.connected = current.connected;
         }
         bus.gpu.set_scale(self.bus.gpu.scale());
-        bus.settle();
+        match snapshot.timing {
+            Some(t) => {
+                bus.gpu.drawing = t.gpu_drawing;
+                bus.gpu_list = t.gpu_list;
+                bus.spu.capture = t.spu_capture;
+            }
+            None => bus.settle(),
+        }
         if self.bus.gpu.recording() {
             bus.gpu.set_recording(true);
         }
@@ -548,20 +610,51 @@ mod tests {
         assert_eq!(other.cpu.debug_registers(), [1, 2, 3, 0x8007_b56c, 5]);
     }
 
-    /// Format 2 states (before the debug registers) still load.
-    #[test]
-    fn format_2_states_load() {
+    /// A fresh machine's state in an older format: format 4 is format 3
+    /// followed by the timing (zero, nothing, zero: a byte each in
+    /// postcard), format 3 format 2 followed by the five debug registers
+    /// (zeros, a byte each).
+    fn older_state(version: u32) -> Vec<u8> {
         let system = System::new(&fake_bios()).unwrap();
         let mut state = system.save_state();
-        // Format 3 is format 2 followed by the five registers: zeros, one
-        // byte each in postcard.
-        assert_eq!(&state[state.len() - 5..], &[0; 5]);
-        state.truncate(state.len() - 5);
+        let cut = match version {
+            3 => 3,
+            2 => 3 + 5,
+            _ => unreachable!(),
+        };
+        assert!(state[state.len() - cut..].iter().all(|&b| b == 0));
+        state.truncate(state.len() - cut);
         let at = STATE_MAGIC.len();
-        state[at..at + 4].copy_from_slice(&2u32.to_le_bytes());
+        state[at..at + 4].copy_from_slice(&version.to_le_bytes());
+        state
+    }
+
+    /// Format 2 and 3 states (before the debug registers, the timing) still
+    /// load.
+    #[test]
+    fn older_states_load() {
+        for version in [2, 3] {
+            let mut other = System::new(&fake_bios()).unwrap();
+            other.load_state(&older_state(version)).unwrap();
+            assert_eq!(other.cpu.debug_registers(), [0; 5]);
+        }
+    }
+
+    /// The timing comes back with the state: a restored machine goes on as
+    /// the saved one would.
+    #[test]
+    fn save_states_keep_the_timing() {
+        let mut system = System::new(&fake_bios()).unwrap();
+        system.bus.gpu.drawing = 12_345;
+        system.bus.gpu_list = Some(678);
+        system.bus.spu.capture = 0x1ab;
+        let state = system.save_state();
         let mut other = System::new(&fake_bios()).unwrap();
         other.load_state(&state).unwrap();
-        assert_eq!(other.cpu.debug_registers(), [0; 5]);
+        assert_eq!(other.bus.gpu.drawing, 12_345);
+        assert_eq!(other.bus.gpu_list, Some(678));
+        assert_eq!(other.bus.spu.capture, 0x1ab);
+        assert_eq!(other.save_state(), state);
     }
 
     #[test]

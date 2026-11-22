@@ -163,10 +163,10 @@ pub struct Gpu {
     pub flips: u32,
     /// GPU cycles of drawing just sent, and the drawing still under way, in
     /// CPU cycles: the GPU draws while the CPU runs (see `wait_drawing`).
-    /// Not in save states (a frame's drawing time at most is lost).
+    /// `drawing` is saved apart (`crate::Timing`), after the rest.
     busy: u64,
     #[serde(skip)]
-    drawing: u64,
+    pub(crate) drawing: u64,
     /// Recording for another renderer (see `set_recording`): what changes
     /// the scaled VRAM, and the native area drawn since the recorder last
     /// sent it (inclusive).
