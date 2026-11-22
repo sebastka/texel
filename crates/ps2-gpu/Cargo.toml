@@ -10,7 +10,7 @@ publish.workspace = true
 texel-ps2.workspace = true
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-pollster = "0.4.0"
+pollster = "1.0.3"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies.wgpu]
 version = "=30.0.1"
