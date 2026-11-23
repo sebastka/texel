@@ -267,11 +267,31 @@ impl Dma {
         (v & 0x00FF_FFFF) | flags
     }
 
+    /// DICR's bit 31, the DMA interrupt's line: forced (bit 15), or
+    /// enabled (bit 23) with a channel's flag up (in either register).
+    fn master(&self) -> bool {
+        let pending = (self.dicr | self.dicr2) & 0x7F00_0000 != 0;
+        self.dicr & (1 << 15) != 0 || (self.dicr & (1 << 23) != 0 && pending)
+    }
+
     fn read_dicr(&self, second: bool) -> u32 {
         let dicr = if second { self.dicr2 } else { self.dicr };
-        let pending = (self.dicr | self.dicr2) & 0x7F00_0000 != 0;
-        let master = self.dicr & (1 << 15) != 0 || (self.dicr & (1 << 23) != 0 && pending);
-        dicr | if master { 1 << 31 } else { 0 }
+        dicr | if self.master() { 1 << 31 } else { 0 }
+    }
+
+    /// Writes DICR (or DICR2): the interrupt is raised when bit 31 rises
+    /// (the IOP's kernel turning the master enable back on, a flag still
+    /// up, gets its interrupt).
+    fn write(&mut self, second: bool, v: u32, intc: &mut Intc) {
+        let before = self.master();
+        if second {
+            self.dicr2 = Self::write_dicr(self.dicr2, v);
+        } else {
+            self.dicr = Self::write_dicr(self.dicr, v);
+        }
+        if !before && self.master() {
+            intc.raise(irq::DMA);
+        }
     }
 }
 
@@ -556,9 +576,9 @@ impl IopBus {
             0x1F80_1074 => self.intc.mask = v,
             0x1F80_1078 => self.intc.ctrl = v & 1,
             0x1F80_10F0 => self.dma.dpcr = v,
-            0x1F80_10F4 => self.dma.dicr = Dma::write_dicr(self.dma.dicr, v),
+            0x1F80_10F4 => self.dma.write(false, v, &mut self.intc),
             0x1F80_1570 => self.dma.dpcr2 = v,
-            0x1F80_1574 => self.dma.dicr2 = Dma::write_dicr(self.dma.dicr2, v),
+            0x1F80_1574 => self.dma.write(true, v, &mut self.intc),
             0x1F80_1578 => self.dma.dmacen = v,
             0x1F80_157C => self.dma.dmacinten = v,
             0xFFFE_0130 => self.cache_ctrl = v,
@@ -793,6 +813,31 @@ impl CpuBus for IopBus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A channel finishing while the master enable is off sets its flag
+    /// only; turning the enable back on raises the interrupt (DICR bit 31
+    /// rises), as the IOP's kernel needs when it toggles the enable (Jak 3
+    /// waited forever for an EE reply otherwise).
+    #[test]
+    fn dma_interrupt_when_the_master_enable_returns() {
+        let mut dma = Dma::default();
+        let mut intc = Intc::default();
+        // SIF1 (channel 10) enabled in DICR2; the master enable off.
+        dma.write(true, 1 << (16 + 3), &mut intc);
+        dma.complete(10, &mut intc);
+        assert_eq!(dma.dicr2 & (1 << 27), 1 << 27);
+        assert_eq!(intc.stat, 0);
+        dma.write(false, 1 << 23, &mut intc);
+        assert_eq!(intc.stat, 1 << irq::DMA);
+        assert_ne!(dma.read_dicr(false) & (1 << 31), 0);
+        // Written again with the flag still up: no new interrupt.
+        intc.stat = 0;
+        dma.write(false, 1 << 23, &mut intc);
+        assert_eq!(intc.stat, 0);
+        // The flag cleared (written 1): bit 31 falls.
+        dma.write(true, (1 << (16 + 3)) | (1 << 27), &mut intc);
+        assert_eq!(dma.read_dicr(false) & (1 << 31), 0);
+    }
 
     #[test]
     fn timers_interrupt_once_or_repeatedly() {
