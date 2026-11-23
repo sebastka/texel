@@ -18,8 +18,8 @@ export interface StartMessage {
   audio: SharedArrayBuffer | null;
   smooth: boolean;
   scale: number;
-  /** Netplay: the room to join, and this member's name. */
-  join: { code: string; name: string } | null;
+  /** Netplay: the room whose game this is, to run in step with it. */
+  room: RoomSnapshot | null;
 }
 
 /** Owners of each controller: member ids (several share a controller). */
@@ -30,27 +30,41 @@ export type Half = "top" | "bottom" | "left" | "right";
  * null: everyone sees the whole screen. */
 export type SplitView = Half | null;
 
+/** What a player needs of the room to run its game in step: who is
+ * there, who hosts, the epoch, the controllers and split screen. */
+export interface RoomSnapshot {
+  me: number;
+  host: number;
+  epoch: number;
+  members: { id: number; name: string; registered: boolean; rtt: number | null }[];
+  ports: Ports;
+  /** The host handed out the controllers (no automatic second one). */
+  assigned: boolean;
+  view: SplitView;
+}
+
 export interface Member {
   id: number;
   name: string;
   host: boolean;
+  /** Signed in: may take over as the host. */
+  registered: boolean;
   me: boolean;
-  /** Has the game's state and runs it. */
+  /** Runs the game in step. */
   playing: boolean;
   /** Round trip to the server, in ms. */
   rtt: number | null;
 }
 
+/** A room's game, as the player runs it. */
 export interface NetStatus {
-  /** connecting → syncing (guests) → playing ⇄ stalled → ended. */
-  state: "connecting" | "syncing" | "playing" | "stalled" | "ended";
-  code: string | null;
-  /** This member's id (0: the host). */
-  me: number | null;
+  /** syncing (guests) → playing ⇄ stalled → ended. */
+  state: "syncing" | "playing" | "stalled" | "ended";
+  epoch: number;
+  me: number;
   members: Member[];
   ports: Ports;
-  /** Round trip to the server, in ms. */
-  rtt: number | null;
+  assigned: boolean;
   /** This member's input delay, in frames. */
   delay: number | null;
   /** Members the game waits for, while stalled. */
@@ -96,16 +110,18 @@ export type ToWorker =
   | { type: "load-state"; slot: number }
   /** Opens the lid, then closes it on another disc of the game. */
   | { type: "swap"; gameId: string; cue: string | null; files: { name: string; size: number }[]; sbi: boolean }
-  /** Opens a netplay room for the running game. */
-  | { type: "net-host"; gameId: string; biosId: string; name: string }
+  /** The running game becomes the room's (the host's, as it is). */
+  | { type: "net-attach"; room: RoomSnapshot }
+  /** A message from the room. */
+  | { type: "net-in"; data: string | ArrayBuffer }
   /** Host: who drives each controller. */
   | { type: "net-ports"; ports: Ports }
-  | { type: "net-chat"; text: string }
-  /** Host: hides the other player's half of the screen from each player. */
+  /** Split screen (the page tells the others). */
   | { type: "net-view"; view: SplitView }
   | { type: "net-leave" };
 
 export type Axes = [number, number, number, number];
+
 
 export type FromWorker =
   /** Controller state, sent when it changes: analog mode and rumble (0-1). */
@@ -122,5 +138,6 @@ export type FromWorker =
   | { type: "state-saved"; slot: number }
   | { type: "state-loaded"; slot: number }
   | { type: "net"; status: NetStatus }
-  | { type: "net-chat"; line: ChatLine }
+  /** A message for the room. */
+  | { type: "net-out"; data: string | Uint8Array }
   | { type: "error"; message: string };

@@ -4,7 +4,7 @@ import type { Console, GameDetail } from "./api";
 import { createRing } from "./audio";
 import workletUrl from "./audio-worklet.ts?worker&url";
 import { Input } from "./input";
-import type { ChatLine, FromWorker, NetStatus, Ports, SplitView, StartMessage, ToWorker } from "./protocol";
+import type { FromWorker, NetStatus, Ports, RoomSnapshot, SplitView, StartMessage, ToWorker } from "./protocol";
 
 interface Callbacks {
   onStatus: (s: string) => void;
@@ -15,9 +15,10 @@ interface Callbacks {
   onAnalog: (analog: boolean) => void;
   /** Running: with what renderer (WebGPU, or null for software). */
   onStarted?: (renderer: string | null) => void;
-  /** Netplay session changes. */
+  /** The room's game, as this player runs it. */
   onNet?: (status: NetStatus) => void;
-  onChat?: (line: ChatLine) => void;
+  /** A message for the room. */
+  onNetOut?: (data: string | Uint8Array) => void;
 }
 
 const SMOOTH_KEY = "texel.smooth";
@@ -105,19 +106,14 @@ export class Player {
     this.worker.onmessage = (e: MessageEvent<FromWorker>) => this.onMessage(e.data);
     this.worker.onerror = (e) => cb.onStatus(`Error: ${e.message}`);
     document.addEventListener("visibilitychange", this.onVisibility);
-    window.addEventListener("pagehide", this.onPageHide);
   }
-
-  /** Leaving the page (it may stay frozen in the back/forward cache):
-   * leave netplay, so that the other side knows. */
-  private onPageHide = () => this.send({ type: "net-leave" });
 
   private send(msg: ToWorker, transfer: Transferable[] = []) {
     this.worker.postMessage(msg, transfer);
   }
 
-  /** Starts a game; with `join`, as the guest of that netplay room. */
-  async start(biosId: string, game: GameDetail, join: { code: string; name: string } | null = null) {
+  /** Starts a game; with `room`, as that netplay room's game. */
+  async start(biosId: string, game: GameDetail, room: RoomSnapshot | null = null) {
     await this.launch({
       console: "ps1",
       biosId,
@@ -126,7 +122,7 @@ export class Player {
       cue: game.cue,
       files: game.files,
       sbi: game.sbi,
-      join,
+      room,
     });
   }
 
@@ -141,11 +137,11 @@ export class Player {
       cue: game?.cue ?? null,
       files: game?.files ?? [],
       sbi: false,
-      join: null,
+      room: null,
     });
   }
 
-  private async launch(what: Pick<StartMessage, "console" | "biosId" | "gameId" | "cardsId" | "cue" | "files" | "sbi" | "join">) {
+  private async launch(what: Pick<StartMessage, "console" | "biosId" | "gameId" | "cardsId" | "cue" | "files" | "sbi" | "room">) {
     const canvas = document.createElement("canvas");
     canvas.width = 640;
     canvas.height = 480;
@@ -258,8 +254,8 @@ export class Player {
       case "net":
         this.cb.onNet?.(msg.status);
         break;
-      case "net-chat":
-        this.cb.onChat?.(msg.line);
+      case "net-out":
+        this.cb.onNetOut?.(msg.data);
         break;
       case "error":
         this.cb.onStatus(`Error: ${msg.message}`);
@@ -346,9 +342,14 @@ export class Player {
     this.cb.onStatus(this.paused ? "Paused" : "Running");
   }
 
-  /** Opens a netplay room for the running game. */
-  hostNetplay(gameId: string, biosId: string, name: string) {
-    this.send({ type: "net-host", gameId, biosId, name });
+  /** The running game becomes the room's: the host's, as it is. */
+  attachNetplay(room: RoomSnapshot) {
+    this.send({ type: "net-attach", room });
+  }
+
+  /** A message from the room. */
+  netIn(data: string | ArrayBuffer) {
+    this.send({ type: "net-in", data }, typeof data === "string" ? [] : [data]);
   }
 
   /** Host: who drives each controller. */
@@ -356,13 +357,9 @@ export class Player {
     this.send({ type: "net-ports", ports });
   }
 
-  /** Host: split screen (see SplitView). */
+  /** Split screen (see SplitView). */
   setNetView(view: SplitView) {
     this.send({ type: "net-view", view });
-  }
-
-  say(text: string) {
-    this.send({ type: "net-chat", text });
   }
 
   leaveNetplay() {
@@ -420,7 +417,6 @@ export class Player {
     this.resize?.disconnect();
     this.input.dispose();
     document.removeEventListener("visibilitychange", this.onVisibility);
-    window.removeEventListener("pagehide", this.onPageHide);
     void this.audio?.close();
     setTimeout(() => this.worker.terminate(), 1000);
   }

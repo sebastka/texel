@@ -245,7 +245,7 @@ export const api = {
   memcards: () => json<string[]>("/api/memcards"),
   game: (id: string) => json<GameDetail>(`/api/games/${encodeURIComponent(id)}`),
   room: (code: string) =>
-    json<{ game: string; bios: string; full: boolean }>(`/api/netplay/rooms/${encodeURIComponent(code)}`),
+    json<{ game: string | null; bios: string | null; full: boolean }>(`/api/netplay/rooms/${encodeURIComponent(code)}`),
   /** Records the BIOS a game is started with, preselected next time. */
   setBios: (id: string, bios: string) =>
     fetch(`/api/games/${encodeURIComponent(id)}/bios`, { method: "PUT", body: bios }),

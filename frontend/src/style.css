@@ -215,7 +215,20 @@ button:disabled {
 }
 
 .search {
-  width: min(360px, 40vw);
+  width: 220px;
+  min-width: 120px;
+}
+
+/* Wide enough: the tabs and the tools share one line, the search field
+ * giving way first. */
+@media (min-width: 1000px) {
+  header {
+    flex-wrap: nowrap;
+  }
+
+  .header-main {
+    flex: 0 0 auto;
+  }
 }
 
 /* --- Pages ----------------------------------------------------------------------- */
@@ -700,6 +713,10 @@ table.bios-pick tr.best .relevance {
   font-size: 12px;
 }
 
+.small-button[hidden] {
+  display: none;
+}
+
 .relevance {
   font-size: 13px;
   color: var(--muted);
@@ -981,23 +998,23 @@ table.tracks td {
   display: none;
 }
 
-/* --- Room (netplay) ----------------------------------------------------------------- */
+/* --- Player layout ----------------------------------------------------------------- */
 
-/* The screen and its controls, with the room on the right (below the
- * screen on narrow screens). */
+/* The screen and its controls, with the room's chat on the right (below
+ * the screen on narrow screens). */
 .player-body {
   display: grid;
-  grid-template-columns: minmax(0, calc((100vh - 170px) * 4 / 3)) 320px;
+  grid-template-columns: minmax(0, calc((100vh - 170px) * 4 / 3)) 300px;
   grid-template-areas:
-    "stage room"
-    "controls room";
+    "stage side"
+    "controls side";
   justify-content: center;
   align-items: start;
   gap: 10px 16px;
   width: 100%;
 }
 
-.player-body:has(> .room[hidden]) {
+.player-body:has(> .room-side[hidden]) {
   grid-template-columns: minmax(0, calc((100vh - 170px) * 4 / 3));
   grid-template-areas:
     "stage"
@@ -1007,6 +1024,32 @@ table.tracks td {
 .player-body > .controls {
   grid-area: controls;
   justify-self: center;
+}
+
+.room-side {
+  grid-area: side;
+  position: sticky;
+  top: 76px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px 14px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+.room-side[hidden] {
+  display: none;
+}
+
+.room-side h2 {
+  margin: 0;
+  font-size: 15px;
+}
+
+.room-side .chat-log {
+  height: min(420px, calc(100vh - 260px));
 }
 
 .player-stage {
@@ -1022,105 +1065,92 @@ table.tracks td {
   width: 100%;
 }
 
-.room {
-  grid-area: room;
-  position: sticky;
-  top: 16px;
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-  max-height: calc(100vh - 32px);
-  overflow-y: auto;
-  padding: 14px 16px;
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
+@media (max-width: 1000px) {
+  .player-body,
+  .player-body:has(> .room-side[hidden]) {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-areas:
+      "stage"
+      "side"
+      "controls";
+  }
+
+  .room-side {
+    position: static;
+  }
 }
 
-.room[hidden],
-.split[hidden],
-.chat[hidden] {
+/* --- Room (netplay) ----------------------------------------------------------------- */
+
+/* Under the header, on every page while in a room. */
+.room-bar {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 8px 16px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+}
+
+.room-bar[hidden],
+.room-more[hidden],
+.view-select[hidden],
+.open-room[hidden] {
   display: none;
 }
 
-.room h2 {
-  margin: 0;
-  font-size: 16px;
-}
-
-.room h3 {
-  margin: 0 0 6px;
-  font-size: 14px;
-}
-
-.room p {
-  margin: 0;
-}
-
-.view-select {
-  width: 100%;
-  margin-bottom: 6px;
-}
-
-.room-body {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-}
-
-.room-open,
-.chat-form {
-  display: flex;
-  gap: 8px;
-}
-
-.room-open input,
-.chat-form input {
-  flex: 1;
-  min-width: 0;
-}
-
-.room-code {
+.room-line {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: 8px;
+  gap: 6px 12px;
 }
 
-.link-field {
-  flex: 1 1 100%;
-  min-width: 0;
-  font-size: 13px;
+.room-label {
+  font-weight: 600;
 }
 
-.room-code strong {
+.room-code {
   font-family: ui-monospace, monospace;
-  font-size: 20px;
+  font-size: 18px;
   letter-spacing: 0.08em;
 }
 
-.members {
+.link-field {
+  min-width: 0;
+  width: 22em;
+  font-size: 13px;
+}
+
+.room-state {
+  min-width: 0;
+}
+
+.room-actions {
   display: flex;
-  flex-direction: column;
-  gap: 4px;
+  gap: 8px;
+  margin-left: auto;
+}
+
+.room-members {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
   margin: 0;
   padding: 0;
   list-style: none;
 }
 
-.members li {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto auto;
+.room-members li {
+  display: flex;
   align-items: center;
   gap: 8px;
-  padding: 6px 8px;
+  padding: 4px 6px 4px 10px;
   background: var(--surface-2);
-  border-radius: 6px;
+  border-radius: 999px;
 }
 
 .member-name {
-  overflow: hidden;
-  text-overflow: ellipsis;
   white-space: nowrap;
 }
 
@@ -1153,18 +1183,49 @@ table.tracks td {
   color: var(--warn);
 }
 
-.net-actions {
+/* The chat and the split screen: unfolded in the bar, or beside the game. */
+.room-more {
+  max-width: 720px;
+}
+
+.room-chat {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.room-split {
   display: flex;
   flex-wrap: wrap;
+  align-items: center;
   gap: 8px;
+  min-width: 0;
+}
+
+/* Its options are long: the list stays within its box, and the chosen
+ * one is cut short rather than overflowing. */
+.view-select {
+  flex: 1 1 12em;
+  min-width: 0;
+  max-width: 100%;
+  text-overflow: ellipsis;
+}
+
+.chat-form {
+  display: flex;
+  gap: 8px;
+}
+
+.chat-form input {
+  flex: 1;
+  min-width: 0;
 }
 
 .chat-log {
   display: flex;
   flex-direction: column;
   gap: 4px;
-  height: 220px;
-  margin-bottom: 8px;
+  height: 180px;
   padding: 8px;
   overflow-y: auto;
   font-size: 14px;
@@ -1173,7 +1234,7 @@ table.tracks td {
   border-radius: 6px;
 }
 
-.room .chat-line {
+.chat-line {
   margin: 0;
   overflow-wrap: anywhere;
 }
@@ -1189,22 +1250,6 @@ table.tracks td {
   font-style: normal;
   color: var(--muted);
   font-variant-numeric: tabular-nums;
-}
-
-@media (max-width: 1000px) {
-  .player-body,
-  .player-body:has(> .room[hidden]) {
-    grid-template-columns: minmax(0, 1fr);
-    grid-template-areas:
-      "stage"
-      "room"
-      "controls";
-  }
-
-  .room {
-    position: static;
-    max-height: none;
-  }
 }
 
 main.join {

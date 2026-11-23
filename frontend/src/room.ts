@@ -1,17 +1,12 @@
-// The netplay room, beside the game: its code, its members and who has
-// which controller, and the chat.
+// The netplay room's bar, under the header on every page while in a room:
+// its code, its members and who has which controller, what it plays, and
+// the chat: folded away, or beside the screen in the room's game.
 
 import { h, type Child } from "./dom";
-import type { ChatLine, Half, Member, NetStatus, Ports, SplitView } from "./protocol";
+import type { Room } from "./room-link";
+import type { ChatLine, Half, NetStatus, Ports, SplitView } from "./protocol";
 
 const NAME_KEY = "texel.name";
-
-/** The signed-in user's name: rooms are opened under it. */
-let accountName: string | null = null;
-
-export function setAccountName(name: string | null) {
-  accountName = name;
-}
 
 export function savedName(): string {
   try {
@@ -32,22 +27,36 @@ export function saveName(name: string) {
 /** "ABCDEF" → "ABC-DEF". */
 export const formatCode = (code: string) => `${code.slice(0, 3)}-${code.slice(3)}`;
 
-export interface RoomOptions {
-  /** Joining someone's room, rather than hosting. */
-  guest: boolean;
-  /** Host: opens a room under this name. */
-  open: (name: string) => void;
+export interface BarActions {
   setPorts: (ports: Ports) => void;
-  /** Host: split screen. */
   setView: (view: SplitView) => void;
   say: (text: string) => void;
   leave: () => void;
+  /** Hides the bar of a room that ended. */
+  dismiss: () => void;
 }
 
-export interface RoomPanel {
+/** What the bar shows. */
+export type BarState =
+  | {
+      room: Room;
+      /** The room's game, as this member's player runs it (none while
+       * this member is not in it). */
+      net: NetStatus | null;
+      /** The room's game's title. */
+      title: string | null;
+      /** This page shows the room's game. */
+      here: boolean;
+    }
+  | { ended: string };
+
+export interface RoomBar {
   element: HTMLElement;
-  status: (s: NetStatus) => void;
+  render: (s: BarState | null) => void;
   chat: (line: ChatLine) => void;
+  /** Shows the chat (and the split screen) in `place`, beside the game;
+   * null: back in the bar, folded. */
+  dock: (place: HTMLElement | null) => void;
 }
 
 const time = (ms: number) => {
@@ -55,31 +64,32 @@ const time = (ms: number) => {
   return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
 };
 
-export function roomPanel(o: RoomOptions): RoomPanel {
-  let net: NetStatus | null = null;
-  const body = h("div.room-body");
+const OPPOSITE: Record<Half, Half> = { top: "bottom", bottom: "top", left: "right", right: "left" };
+
+export function roomBar(a: BarActions): RoomBar {
+  const body = h("div.room-line");
+  const members = h("ul.room-members");
   const log = h("div.chat-log", { role: "log", "aria-live": "polite" });
   const message = h("input.chat-input", { placeholder: "Message", maxLength: 500, "aria-label": "Chat message" });
-  const chat = h(
-    "section.chat",
-    { hidden: true },
-    h("h3", {}, "Chat"),
-    log,
-    h(
-      "form.chat-form",
-      {
-        onsubmit: (e: Event) => {
-          e.preventDefault();
-          const text = message.value.trim();
-          if (!text) return;
-          o.say(text);
-          message.value = "";
-        },
+  let unread = 0;
+  let current: BarState | null = null;
+  const chatButton = h(
+    "button.ghost.small-button.toggle",
+    {
+      "aria-expanded": "false",
+      onclick: () => {
+        more.hidden = !more.hidden;
+        chatButton.setAttribute("aria-expanded", String(!more.hidden));
+        if (!more.hidden) {
+          unread = 0;
+          log.scrollTop = log.scrollHeight;
+          message.focus();
+        }
+        render(current);
       },
-      message,
-      h("button.ghost", { type: "submit" }, "Send"),
-    ),
-  );
+    },
+    "Chat",
+  ) as HTMLButtonElement;
   // Split screen: built once, so that an open menu survives updates.
   const VIEWS: [SplitView, string][] = [
     [null, "Everyone sees the whole screen"],
@@ -92,49 +102,64 @@ export function roomPanel(o: RoomOptions): RoomPanel {
     "select.view-select",
     {
       "aria-label": "Split screen",
+      title:
+        "For split-screen games: each player's browser hides the other player's half. Those who watch, or hold both " +
+        "controllers, see everything.",
       onchange: (e: Event) => {
         const v = (e.target as HTMLSelectElement).value;
-        o.setView(v ? (v as Half) : null);
+        a.setView(v ? (v as Half) : null);
       },
     },
     ...VIEWS.map(([v, label]) => h("option", { value: v ?? "" }, label)),
   );
-  const viewText = h("p.small");
-  const split = h(
-    "section.split",
-    { hidden: true },
-    h("h3", {}, "Split screen"),
-    o.guest ? viewText : viewSelect,
+  const viewText = h("span.small");
+  const split = h("div.room-split", {}, h("span.muted.small", {}, "Split screen:"), viewSelect, viewText);
+  // The chat and the split screen: in the bar (`more`), or docked.
+  const chatBox = h(
+    "div.room-chat",
+    {},
+    log,
     h(
-      "p.muted.small",
-      {},
-      "For split-screen games: each player's browser hides the other player's half. " +
-        "Those who watch, or hold both controllers, see everything.",
+      "form.chat-form",
+      {
+        onsubmit: (e: Event) => {
+          e.preventDefault();
+          const text = message.value.trim();
+          if (!text) return;
+          a.say(text);
+          message.value = "";
+        },
+      },
+      message,
+      h("button.ghost", { type: "submit" }, "Send"),
     ),
+    split,
   );
-  const element = h("aside.room", {}, h("h2", {}, "Play together"), body, split, chat);
+  const more = h("div.room-more", { hidden: true }, chatBox);
+  let docked = false;
+  const element = h("section.room-bar", { hidden: true, "aria-label": "Room" }, body, members, more);
 
-  const active = () => !!net && net.state !== "ended" && net.state !== "connecting";
-
-  const chips = (m: Member, ports: Ports) =>
+  const chips = (room: Room, id: number, ports: Ports, net: NetStatus | null) =>
     h(
       "span.chips",
       {},
       ...[0, 1].map((port) => {
-        const on = ports[port]!.includes(m.id);
+        const on = ports[port]!.includes(id);
         const label = `Controller ${port + 1}`;
-        if (o.guest) return on ? h("span.chip.on", { title: label }, `🎮 ${port + 1}`) : null;
+        if (!room.isHost) return on ? h("span.chip.on", { title: label }, `🎮 ${port + 1}`) : null;
+        // In a game, only to those running it (the others would hold it up).
+        const playing = !net || net.members.some((m) => m.id === id && m.playing);
         return h(
           `button.chip${on ? ".on" : ""}`,
           {
-            title: m.playing ? `${on ? "Take back" : "Give"} ${label.toLowerCase()}` : "Still joining",
-            disabled: !m.playing,
+            title: playing ? `${on ? "Take back" : "Give"} ${label.toLowerCase()}` : "Not in the game yet",
+            disabled: !playing,
             "aria-pressed": String(on),
             onclick: () => {
               const next = ports.map((ids, i) =>
-                i === port ? (on ? ids.filter((x) => x !== m.id) : [...ids, m.id]) : [...ids],
+                i === port ? (on ? ids.filter((x) => x !== id) : [...ids, id]) : [...ids],
               ) as Ports;
-              o.setPorts(next);
+              a.setPorts(next);
             },
           },
           `🎮 ${port + 1}`,
@@ -142,147 +167,153 @@ export function roomPanel(o: RoomOptions): RoomPanel {
       }),
     );
 
-  const render = () => {
-    const s = net;
-    const parts: Child[] = [];
-    if (!o.guest && (!s || s.state === "ended")) {
-      const name = h("input.name-input", {
-        value: accountName ?? savedName(),
-        placeholder: "Your name",
-        maxLength: 24,
-        "aria-label": "Your name",
-        readOnly: accountName !== null,
-        title: accountName !== null ? "Your account's name" : "",
-      });
-      parts.push(
-        h(
-          "p.muted",
-          {},
-          "Open a room and share its code: friends who join run this game in their browser, in step with yours. " +
-            "Two can play at once, on the two controllers; the others watch, and everyone can chat.",
-        ),
-        s?.note ? h("p.muted.small", {}, s.note) : null,
-        h(
-          "form.room-open",
-          {
-            onsubmit: (e: Event) => {
-              e.preventDefault();
-              const n = name.value.trim();
-              if (!n) return name.focus();
-              if (accountName === null) saveName(n);
-              o.open(n);
-            },
-          },
-          name,
-          h("button.primary", { type: "submit" }, "Open a room"),
-        ),
+  function render(s: BarState | null) {
+    current = s;
+    element.hidden = !s;
+    if (!s) return;
+    if ("ended" in s) {
+      body.replaceChildren(
+        h("span.room-label", {}, "Room"),
+        h("span.room-state", {}, s.ended),
+        h("span.room-actions", {}, h("button.ghost.small-button", { onclick: () => a.dismiss() }, "Dismiss")),
       );
-    } else if (!s || s.state === "connecting" || (o.guest && s.state === "syncing")) {
-      parts.push(h("p", {}, o.guest ? "Joining the room…" : "Opening a room…"));
-    } else if (s.state === "ended") {
-      parts.push(h("p", {}, s.note ?? "The session ended."), h("a.button.ghost", { href: "#/join" }, "Join another room"));
+      members.replaceChildren();
+      more.hidden = true;
+      return;
     }
-    if (s && active() && s.code) {
-      const link = `${location.origin}${location.pathname}#/join/${s.code}`;
-      const copy = h(
-        "button.ghost",
-        {
-          onclick: () => {
-            // No clipboard on insecure origins (plain http, but for
-            // localhost): show the link, selected, to copy by hand.
-            const manual = () => {
-              const field = h("input.link-field", { value: link, readOnly: true, "aria-label": "Room link" });
-              copy.replaceWith(field);
-              field.select();
-            };
-            if (!navigator.clipboard) return manual();
-            navigator.clipboard.writeText(link).then(() => (copy.textContent = "Copied"), manual);
-          },
+    const { room, net, title, here } = s;
+    if (room.state === "connecting" || !room.code) {
+      body.replaceChildren(h("span.room-label", {}, "Room"), h("span.room-state", {}, "Connecting…"));
+      members.replaceChildren();
+      return;
+    }
+    const link = `${location.origin}${location.pathname}#/join/${room.code}`;
+    const copy = h(
+      "button.ghost.small-button",
+      {
+        onclick: () => {
+          // No clipboard on insecure origins (plain http, but for
+          // localhost): show the link, selected, to copy by hand.
+          const manual = () => {
+            const field = h("input.link-field", { value: link, readOnly: true, "aria-label": "Room link" });
+            copy.replaceWith(field);
+            field.select();
+          };
+          if (!navigator.clipboard) return manual();
+          navigator.clipboard.writeText(link).then(() => (copy.textContent = "Copied"), manual);
         },
-        "Copy link",
+      },
+      "Copy link",
+    );
+    // What the room does, from this member's side.
+    let doing: Child;
+    if (!room.game) {
+      doing = room.isHost
+        ? h("span", {}, "Start a game from the library: everyone plays it with you.")
+        : h("span", {}, `${room.hostName} is choosing a game.`);
+    } else if (!here) {
+      doing = h("span", {}, `Playing ${title ?? "a game"}. `, h("a", { href: "#/room" }, "Back to the game"));
+    } else if (!net || net.state === "syncing") {
+      doing = h("span", {}, `Getting ${room.hostName}'s game…`);
+    } else if (net.state === "stalled" && net.waitingFor.length) {
+      doing = h("span.net-stalled", {}, `Waiting for ${net.waitingFor.join(", ")}…`);
+    } else {
+      doing = h(
+        "span",
+        {},
+        `Playing ${title ?? "a game"}`,
+        net.delay !== null ? h("span.muted.small", {}, ` · input delay ${net.delay}`) : null,
       );
-      const holders = (port: number) => {
-        const names = s.ports[port]!.map((id) => s.members.find((m) => m.id === id)?.name).filter(Boolean);
-        return names.length ? names.join(" + ") : "nobody";
-      };
-      parts.push(
-        h("p.room-code", {}, h("span.muted", {}, "Code"), h("strong", {}, formatCode(s.code)), copy),
+    }
+    const heir = room.heir;
+    const leaveTitle = !room.isHost
+      ? ""
+      : heir
+        ? `${heir.name} becomes the host and the room goes on.`
+        : "Nobody else here has an account to take over: the room closes.";
+    chatButton.textContent = unread && more.hidden ? `Chat (${unread})` : "Chat";
+    chatButton.hidden = docked;
+    body.replaceChildren(
+      h("span.room-label", {}, "Room"),
+      h("strong.room-code", {}, formatCode(room.code)),
+      copy,
+      h("span.room-state", {}, doing),
+      ...(net?.note ? [h("span.muted.small.room-note", {}, net.note)] : []),
+      h(
+        "span.room-actions",
+        {},
+        chatButton,
         h(
-          "ul.members",
+          "button.ghost.small-button",
+          { title: leaveTitle, onclick: () => a.leave() },
+          room.isHost && !heir ? "Close the room" : "Leave the room",
+        ),
+      ),
+    );
+    const inGame = net && here ? net : null;
+    const ports = inGame ? inGame.ports : room.ports;
+    members.replaceChildren(
+      ...[...room.members.values()].map((m) => {
+        const status = inGame?.members.find((x) => x.id === m.id);
+        return h(
+          "li",
           {},
-          ...s.members.map((m) =>
-            h(
-              "li",
-              {},
-              h(
-                "span.member-name",
-                {},
-                h("strong", {}, m.name),
-                m.me ? h("span.muted.small", {}, " (you)") : null,
-                m.host ? h("span.muted.small", {}, " · host") : null,
-              ),
-              h(
-                "span.muted.small.member-state",
-                {},
-                !m.playing ? "joining…" : m.rtt !== null ? `${Math.round(m.rtt)} ms` : "",
-              ),
-              chips(m, s.ports),
-            ),
+          h(
+            "span.member-name",
+            {},
+            h("strong", {}, m.name),
+            m.id === room.me ? h("span.muted.small", {}, " (you)") : null,
+            m.id === room.host ? h("span.muted.small", {}, " · host") : null,
           ),
-        ),
-        h("p.small", {}, `Controller 1: ${holders(0)} · Controller 2: ${holders(1)}`),
-        !o.guest
-          ? h("p.muted.small", {}, "Hand out a controller with 🎮 1 or 🎮 2 next to a name; two names on one controller share it.")
-          : null,
-        s.state === "stalled" && s.waitingFor.length ? h("p.net-stalled", {}, `Waiting for ${s.waitingFor.join(", ")}…`) : null,
-        s.delay !== null ? h("p.muted.small", {}, `Your input delay: ${s.delay} frame${s.delay === 1 ? "" : "s"}`) : null,
-        s.note ? h("p.muted.small", {}, s.note) : null,
-        h(
-          "div.net-actions",
-          {},
-          h("button.ghost", { onclick: () => o.leave() }, o.guest ? "Leave the room" : "Close the room"),
-        ),
-      );
-    }
-    body.replaceChildren(...parts.filter((p): p is Node | string => !!p));
-    split.hidden = !active();
-    if (s) {
-      viewSelect.value = s.view ?? "";
-      const OPPOSITE: Record<Half, Half> = { top: "bottom", bottom: "top", left: "right", right: "left" };
-      viewText.textContent = !s.view
-        ? "Everyone sees the whole screen."
-        : s.hidden
-          ? `You see the ${OPPOSITE[s.hidden]} half; the other one is hidden.`
-          : "Each player sees their half; you see everything.";
-    }
-    chat.hidden = !active() && !log.childElementCount;
-  };
+          h(
+            "span.muted.small.member-state",
+            {},
+            status && !status.playing ? "not in the game" : m.rtt !== null ? `${Math.round(m.rtt)} ms` : "",
+          ),
+          chips(room, m.id, ports, inGame),
+        );
+      }),
+    );
+    const view = inGame?.view ?? room.view;
+    viewSelect.value = view ?? "";
+    viewSelect.hidden = !room.isHost;
+    viewText.hidden = room.isHost;
+    viewText.textContent = !view
+      ? "everyone sees the whole screen."
+      : inGame?.hidden
+        ? `you see the ${OPPOSITE[inGame.hidden]} half; the other one is hidden.`
+        : "each player sees their half; you see everything.";
+  }
 
-  render();
   return {
     element,
-    status: (s) => {
-      // A new room: a new chat.
-      if (s.code && s.code !== net?.code) log.replaceChildren();
-      net = s;
-      render();
-    },
+    render,
     chat: (line) => {
       const atBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 8;
       log.append(
         line.from === null
           ? h("p.chat-line.notice", {}, h("span.chat-time", {}, time(line.at)), line.text)
-          : h(
-              "p.chat-line",
-              {},
-              h("span.chat-time", {}, time(line.at)),
-              h("strong", {}, line.name),
-              " ",
-              line.text,
-            ),
+          : h("p.chat-line", {}, h("span.chat-time", {}, time(line.at)), h("strong", {}, line.name), " ", line.text),
       );
       if (atBottom) log.scrollTop = log.scrollHeight;
-      chat.hidden = false;
+      if (more.hidden && !docked && line.from !== null) {
+        unread++;
+        render(current);
+      }
+    },
+    dock: (place) => {
+      if (place) {
+        if (chatBox.parentElement !== place) place.append(chatBox);
+        docked = true;
+        more.hidden = true;
+        chatButton.setAttribute("aria-expanded", "false");
+        unread = 0;
+        log.scrollTop = log.scrollHeight;
+      } else if (docked) {
+        more.append(chatBox);
+        docked = false;
+      }
+      render(current);
     },
   };
 }

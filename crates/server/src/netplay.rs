@@ -3,11 +3,17 @@
 //! their messages (to everyone, or to one member) and keeps the room's
 //! chat. It does not look at the game messages.
 //!
+//! A room is a session: it opens without a game, its host starts one
+//! (`load`), changes it or stops it, and when the host leaves, the first
+//! member with an account takes over (without one, the room closes). Each
+//! change starts a new epoch: the browsers drop messages of earlier ones.
+//!
 //! Text messages are JSON objects. The server stamps them with `from` (the
 //! sender's member id) and sends them to the member in `to`, or to every
-//! other member. It answers `ping` itself and keeps `chat` messages, which
-//! go to everyone, the sender included. Binary messages start with two
-//! bytes, `to` (255: everyone else) and `from`, stamped by the server.
+//! other member. It answers `ping` itself, keeps `chat` messages, which go
+//! to everyone, the sender included, and handles `load`. Binary messages
+//! start with two bytes, `to` (255: everyone else) and `from`, stamped by
+//! the server.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -24,6 +30,7 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
 use crate::auth::{CurrentUser, Viewer};
+use crate::library::Console;
 use crate::state::AppState;
 
 /// Unambiguous characters: no 0/O, 1/I/L.
@@ -46,14 +53,25 @@ const PING_EVERY: Duration = Duration::from_secs(10);
 /// frozen in the back/forward cache, where its socket may stay open).
 const SILENT: Duration = Duration::from_secs(30);
 const EVERYONE: u8 = 255;
-const HOST: u8 = 0;
+/// The member who opens a room.
+const OPENER: u8 = 0;
 
 #[derive(Default)]
 pub struct Rooms(Mutex<HashMap<String, Room>>);
 
-struct Room {
+/// A game a room plays, and its BIOS: what the room's code grants.
+struct Playing {
     game: String,
     bios: String,
+}
+
+struct Room {
+    /// None while the host chooses.
+    playing: Option<Playing>,
+    /// The member who changes the game and hands out the controllers.
+    host: u8,
+    /// Counts the changes of game and of host.
+    epoch: u32,
     /// Ids are not reused: inputs and controller owners refer to them.
     next_id: u8,
     members: BTreeMap<u8, Member>,
@@ -62,6 +80,8 @@ struct Room {
 
 struct Member {
     name: String,
+    /// Signed in: may become the host.
+    registered: bool,
     tx: mpsc::Sender<Message>,
 }
 
@@ -91,9 +111,18 @@ impl Room {
         Value::Array(
             self.members
                 .iter()
-                .map(|(id, m)| json!({ "id": id, "name": m.name }))
+                .map(|(id, m)| json!({ "id": id, "name": m.name, "registered": m.registered }))
                 .collect(),
         )
+    }
+
+    /// Who takes over from the host: the first other member with an
+    /// account.
+    fn successor(&self) -> Option<u8> {
+        self.members
+            .iter()
+            .find(|(id, m)| **id != self.host && m.registered)
+            .map(|(id, _)| *id)
     }
 }
 
@@ -101,9 +130,12 @@ impl Rooms {
     /// Whether room `code` is open and plays this game (or uses this
     /// BIOS): what its code lets a player without an account read.
     pub fn grants(&self, code: &str, game: Option<&str>, bios: Option<&str>) -> bool {
-        self.lock().get(&normalise(code)).is_some_and(|r| {
-            game.is_none_or(|g| r.game == g) && bios.is_none_or(|b| r.bios == b) && (game.is_some() || bios.is_some())
-        })
+        (game.is_some() || bios.is_some())
+            && self.lock().get(&normalise(code)).is_some_and(|r| {
+                r.playing
+                    .as_ref()
+                    .is_some_and(|p| game.is_none_or(|g| p.game == g) && bios.is_none_or(|b| p.bios == b))
+            })
     }
 
     fn lock(&self) -> MutexGuard<'_, HashMap<String, Room>> {
@@ -150,24 +182,19 @@ fn now_ms() -> u64 {
         .map_or(0, |d| d.as_millis() as u64)
 }
 
-#[derive(Deserialize)]
-pub struct HostQuery {
-    game: String,
-    bios: String,
+/// Whether rooms can play this game with this BIOS: the PlayStation's.
+fn playable(lib: &crate::library::Library, game: &str, bios: &str) -> bool {
+    lib.game(game).is_some_and(|g| g.console == Console::Ps1)
+        && lib.bios(bios).is_some_and(|b| b.console == Console::Ps1)
 }
 
-/// Opens a room for a running game; its creator (signed in) is member 0,
+/// Opens a room, without a game yet; its creator (signed in) is member 0,
 /// the host, under their name.
 pub async fn host(
     State(state): State<Arc<AppState>>,
     CurrentUser(user, _): CurrentUser,
-    Query(q): Query<HostQuery>,
     ws: WebSocketUpgrade,
 ) -> Response {
-    let lib = state.library.read().await.clone();
-    if lib.game(&q.game).is_none() || lib.bios(&q.bios).is_none() {
-        return (StatusCode::NOT_FOUND, "unknown game or BIOS").into_response();
-    }
     if state.rooms.lock().len() >= MAX_ROOMS {
         return (StatusCode::SERVICE_UNAVAILABLE, "too many rooms").into_response();
     }
@@ -180,25 +207,27 @@ pub async fn host(
                 .expect("an endless iterator");
             let mut members = BTreeMap::new();
             members.insert(
-                HOST,
+                OPENER,
                 Member {
                     name: clean_name(&user.name),
+                    registered: true,
                     tx,
                 },
             );
             let room = Room {
-                game: q.game,
-                bios: q.bios,
+                playing: None,
+                host: OPENER,
+                epoch: 0,
                 next_id: 1,
                 members,
                 chat: VecDeque::new(),
             };
-            let _ = room.send(HOST, text(&welcome(&code, HOST, &room)));
+            let _ = room.send(OPENER, text(&welcome(&code, OPENER, &room)));
             rooms.insert(code.clone(), room);
             code
         };
         tracing::info!(%code, "netplay room opened");
-        member(socket, rx, &state, &code, HOST).await;
+        member(socket, rx, &state, &code, OPENER).await;
     })
 }
 
@@ -207,6 +236,10 @@ fn welcome(code: &str, you: u8, room: &Room) -> Value {
         "type": "welcome",
         "code": code,
         "you": you,
+        "host": room.host,
+        "game": room.playing.as_ref().map(|p| &p.game),
+        "bios": room.playing.as_ref().map(|p| &p.bios),
+        "epoch": room.epoch,
         "members": room.roster(),
         "chat": room.chat,
     })
@@ -214,8 +247,8 @@ fn welcome(code: &str, you: u8, room: &Room) -> Value {
 
 #[derive(Serialize)]
 pub struct RoomJson {
-    game: String,
-    bios: String,
+    game: Option<String>,
+    bios: Option<String>,
     host: String,
     members: usize,
     full: bool,
@@ -231,9 +264,9 @@ pub async fn room(State(state): State<Arc<AppState>>, Path(code): Path<String>) 
         Some(r) => (
             [(axum::http::header::SET_COOKIE, state.auth.room_cookie(&code))],
             Json(RoomJson {
-                game: r.game.clone(),
-                bios: r.bios.clone(),
-                host: r.members.get(&HOST).map(|m| m.name.clone()).unwrap_or_default(),
+                game: r.playing.as_ref().map(|p| p.game.clone()),
+                bios: r.playing.as_ref().map(|p| p.bios.clone()),
+                host: r.members.get(&r.host).map(|m| m.name.clone()).unwrap_or_default(),
                 members: r.members.len(),
                 full: r.members.len() >= MAX_MEMBERS || r.next_id == EVERYONE,
             }),
@@ -269,6 +302,7 @@ pub async fn join(
     ws.max_message_size(MAX_MESSAGE).on_upgrade(move |socket| async move {
         let (tx, rx) = mpsc::channel(QUEUE);
         let name = clean_name(viewer.user.as_ref().map_or(&q.name, |u| &u.name));
+        let registered = viewer.user.is_some();
         let id = {
             let mut rooms = state.rooms.lock();
             let Some(room) = rooms.get_mut(&code) else { return };
@@ -277,9 +311,17 @@ pub async fn join(
             }
             let id = room.next_id;
             room.next_id += 1;
-            room.members.insert(id, Member { name: name.clone(), tx });
+            room.members.insert(
+                id,
+                Member {
+                    name: name.clone(),
+                    registered,
+                    tx,
+                },
+            );
             let _ = room.send(id, text(&welcome(&code, id, room)));
-            room.broadcast(Some(id), &text(&json!({ "type": "joined", "id": id, "name": name })));
+            let joined = json!({ "type": "joined", "id": id, "name": name, "registered": registered });
+            room.broadcast(Some(id), &text(&joined));
             id
         };
         tracing::info!(%code, id, "netplay member joined");
@@ -287,8 +329,8 @@ pub async fn join(
     })
 }
 
-/// Runs a member's connection, then removes it from the room (closing the
-/// room when it is the host).
+/// Runs a member's connection, then removes it from the room (handing it
+/// over, or closing it, when it is the host).
 async fn member(socket: WebSocket, rx: mpsc::Receiver<Message>, state: &AppState, code: &str, id: u8) {
     relay(socket, rx, state, code, id).await;
     leave(state, code, id);
@@ -300,14 +342,61 @@ fn leave(state: &AppState, code: &str, id: u8) {
     if room.members.remove(&id).is_none() {
         return;
     }
-    if id == HOST {
-        room.broadcast(None, &text(&json!({ "type": "closed" })));
-        rooms.remove(code);
-        tracing::info!(%code, "netplay room closed");
-    } else {
+    if id != room.host {
         room.broadcast(None, &text(&json!({ "type": "left", "id": id })));
         tracing::info!(%code, id, "netplay member left");
+        return;
     }
+    match room.successor() {
+        Some(host) => {
+            room.host = host;
+            room.epoch += 1;
+            room.broadcast(None, &text(&json!({ "type": "left", "id": id })));
+            room.broadcast(None, &text(&json!({ "type": "host", "id": host, "epoch": room.epoch })));
+            tracing::info!(%code, id, host, "netplay host left: handed over");
+        }
+        None => {
+            room.broadcast(None, &text(&json!({ "type": "closed" })));
+            rooms.remove(code);
+            tracing::info!(%code, "netplay room closed");
+        }
+    }
+}
+
+/// The host starts a game (`game` and `bios`), or stops it (`game` null):
+/// everyone follows, in a new epoch.
+async fn load(state: &AppState, code: &str, from: u8, msg: &serde_json::Map<String, Value>) -> Vec<u8> {
+    let field = |k: &str| msg.get(k).and_then(Value::as_str).map(str::to_owned);
+    let playing = field("game").map(|game| Playing {
+        game,
+        bios: field("bios").unwrap_or_default(),
+    });
+    let ok = match &playing {
+        Some(p) => playable(&state.library.read().await.clone(), &p.game, &p.bios),
+        None => true,
+    };
+    let mut rooms = state.rooms.lock();
+    let Some(room) = rooms.get_mut(code) else {
+        return Vec::new();
+    };
+    let refusal = if from != room.host {
+        Some("Only the host changes the game.")
+    } else if !ok {
+        Some("Rooms play PlayStation games from the library.")
+    } else {
+        None
+    };
+    if let Some(why) = refusal {
+        let msg = text(&json!({ "type": "error", "text": why }));
+        return room.send(from, msg).err().map(|()| vec![from]).unwrap_or_default();
+    }
+    room.playing = playing;
+    room.epoch += 1;
+    let game = room.playing.as_ref().map(|p| p.game.as_str());
+    tracing::info!(%code, game = game.unwrap_or("none"), "netplay game changed");
+    let bios = room.playing.as_ref().map(|p| p.bios.as_str());
+    let change = json!({ "type": "game", "game": game, "bios": bios, "epoch": room.epoch });
+    room.broadcast(None, &text(&change))
 }
 
 /// Routes one message from member `from`. Returns members to drop (their
@@ -377,6 +466,15 @@ fn route(state: &AppState, code: &str, from: u8, msg: Message) -> Vec<u8> {
     }
 }
 
+/// A `load` message, which `load` handles (it reads the library).
+fn load_request(msg: &Message) -> Option<serde_json::Map<String, Value>> {
+    let Message::Text(raw) = msg else { return None };
+    match serde_json::from_str::<Value>(raw) {
+        Ok(Value::Object(obj)) if obj.get("type").and_then(Value::as_str) == Some("load") => Some(obj),
+        _ => None,
+    }
+}
+
 /// Forwards the socket's messages to the room, and the room's to the
 /// socket, until the member goes away.
 async fn relay(mut socket: WebSocket, mut rx: mpsc::Receiver<Message>, state: &AppState, code: &str, id: u8) {
@@ -388,7 +486,11 @@ async fn relay(mut socket: WebSocket, mut rx: mpsc::Receiver<Message>, state: &A
             incoming = socket.recv() => match incoming {
                 Some(Ok(msg @ (Message::Text(_) | Message::Binary(_)))) => {
                     heard = Instant::now();
-                    for slow in route(state, code, id, msg) {
+                    let slow = match load_request(&msg) {
+                        Some(obj) => load(state, code, id, &obj).await,
+                        None => route(state, code, id, msg),
+                    };
+                    for slow in slow {
                         tracing::warn!(%code, id = slow, "netplay member too slow: dropping");
                         if slow == id {
                             return;
@@ -431,6 +533,26 @@ mod tests {
         assert_eq!(code.len(), CODE_LEN);
         assert!(code.bytes().all(|b| ALPHABET.contains(&b)));
         assert_eq!(normalise(" abc-d2f "), "ABCD2F");
+    }
+
+    #[test]
+    fn successors_have_accounts() {
+        let member = |registered| Member {
+            name: String::new(),
+            registered,
+            tx: mpsc::channel(1).0,
+        };
+        let mut room = Room {
+            playing: None,
+            host: OPENER,
+            epoch: 0,
+            next_id: 4,
+            members: BTreeMap::from([(OPENER, member(true)), (1, member(false)), (3, member(true))]),
+            chat: VecDeque::new(),
+        };
+        assert_eq!(room.successor(), Some(3));
+        room.members.remove(&3);
+        assert_eq!(room.successor(), None);
     }
 
     #[test]

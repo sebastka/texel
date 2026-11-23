@@ -32,7 +32,8 @@ import { h, type Child } from "./dom";
 import { gamepadChip } from "./gamepad-ui";
 import { Player } from "./player";
 import type { NetStatus } from "./protocol";
-import { roomPanel, saveName, savedName, setAccountName } from "./room";
+import { roomBar, saveName, savedName } from "./room";
+import { Room, wsUrl, type RoomGame } from "./room-link";
 
 const app = document.querySelector<HTMLDivElement>("#app")!;
 
@@ -46,14 +47,181 @@ let games: GameListItem[] = [];
 /** The signed-in user: null shows the sign-in page (but to join a room). */
 let me: User | null = null;
 let player: Player | null = null;
+/** The game the player runs (the PlayStation's: the one a room can play). */
+let playing: RoomGame | null = null;
 
-function external(href: string, text: string) {
-  return h("a.external", { href, target: "_blank", rel: "noopener noreferrer" }, text);
+// --- Room (netplay) ---------------------------------------------------------------
+// A room lasts across pages (see room-link.ts): its bar is under the header
+// on every page. The host's games are the room's; the others follow them
+// (`#/room`).
+
+let room: Room | null = null;
+/** Why the last room ended, until dismissed. */
+let roomEnded: string | null = null;
+/** The room's game as the player runs it, and the epoch it joined. */
+let roomNet: NetStatus | null = null;
+let playerEpoch: number | null = null;
+/** Titles of the rooms' games, for guests without the library. */
+const titles = new Map<string, string>();
+/** The player page's locks, to update with the room. */
+let onRoomChange: (() => void) | null = null;
+
+const bar = roomBar({
+  setPorts: (ports) => {
+    room?.setPorts(ports);
+    player?.setNetPorts(ports);
+  },
+  setView: (view) => {
+    room?.setView(view);
+    player?.setNetView(view);
+  },
+  say: (text) => room?.say(text),
+  leave: () => {
+    const guest = !room?.isHost;
+    room?.leave();
+    // A guest leaves the game too; a host plays on, alone.
+    if (guest && location.hash === "#/room") location.hash = me ? `#/games/${shownConsole}` : "#/join";
+  },
+  dismiss: () => {
+    roomEnded = null;
+    renderBar();
+  },
+});
+
+function renderBar() {
+  if (room) {
+    const title = room.game ? (games.find((g) => g.id === room!.game!.game)?.title ?? titles.get(room.game.game) ?? null) : null;
+    const here = playerEpoch !== null && playerEpoch === room.epoch;
+    bar.render({ room, net: here ? roomNet : null, title, here });
+  } else bar.render(roomEnded ? { ended: roomEnded } : null);
+  for (const b of document.querySelectorAll<HTMLElement>(".open-room")) b.hidden = !!room;
+  onRoomChange?.();
+}
+
+/** The player runs the room's game: the room's messages go to it. */
+function attach(r: Room) {
+  playerEpoch = r.epoch;
+  roomNet = null;
+  const p = player;
+  r.relay = (data) => p?.netIn(data);
 }
 
 function stopPlayer() {
+  // Out of the room's game: the host stops it for everyone, the others
+  // stop holding it up.
+  if (player && room && playerEpoch === room.epoch && room.state === "open") {
+    if (room.isHost) {
+      if (room.game) room.load(null);
+    } else room.idle();
+  }
+  if (room) room.relay = null;
   player?.stop();
   player = null;
+  playing = null;
+  playerEpoch = null;
+  roomNet = null;
+  onRoomChange = null;
+  bar.dock(null);
+  if (room) renderBar();
+}
+
+/** Shows `hash`, even when it is shown already. */
+function go(hash: string) {
+  if (location.hash === hash) route();
+  else location.hash = hash;
+}
+
+/** Opens a room (host) or joins one. */
+function enterRoom(url: string) {
+  room?.leave();
+  roomEnded = null;
+  const r = new Room(url, {
+    change: renderBar,
+    chat: (line) => bar.chat(line),
+    welcome: () => {
+      if (r.isHost) {
+        // Opened while playing: that game is the room's (as it is).
+        if (playing) r.load(playing);
+      } else go("#/room");
+    },
+    game: (g) => {
+      if (g && !titles.has(g.game) && !games.some((x) => x.id === g.game)) {
+        void api.game(g.game).then((d) => {
+          titles.set(g.game, d.title);
+          renderBar();
+        }, () => undefined);
+      }
+      if (r.isHost) {
+        // The host's running game: the room's from now.
+        if (g && player && playing?.game === g.game && playing.bios === g.bios) {
+          attach(r);
+          player.attachNetplay(r.snapshot());
+        }
+      } else if (g) go("#/room");
+      else if (location.hash === "#/room") route();
+    },
+    host: () => {
+      const running = roomNet?.state === "playing" || roomNet?.state === "stalled";
+      // In the game: it goes on (with this member as its host, maybe).
+      if (playerEpoch !== null && running) playerEpoch = r.epoch;
+      // A new host out of the game: it stops, for everyone to choose again.
+      else if (r.isHost && r.game) r.load(null);
+      if (r.isHost && location.hash === "#/room" && !running) route();
+    },
+    end: (why) => {
+      if (room !== r) return;
+      if (player && playerEpoch !== null) player.leaveNetplay();
+      room = null;
+      roomNet = null;
+      playerEpoch = null;
+      roomEnded = why || null;
+      renderBar();
+      if (location.hash === "#/room") route();
+    },
+  });
+  room = r;
+  renderBar();
+}
+
+function openRoom() {
+  enterRoom(wsUrl("/api/netplay/host"));
+}
+
+/** The room's page: its game, or what it waits for. */
+function renderRoom() {
+  if (room?.game && room.state === "open") {
+    const { game, bios } = room.game;
+    // The host's own game is at its own address.
+    if (room.isHost) location.hash = `#/play/${game}/${bios}`;
+    else renderPlayer(game, bios, true);
+    return;
+  }
+  stopPlayer();
+  const text = !room
+    ? (roomEnded ?? "You are in no room.")
+    : room.state === "connecting"
+      ? "Joining the room…"
+      : room.isHost
+        ? "Start a game from the library: everyone in the room plays it with you."
+        : `${room.hostName} is choosing a game: it starts here for everyone.`;
+  app.replaceChildren(
+    header(null),
+    h(
+      "main.join",
+      {},
+      h("h1", {}, "Play together"),
+      h("p.muted", {}, text),
+      !room
+        ? h("a.button.ghost", { href: "#/join" }, "Join a room")
+        : room.isHost
+          ? h("a.button.primary", { href: `#/games/ps1` }, "Choose a game")
+          : null,
+    ),
+  );
+}
+
+function external(href: string, text: string) {
+  return h("a.external", { href, target: "_blank", rel: "noopener noreferrer" }, text);
 }
 
 /** The console tab last shown, for the header's links. */
@@ -68,7 +236,8 @@ const parseConsole = (s: string | undefined): Console => (s === "ps1" || s === "
 
 export type Page = "games" | "bios" | "cards" | "join" | "admin" | "account";
 
-function header(active: Page | null, ...right: Node[]) {
+/** The header, and the room's bar under it. */
+function header(active: Page | null, ...right: Node[]): DocumentFragment {
   const tab = (name: Page, href: string, label: string) => h(`a.tab${active === name ? ".active" : ""}`, { href }, label);
   const tabs = me
     ? [
@@ -82,27 +251,44 @@ function header(active: Page | null, ...right: Node[]) {
   const account = me
     ? accountMenu(me, () => void signOut())
     : h("a.button.ghost.small-button", { href: "#/signin" }, "Sign in");
+  // Rooms are opened by members with an account.
+  const together = me
+    ? h(
+        "button.ghost.open-room",
+        {
+          hidden: !!room,
+          title: "Open a room: friends join it with its code, and play the games you start with you, in their browser.",
+          onclick: openRoom,
+        },
+        "Play together",
+      )
+    : null;
   // The page's tools and the avatar stay together, on the right: when the
   // header runs out of room, they go to the next line as one.
-  return h(
-    "header",
-    {},
+  const fragment = document.createDocumentFragment();
+  fragment.append(
     h(
-      "div.header-main",
+      "header",
       {},
-      h("a.brand", { href: me ? `#/games/${shownConsole}` : "#/signin" }, h("span.logo", {}, ""), "Texel"),
-      h("nav", { "aria-label": "Sections" }, ...tabs),
+      h(
+        "div.header-main",
+        {},
+        h("a.brand", { href: me ? `#/games/${shownConsole}` : "#/signin" }, h("span.logo", {}, ""), "Texel"),
+        h("nav", { "aria-label": "Sections" }, ...tabs),
+      ),
+      h("div.header-tools", {}, ...right, ...(together ? [together] : []), account),
     ),
-    h("div.header-tools", {}, ...right, account),
+    bar.element,
   );
+  return fragment;
 }
 
 async function signOut() {
   stopPlayer();
+  room?.leave();
   try {
     const { redirect } = await api.logout();
     me = null;
-    setAccountName(null);
     if (redirect) location.href = redirect;
     else location.hash = "#/signin";
   } catch (e) {
@@ -113,7 +299,7 @@ async function signOut() {
 /** What the account, card and admin pages need from here. */
 export interface Shell {
   app: HTMLElement;
-  header: (active: Page | null, ...right: Node[]) => HTMLElement;
+  header: (active: Page | null, ...right: Node[]) => Node;
   me: () => User | null;
   /** After signing in or out: reloads the lists and shows `hash`. */
   signedIn: (user: User | null, hash?: string) => void;
@@ -127,7 +313,6 @@ const shell: Shell = {
   me: () => me,
   signedIn: (user, hash = `#/games/${shownConsole}`) => {
     me = user;
-    setAccountName(user?.name ?? null);
     // Out of the registration page's own address.
     if (location.pathname !== "/" || location.search) history.replaceState(null, "", `/${hash}`);
     void load().then(() => {
@@ -1006,10 +1191,12 @@ function renderJoin(code: string | undefined) {
     if (!normalised) return input.focus();
     if (!me) saveName(who);
     error.hidden = true;
+    // Looking the room up gives the cookie that lets in its games.
     api.room(normalised).then(
-      (room) => {
-        if (room.full) fail("This room is full.");
-        else renderPlayer(room.game, room.bios, { code: normalised, name: who });
+      (info) => {
+        if (info.full) fail("This room is full.");
+        else if (room?.code === normalised && room.state === "open") go("#/room");
+        else enterRoom(wsUrl(`/api/netplay/join/${encodeURIComponent(normalised)}?name=${encodeURIComponent(who)}`));
       },
       () => fail("No open room has this code: ask for a new one."),
     );
@@ -1023,8 +1210,8 @@ function renderJoin(code: string | undefined) {
       h(
         "p.muted",
         {},
-        "A friend opens a room from their game (Play together) and gives you its code. " +
-          "The game then runs in your browser too, in step with theirs.",
+        "A friend opens a room (Play together) and gives you its code. " +
+          "The games they start then run in your browser too, in step with theirs.",
       ),
       h(
         "form.join-form",
@@ -1049,9 +1236,11 @@ function renderJoin(code: string | undefined) {
 
 /** Save states: a button opening a panel of slots (under the player's
  * header), and F5/F9 to save and load slot 1, until the page changes. */
-function stateControls(id: string, biosId: string, bioses: Bios[], hidden = false) {
+function stateControls(gameOf: () => string, biosOf: () => string, bioses: Bios[], hidden = false) {
   const statesPanel = h("div.states-panel", { hidden: true });
   const renderStates = async () => {
+    const id = gameOf();
+    const biosId = biosOf();
     let saved: SaveState[] = [];
     try {
       saved = await api.states(id);
@@ -1134,7 +1323,9 @@ function fastToggle() {
   return button;
 }
 
-function renderPlayer(id: string, biosId: string, join: { code: string; name: string } | null = null) {
+/** A PlayStation game in the player; `roomGame`: the room's, for a guest
+ * (the host's game becomes the room's when it starts one in a room). */
+function renderPlayer(id: string, biosId: string, roomGame = false) {
   stopPlayer();
   const game = games.find((g) => g.id === id);
   const bios = biosList.find((b) => b.id === biosId);
@@ -1143,6 +1334,8 @@ function renderPlayer(id: string, biosId: string, join: { code: string; name: st
     renderConsole(biosId, game);
     return;
   }
+  // A guest runs the room's game; a host's game becomes the room's.
+  const guest = roomGame && !!room && !room.isHost;
   const status = h("span.status", {}, "Starting…");
   const screen = h("div.screen");
   const pause = h("button.ghost", { onclick: () => player?.togglePause() }, "Pause");
@@ -1181,7 +1374,7 @@ function renderPlayer(id: string, biosId: string, join: { code: string; name: st
     smooth.textContent = on ? "Smooth: on" : "Smooth: off";
     smooth.setAttribute("aria-pressed", String(on));
   };
-  const reset = h("button.ghost", { hidden: !!join, onclick: () => player?.reset() }, "Reset");
+  const reset = h("button.ghost", { hidden: guest, onclick: () => player?.reset() }, "Reset");
   // Enhancements: precise geometry (GPU only), widescreen (16:9).
   const showToggle = (b: Element, label: string, on: boolean) => {
     b.textContent = `${label}: ${on ? "on" : "off"}`;
@@ -1216,75 +1409,62 @@ function renderPlayer(id: string, biosId: string, join: { code: string; name: st
     screen.classList.toggle("wide", on);
   };
   const fast = fastToggle();
-  fast.hidden = !!join;
+  fast.hidden = guest;
   // The disc in the drive, which changes with multi-disc games.
   let current = id;
-  // Netplay: the room, beside the screen.
-  let net: NetStatus | null = null;
-  const room = roomPanel({
-    guest: !!join,
-    open: (name) => player?.hostNetplay(current, biosId, name),
-    setPorts: (ports) => player?.setNetPorts(ports),
-    setView: (view) => player?.setNetView(view),
-    say: (text) => player?.say(text),
-    leave: () => {
-      player?.leaveNetplay();
-      if (join) location.hash = `#/game/${id}`;
-    },
-  });
-  room.element.hidden = !join;
-  const netButton = h(
-    "button.ghost.toggle",
-    {
-      hidden: !!join,
-      title: "Play with friends: they run this game in their browser, in step with yours.",
-      "aria-pressed": "false",
-      onclick: () => {
-        room.element.hidden = !room.element.hidden;
-        netButton.setAttribute("aria-pressed", String(!room.element.hidden));
-      },
-    },
-    "Play together",
-  );
-  const inRoom = () => !!net && net.state !== "ended";
-  const onNet = (status: NetStatus) => {
-    net = status;
-    room.status(status);
-    // What would break the members' sync: anything once others are in;
-    // changing discs as soon as a room is open (members load its disc).
-    const others = status.members.length > 1 && inRoom();
-    const locked = !!join || others;
+  playing = { game: id, bios: biosId };
+  // In a room, what would break the members' sync is locked: anything once
+  // others are in; changing discs, widescreen and fast-forward as soon as
+  // a room is open.
+  // In a room: its chat beside the screen.
+  const side = h("aside.room-side", { hidden: true, "aria-label": "Room chat" }, h("h2", {}, "Chat"));
+  const lock = () => {
+    const inRoom = !!room && room.state !== "ended";
+    if (inRoom !== !side.hidden) {
+      side.hidden = !inRoom;
+      bar.dock(inRoom ? side : null);
+    }
+    const locked = guest || (inRoom && room!.members.size > 1);
     reset.disabled = locked;
     statesButton.disabled = locked;
-    // In step with the others: no fast-forward (the worker ignores it then).
-    if (inRoom() && player?.fast) fast.click();
-    fast.disabled = inRoom();
-    // Widescreen changes what the console computes: all must agree.
-    if (inRoom() && player?.widescreen) setWide(player.setWidescreen(false));
-    wide.disabled = inRoom() || !!join;
+    if (inRoom && player?.fast) fast.click();
+    fast.disabled = inRoom;
+    if (inRoom && player?.widescreen) setWide(player.setWidescreen(false));
+    wide.disabled = inRoom;
     if (locked) statesPanel.hidden = true;
-    if (discPicker) discPicker.disabled = inRoom();
+    if (discPicker) discPicker.disabled = inRoom;
   };
   const full = h("button.ghost", { onclick: () => void screen.requestFullscreen() }, "Fullscreen");
   // Save states: a panel of slots under the header.
-  const { panel: statesPanel, button: statesButton, render: renderStates } = stateControls(id, biosId, biosList, !!join);
+  const { panel: statesPanel, button: statesButton, render: renderStates } = stateControls(
+    () => current,
+    () => biosId,
+    biosList,
+    guest,
+  );
   const discs = game?.discs ?? [];
-  const discPicker = discs.length && !join
-    ? h(
-        "select",
-        {
-          title: "Change discs: opens the console's lid and closes it on the chosen disc. Do it when the game asks.",
-          onchange: (e: Event) => {
-            const target = (e.target as HTMLSelectElement).value;
-            current = target;
-            void api.game(target).then((d) => player?.swapDisc(d));
+  const discPicker =
+    discs.length && !guest
+      ? h(
+          "select",
+          {
+            title: "Change discs: opens the console's lid and closes it on the chosen disc. Do it when the game asks.",
+            onchange: (e: Event) => {
+              const target = (e.target as HTMLSelectElement).value;
+              current = target;
+              playing = { game: target, bios: biosId };
+              void api.game(target).then((d) => player?.swapDisc(d));
+            },
           },
-        },
-        ...discs.map((d) => h("option", { value: d.id, selected: d.id === id }, `Disc ${d.number}`)),
-      )
-    : null;
+          ...discs.map((d) => h("option", { value: d.id, selected: d.id === id }, `Disc ${d.number}`)),
+        )
+      : null;
+  const now = h("span.now", { title: bios ? biosName(bios) : "" }, game?.title ?? "");
+  // A guest stays in the room (out of its game); a guest without an
+  // account has nowhere else to go.
+  const quit = guest && !me ? null : h("a.button.ghost", { href: guest ? `#/games/ps1` : `#/game/${id}` }, "Quit");
   app.replaceChildren(
-    header(null, h("span.now", { title: bios ? biosName(bios) : "" }, game?.title ?? "")),
+    header(null, now),
     h(
       "main.player",
       {},
@@ -1308,7 +1488,6 @@ function renderPlayer(id: string, biosId: string, join: { code: string; name: st
               }),
               pause,
               fast,
-              netButton,
               reset,
               statesButton,
               analog,
@@ -1317,13 +1496,13 @@ function renderPlayer(id: string, biosId: string, join: { code: string; name: st
               wide,
               smooth,
               full,
-              h("a.button.ghost", { href: `#/game/${id}` }, "Quit"),
+              ...(quit ? [quit] : []),
             ),
           ),
           statesPanel,
           screen,
         ),
-        room.element,
+        side,
         h(
           "details.controls",
           { open: true },
@@ -1356,16 +1535,42 @@ function renderPlayer(id: string, biosId: string, join: { code: string; name: st
       analog.textContent = on ? "Analog: on" : "Analog: off";
       analog.setAttribute("aria-pressed", String(on));
     },
-    onNet,
-    onChat: (line) => room.chat(line),
+    onNet: (s) => {
+      roomNet = s;
+      if (room && s.state !== "ended") {
+        room.ports = s.ports;
+        room.assigned = s.assigned;
+      }
+      renderBar();
+    },
+    onNetOut: (data) => room?.send(data),
   });
+  onRoomChange = lock;
+  lock();
   setSmooth(player.smooth);
   setResolution(player.scale);
   showToggle(precise, "Precise", player.precise);
-  // A guest plays the host's game as it is.
-  setWide(join ? player.setWidescreen(false) : player.widescreen);
+  // In a room, everyone plays the game as it is.
+  setWide(room ? player.setWidescreen(false) : player.widescreen);
+  const started = player;
   void api.game(id).then(
-    (g) => player?.start(biosId, g, join),
+    (g) => {
+      // A guest without an account has no library to name the game from.
+      if (!now.textContent) {
+        now.textContent = g.title;
+        document.title = `${g.title} · Texel`;
+      }
+      if (player !== started) return;
+      if (guest && room) {
+        attach(room);
+        return started.start(biosId, g, room.snapshot());
+      }
+      const done = started.start(biosId, g);
+      // A host's game is the room's: everyone follows (see the room's
+      // `game` event).
+      if (room?.isHost && room.state === "open") room.load({ game: id, bios: biosId });
+      return done;
+    },
     (e: unknown) => (status.textContent = String(e)),
   );
 }
@@ -1384,7 +1589,7 @@ function renderConsole(biosId: string, game?: Game, cardsId: string | null = nul
   const pause = h("button.ghost", { onclick: () => player?.togglePause() }, "Pause");
   const full = h("button.ghost", { onclick: () => void screen.requestFullscreen() }, "Fullscreen");
   // Save states, for games (they are kept per disc).
-  const states = game ? stateControls(game.id, biosId, ps2BiosList) : null;
+  const states = game ? stateControls(() => game.id, () => biosId, ps2BiosList) : null;
   app.replaceChildren(
     header(null, h("span.now", {}, game ? game.title : bios ? biosName(bios) : consoleName)),
     h(
@@ -1501,7 +1706,6 @@ function cardsPicker(platform: Console, biosId: string, cardsId: string | null):
 
 async function load() {
   me = await api.me();
-  setAccountName(me?.name ?? null);
   if (!me) {
     // Only signed-in users see the library.
     [biosList, ps2BiosList, games] = [[], [], []];
@@ -1515,7 +1719,7 @@ async function load() {
 
 /** Pages open without an account: signing in, registering, joining a room
  * (a room's code grants its game). */
-const PUBLIC = new Set(["signin", "join"]);
+const PUBLIC = new Set(["signin", "join", "room"]);
 
 function route() {
   const [, view, id, extra] = location.hash.split("/");
@@ -1553,6 +1757,7 @@ function route() {
   else if (view === "bios") renderBios(parseConsole(id));
   else if (view === "games") renderGames(parseConsole(id));
   else if (view === "join") renderJoin(id);
+  else if (view === "room") renderRoom();
   else renderGames();
   window.scrollTo(0, 0);
 }
