@@ -3,8 +3,7 @@
 //! ("$argon2id$v=19$m=19456,t=2,p=1$<salt>$<hash>"). Hashing takes tens of
 //! milliseconds: it runs on a blocking thread.
 
-use argon2::Argon2;
-use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
+use argon2::{Argon2, PasswordHasher, PasswordVerifier};
 
 pub const MIN_LEN: usize = 10;
 pub const MAX_LEN: usize = 200;
@@ -13,9 +12,8 @@ pub async fn hash(password: String) -> anyhow::Result<String> {
     tokio::task::spawn_blocking(move || {
         let mut salt = [0u8; 16];
         getrandom::fill(&mut salt).map_err(|e| anyhow::anyhow!("no randomness: {e}"))?;
-        let salt = SaltString::encode_b64(&salt).map_err(|e| anyhow::anyhow!("{e}"))?;
         Ok(Argon2::default()
-            .hash_password(password.as_bytes(), &salt)
+            .hash_password_with_salt(password.as_bytes(), &salt)
             .map_err(|e| anyhow::anyhow!("hashing a password: {e}"))?
             .to_string())
     })
@@ -30,10 +28,8 @@ pub async fn verify(password: String, hash: Option<String>) -> bool {
     tokio::task::spawn_blocking(move || {
         let known = hash.is_some();
         let hash = hash.unwrap_or_else(|| DUMMY.to_owned());
-        let Ok(parsed) = PasswordHash::new(&hash) else {
-            return false;
-        };
-        let ok = Argon2::default().verify_password(password.as_bytes(), &parsed).is_ok();
+        // An unparsable hash fails to verify.
+        let ok = Argon2::default().verify_password(password.as_bytes(), hash.as_str()).is_ok();
         known && ok
     })
     .await
