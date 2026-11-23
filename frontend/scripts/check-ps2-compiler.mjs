@@ -4,16 +4,18 @@
 // prints their speeds and what the compiler did. Exits with 1 if they differ.
 //
 //   pnpm run wasm
-//   node scripts/check-ps2-compiler.mjs PS2-BIOS [SECONDS]
+//   node scripts/check-ps2-compiler.mjs PS2-BIOS [SECONDS] [DISC.iso STATE]
 //
+// With a disc and a state saved in a game (check-ps2-vu.mjs makes one), the
+// two consoles run the game from there instead, the VUs' code compiled.
 // The GS draws nothing (it would take most of the time); GFX=1 draws in
 // software. COMPILED_ONLY=1 runs only the compiled console (to measure it).
-import { readFileSync } from "node:fs";
+import { fstatSync, openSync, readFileSync, readSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
-const [biosPath, secondsArg] = process.argv.slice(2);
-if (!biosPath) {
-  console.error("usage: node scripts/check-ps2-compiler.mjs PS2-BIOS [SECONDS]");
+const [biosPath, secondsArg, discPath, statePath] = process.argv.slice(2);
+if (!biosPath || (discPath && !statePath)) {
+  console.error("usage: node scripts/check-ps2-compiler.mjs PS2-BIOS [SECONDS] [DISC.iso STATE]");
   process.exit(2);
 }
 const dir = fileURLToPath(new URL("../src/wasm/", import.meta.url));
@@ -26,6 +28,16 @@ function run(compiled) {
   const emu = new mod.Ps2Emulator(bios);
   if (!process.env.GFX) emu.disableGraphics();
   emu.setCompiler(compiled);
+  if (discPath) {
+    emu.setVuCompiler(true);
+    const fd = openSync(discPath, "r");
+    emu.insertDisc(undefined, ["disc.iso"], Float64Array.from([fstatSync(fd).size]), (_file, offset, length) => {
+      const buf = new Uint8Array(length);
+      readSync(fd, buf, 0, length, offset);
+      return buf;
+    });
+    emu.loadState(readFileSync(statePath));
+  }
   const hashes = [];
   const started = performance.now();
   for (let f = 1; f <= frames; f++) {
