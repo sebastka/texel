@@ -42,6 +42,8 @@ function saveFlag(key: string, on: boolean) {
     // Private mode: not remembered.
   }
 }
+/** How long a stopped worker may take to save memory cards. */
+const STOP_TIMEOUT_MS = 10_000;
 /** Largest canvas side, in device pixels (a 4K screen is 3840 wide). */
 const MAX_CANVAS = 4096;
 const SCALE_KEY = "texel.scale";
@@ -410,14 +412,21 @@ export class Player {
   }
 
   stop() {
-    // Pausing saves written memory cards; give it a moment to finish.
-    this.send({ type: "pause", paused: true });
+    // The worker stops, saves the memory cards the game wrote, and says
+    // so: it ends then (or after a while, should the server not answer).
+    this.send({ type: "stop" });
     cancelAnimationFrame(this.raf);
     this.rumble.forEach((_, port) => this.input.rumble(port, 0, 0));
     this.resize?.disconnect();
     this.input.dispose();
     document.removeEventListener("visibilitychange", this.onVisibility);
     void this.audio?.close();
-    setTimeout(() => this.worker.terminate(), 1000);
+    const end = () => this.worker.terminate();
+    const timeout = setTimeout(end, STOP_TIMEOUT_MS);
+    this.worker.onmessage = (e: MessageEvent<FromWorker>) => {
+      if (e.data.type !== "stopped") return;
+      clearTimeout(timeout);
+      end();
+    };
   }
 }
