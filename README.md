@@ -21,7 +21,7 @@ Boots the BIOS shell and commercial games (tested: Rayman, Gran Turismo) at full
 | Controllers | DualShock: digital and analog modes, configuration commands, rumble (Gamepad API); keyboard |
 | Memory cards | Per user and per game, by serial (shared by the discs of a multi-disc game, kept across image formats), saved in the database; the Memory cards page lists their saves (titles, PlayStation icons) and deletes, copies or moves them between games' cards, PlayStation and PS2; a console started without a disc (Start the console, on the BIOS page) gets a chosen game's cards, to manage its saves in the BIOS, or blank ones |
 | Save states | Per user: 4 slots per disc, with screenshots and the BIOS they need, saved in the database; each game remembers the BIOS it was last started with |
-| Netplay | Rooms of up to 8 people with a chat: everyone runs the game in step, exchanging controller input through the server; the host hands out the two controllers |
+| Netplay | Rooms of up to 8 people with a chat: everyone runs the game in step, exchanging controller input through the server; a room lasts the session, beside the pages: the games its host starts are the room's, and another member with an account takes over when the host leaves |
 | Disc images | CUE/BIN (any number of files), ISO, single BIN, CHD, PBP (unencrypted) |
 | Missing | Cycle-accurate timing (DMA and CD-ROM delays are approximate, GPU drawing time is modelled per pixel), SPU Gaussian interpolation, multitap, mouse, light guns, serial port 1, encrypted PBPs |
 
@@ -122,13 +122,15 @@ Keyboard, split like the controller: WASD or the arrow keys for the D-pad, I △
 
 ### Playing together (netplay)
 
-In the player, Play together opens a room, under your account's name, beside the screen. Friends join it with its code (Join, in the top bar) or its link, signed in or not (then under the name they give: the room's code lets them load its game and BIOS, nothing else): their browser loads the same BIOS and disc and gets the game's state and memory cards from the host, and everyone then runs the game in step, exchanging only controllers' input through the server. Up to 8 people can be in a room, with a chat.
+Play together, in the header, opens a room under your account's name; its bar then stays under the header, on every page, and its chat is beside the screen in a game. Friends join it with its code (Join, in the top bar) or its link, signed in or not (then under the name they give: the room's code lets them load its game and BIOS, nothing else). The PlayStation game the host starts is the room's: the others are taken to it, their browser loads the same BIOS and disc and gets the game's state and memory cards from the host, and everyone then runs the game in step, exchanging only controllers' input through the server. Up to 8 people can be in a room, with a chat.
 
 - Two can play at once, on the console's two controllers; the others watch. The host hands out each controller with the 🎮 1 and 🎮 2 buttons next to the names (the first friend to join gets the second). Several people on one controller share it: their buttons are combined, so one-player games can be played together, or in turns. Everyone plays with their keyboard or first gamepad.
 - Split screen (optional, set by the host): each player's browser hides the other player's half of the screen, top/bottom or left/right, against peeking. Those who watch, or hold both controllers, see everything.
 - Input is delayed by a few frames, adjusted from the measured round trips, so that it reaches everyone in time. When a player's input is late, everyone waits; nobody waits for those who watch, who catch up (or reload the game's state) when they fall behind.
 - Every 120 frames, members compare a checksum of the machine with the one of the member with the controls (the host, when they have one). A member whose checksum differs gets their state.
-- Once others are in the room, reset and save states are disabled, as are disc changes while a room is open; memory cards are saved by the host only.
+- A room is a session, not one game: when the host leaves the game (to the library, say), it stops for everyone, and the next game the host starts is everyone's. Others may step out of a game (nobody waits for them meanwhile) and back in (Back to the game, in the bar).
+- When the host leaves the room, the first member with an account takes over: the game goes on, and the new host hands out the controllers and starts the next games. With nobody signed in left, the room closes.
+- Once others are in the room, reset and save states are disabled, as are disc changes while a room is open; memory cards are saved by their owner only (the host who loaded them; not a member who took over, whose own cards they are not).
 
 ### Accounts
 

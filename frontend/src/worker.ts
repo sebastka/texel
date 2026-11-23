@@ -8,7 +8,7 @@ import { RING_FRAMES, Ring } from "./audio";
 import type { FromDrawer, ToDrawer } from "./draw-worker";
 import { Painter } from "./paint";
 import { Session } from "./netplay";
-import type { Axes, FromWorker, StartMessage, ToWorker } from "./protocol";
+import type { Axes, FromWorker, RoomSnapshot, StartMessage, ToWorker } from "./protocol";
 
 const scope = self as unknown as DedicatedWorkerGlobalScope;
 const post = (msg: FromWorker) => scope.postMessage(msg);
@@ -57,6 +57,13 @@ let gameId: string | null = null;
 let cardsId: string | null = null;
 /** Recorded with save states, which load only with it. */
 let biosId = "";
+/** The memory cards are this user's, and saved: not a netplay guest's
+ * copies of the host's. */
+let ownCards = false;
+/** Netplay: the room this player joins once its emulator is ready, and
+ * the room's messages that came before. */
+let pendingRoom: RoomSnapshot | null = null;
+let netQueue: (string | ArrayBuffer)[] = [];
 let paused = false;
 /** Fast-forward (not in netplay): frames back to back, no sound. */
 let fast = false;
@@ -66,7 +73,7 @@ let timer: ReturnType<typeof setTimeout> | undefined;
 let nextFrameAt = 0;
 let frames = 0;
 let statsAt = 0;
-/** Netplay session, if any. */
+/** Netplay session (the room's game), if any. */
 let net: Session | null = null;
 /** Local controllers, applied before each frame (or sent, in netplay). */
 const local: { buttons: [number, number]; axes: [Axes, Axes] } = {
@@ -77,23 +84,23 @@ const local: { buttons: [number, number]; axes: [Axes, Axes] } = {
   ],
 };
 
-function wsUrl(path: string): string {
-  const url = new URL(path, self.location.href);
-  url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
-  return url.href;
-}
+/** In step with a room (or waiting to be): no fast-forward then. */
+const inStep = () => net !== null && (net.lockstep || net.waiting);
 
-function openSession(host: boolean, path: string) {
+/** Runs the game in step with the room (see netplay.ts). */
+function joinRoom(room: RoomSnapshot) {
   net?.close();
-  net = new Session(host, wsUrl(path), {
+  net = new Session(room, {
     emu: () => emu,
     runFrame,
     status: (status) => post({ type: "net", status }),
-    chat: (line) => post({ type: "net-chat", line }),
+    send: (data) => scope.postMessage({ type: "net-out", data } satisfies FromWorker, typeof data === "string" ? [] : [data.buffer]),
     gzip: (data, decompress = false) => compress(data, "gzip", decompress),
     onStarted: () => draw(),
   });
   net.input = { buttons: local.buttons[0], axes: local.axes[0] };
+  for (const data of netQueue) net.receive(data);
+  netQueue = [];
 }
 
 /**
@@ -207,7 +214,9 @@ async function start(msg: StartMessage) {
   }
   cardsId = msg.cardsId ?? gameId;
   // A guest gets the host's memory cards with the game's state.
-  for (const slot of msg.join ? [] : MEMCARD_SLOTS) {
+  const guest = msg.room !== null && msg.room.me !== msg.room.host;
+  ownCards = !guest;
+  for (const slot of guest ? [] : MEMCARD_SLOTS) {
     const card = cardsId ? await fetchBytes(`/api/games/${encodeURIComponent(cardsId)}/memcards/${slot + 1}`) : null;
     emu.insertMemoryCard(slot, card ?? undefined);
   }
@@ -228,9 +237,9 @@ async function start(msg: StartMessage) {
   chosenScale = autoScale = msg.scale;
   emu.setResolutionScale(msg.scale);
   post({ type: "started", pal: emu.isPal, bios: emu.biosInfo(), renderer: renderer() });
-  if (msg.join) {
-    openSession(false, `/api/netplay/join/${encodeURIComponent(msg.join.code)}?name=${encodeURIComponent(msg.join.name)}`);
-  }
+  if (msg.room) pendingRoom = msg.room;
+  if (pendingRoom) joinRoom(pendingRoom);
+  pendingRoom = null;
   nextFrameAt = performance.now();
   statsAt = nextFrameAt;
   schedule(0);
@@ -254,7 +263,7 @@ function tick() {
   try {
     const now = performance.now();
     let ran = 0;
-    if (fast && !net) {
+    if (fast && !inStep()) {
       // As many frames as fit in a slice of time, then the page's turn.
       while (performance.now() - now < FAST_SLICE_MS && advance()) ran++;
     } else if (ring && audioRunning) {
@@ -284,7 +293,7 @@ function tick() {
     paused = true;
     return;
   }
-  if (fast && !net) schedule(0);
+  if (fast && !inStep()) schedule(0);
   else schedule(ring && audioRunning ? 4 : Math.max(0, nextFrameAt - performance.now()));
 }
 
@@ -464,8 +473,8 @@ async function loadState(slot: number) {
 }
 
 async function saveMemoryCards() {
-  // The host keeps the saves: a guest's cards are copies.
-  if (!emu || !cardsId || (net && !net.isHost)) return;
+  // The cards' owner keeps the saves: a guest's cards are copies.
+  if (!emu || !cardsId || !ownCards) return;
   for (const slot of MEMCARD_SLOTS) {
     const data = emu.takeWrittenMemoryCard(slot);
     if (!data) continue;
@@ -499,11 +508,14 @@ scope.onmessage = (e: MessageEvent<ToWorker>) => {
         reportPads();
       }
       break;
-    case "net-host":
-      openSession(
-        true,
-        `/api/netplay/host?game=${encodeURIComponent(msg.gameId)}&bios=${encodeURIComponent(msg.biosId)}&name=${encodeURIComponent(msg.name)}`,
-      );
+    case "net-attach":
+      // Before the emulator is ready: once it is.
+      if (emu) joinRoom(msg.room);
+      else pendingRoom = msg.room;
+      break;
+    case "net-in":
+      if (net) net.receive(msg.data);
+      else netQueue.push(msg.data);
       break;
     case "net-ports":
       net?.setPorts(msg.ports);
@@ -511,12 +523,8 @@ scope.onmessage = (e: MessageEvent<ToWorker>) => {
     case "net-view":
       net?.setView(msg.view);
       break;
-    case "net-chat":
-      net?.say(msg.text);
-      break;
     case "net-leave":
       net?.close();
-      net = null;
       break;
     case "audio":
       audioRunning = msg.running;

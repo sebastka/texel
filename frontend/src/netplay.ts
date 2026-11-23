@@ -1,24 +1,31 @@
-// Netplay, in the emulator worker: the members of a room run the same game
-// in step (lockstep). Each sends its controller input for frame f + its
-// delay before running frame f. A frame runs once the host's input for it
-// is known (it carries who owns each controller) and the input of every
-// owner: members who own no controller only watch, and nobody waits for
-// them. The server routes messages (see the server's netplay.rs).
+// Netplay's game, in the emulator worker: the members of a room run the
+// same game in step (lockstep). Each sends its controller input for frame
+// f + its delay before running frame f. A frame runs once the host's input
+// for it is known (it carries who owns each controller) and the input of
+// every owner: members who own no controller only watch, and nobody waits
+// for them. The page holds the room's connection (room-link.ts) and relays
+// the game's messages; the server routes them (see the server's
+// netplay.rs).
 //
 // Every CHECK_EVERY frames, members compare a checksum of the machine with
 // the one of the member with the controls (the host when it has some):
 // a member whose checksum differs asks it for its state, and loads it.
 // Members joining get the host's state the same way.
+//
+// Each change of game or host starts an epoch, and messages of earlier
+// ones are dropped. A session lasts one game: the page starts another
+// player for the next. When the host leaves, the member who takes over
+// goes on, and the others get its state.
 
 import type { Emulator } from "./wasm/texel_web.js";
-import type { Axes, ChatLine, Half, Member, NetStatus, Ports, SplitView } from "./protocol";
+import type { Axes, Half, Member, NetStatus, Ports, RoomSnapshot, SplitView } from "./protocol";
 
 const OPPOSITE: Record<Half, Half> = { top: "bottom", bottom: "top", left: "right", right: "left" };
 
-export const HOST_ID = 0;
 const EVERYONE = 255;
 
-// Binary message kinds, after the [to, from] header.
+// Binary message kinds, after the [to, from] header; then the epoch's low
+// byte.
 const INPUT = 1;
 const SNAPSHOT = 2;
 const CHECK = 3;
@@ -29,6 +36,10 @@ const HISTORY = 600;
 const MAX_DELAY = 15;
 /** Frames behind the host past which a member asks for its state. */
 const TOO_FAR_BEHIND = 600;
+/** A guest asks for the host's state again this often until it gets it
+ * (the host may still be starting the game), and the host sends it at most
+ * this often to one member. */
+const HELLO_EVERY = 4000;
 
 interface Packet {
   buttons: number;
@@ -129,7 +140,8 @@ export interface SessionHooks {
   /** Runs a frame for real: audio, pads, stats. */
   runFrame: () => void;
   status: (s: NetStatus) => void;
-  chat: (line: ChatLine) => void;
+  /** Sends a message to the room (through the page). */
+  send: (data: string | Uint8Array) => void;
   gzip: (data: Uint8Array, decompress?: boolean) => Promise<Uint8Array>;
   /** This member got the game's state and runs it. */
   onStarted?: () => void;
@@ -137,15 +149,22 @@ export interface SessionHooks {
 
 interface MemberState {
   name: string;
+  registered: boolean;
+  /** Runs this game in step. */
   playing: boolean;
   rtt: number | null;
 }
 
 export class Session {
-  private readonly ws: WebSocket;
-  private state: NetStatus["state"] = "connecting";
-  private code: string | null = null;
-  private me: number | null = null;
+  private state: NetStatus["state"] = "syncing";
+  private readonly me: number;
+  /** Who hosts the room, and the epoch (see above). */
+  private host: number;
+  private epoch: number;
+  /** Host: members who asked for the state before it ran the game, and
+   * when each was last sent it. */
+  private readonly askers = new Set<number>();
+  private readonly sentAt = new Map<number, number>();
   private started = false;
   private frame = 0;
   private nextSend = 0;
@@ -157,47 +176,54 @@ export class Session {
   private latestHost = -1;
   private readonly members = new Map<number, MemberState>();
   /** Owners of the frame just run. */
-  private ports: Ports = [[HOST_ID], []];
+  private ports: Ports;
   /** Host only: the owners to send with the next input. */
-  private wantedPorts: Ports = [[HOST_ID], []];
-  private autoAssigned = false;
+  private wantedPorts: Ports;
+  private autoAssigned: boolean;
   /** Checksums by frame, then member. */
   private readonly checks = new Map<number, Map<number, number>>();
   private checkFloor = 0;
   private resyncAskedAt = 0;
   private pendingAnalog = false;
   private rtts: number[] = [];
-  private timers: ReturnType<typeof setInterval>[] = [];
+  private readonly timers: ReturnType<typeof setInterval>[] = [];
   private stalledSince = 0;
   private waitingFor: string[] = [];
   private note: string | undefined;
+  /** Split screen, set by the host: display only, not part of the game. */
+  private view: SplitView;
   /** This member's controller: the keyboard and first gamepad. */
   input: { buttons: number; axes: Axes } = { buttons: 0, axes: [128, 128, 128, 128] };
 
+  /** Joins the room's game: the host runs it from its machine as it is;
+   * the others ask the host for its state. */
   constructor(
-    readonly isHost: boolean,
-    url: string,
+    room: RoomSnapshot,
     private readonly hooks: SessionHooks,
   ) {
-    this.ws = new WebSocket(url);
-    this.ws.binaryType = "arraybuffer";
-    this.ws.onopen = () => {
-      const ping = () => this.sendText({ type: "ping", t: performance.now() });
-      ping();
-      this.timers.push(setInterval(ping, 1000));
-      this.timers.push(setInterval(() => this.adapt(), 2000));
-    };
-    this.ws.onmessage = (e: MessageEvent<string | ArrayBuffer>) => {
-      if (typeof e.data === "string") this.onText(JSON.parse(e.data) as Record<string, unknown>);
-      else void this.onBinary(new DataView(e.data));
-    };
-    this.ws.onclose = () => {
-      this.timers.forEach(clearInterval);
-      if (this.state !== "ended") {
-        this.started = false;
-        this.setState("ended", isHost ? "The room was closed." : "The connection to the room was lost.");
-      }
-    };
+    this.me = room.me;
+    this.host = room.host;
+    this.epoch = room.epoch;
+    for (const m of room.members) {
+      this.members.set(m.id, { name: m.name, registered: m.registered, playing: m.id === this.host, rtt: m.rtt });
+    }
+    this.ports = room.ports;
+    this.wantedPorts = room.ports;
+    this.autoAssigned = room.assigned;
+    this.view = room.view;
+    this.timers.push(setInterval(() => this.adapt(), 2000));
+    this.timers.push(
+      setInterval(() => {
+        if (!this.started && this.state === "syncing" && !this.isHost) this.hello();
+      }, HELLO_EVERY),
+    );
+    if (this.isHost) this.begin(0);
+    else this.hello();
+  }
+
+  /** This member hosts the room. */
+  get isHost(): boolean {
+    return this.me === this.host;
   }
 
   /** Running in step with the room. */
@@ -205,28 +231,26 @@ export class Session {
     return this.started;
   }
 
-  /** A guest has nothing to run before it gets the host's state. */
+  /** Nothing to run: a guest waiting for the host's state, or left
+   * behind. The host plays on once the room is gone. */
   get waiting(): boolean {
-    return !this.isHost && !this.started;
+    if (this.started) return false;
+    return this.state === "syncing" || !this.isHost;
   }
-
-  /** Split screen, set by the host: display only, not part of the game. */
-  private view: SplitView = null;
 
   /** The half of the screen to hide from this member: the other
    * player's, when it holds one controller and the host splits the view. */
   get hiddenHalf(): Half | null {
-    if (!this.view || !this.started || this.me === null) return null;
-    const mine = [0, 1].filter((port) => this.ports[port]!.includes(this.me!));
+    if (!this.view || !this.started) return null;
+    const mine = [0, 1].filter((port) => this.ports[port]!.includes(this.me));
     if (mine.length !== 1) return null;
     const myHalf = mine[0] === 0 ? this.view : OPPOSITE[this.view];
     return OPPOSITE[myHalf];
   }
 
+  /** The split screen (the page sends it to the others). */
   setView(view: SplitView) {
-    if (!this.isHost) return;
     this.view = view;
-    this.sendText({ type: "view", view });
     this.report();
   }
 
@@ -246,36 +270,27 @@ export class Session {
     this.pendingAnalog = true;
   }
 
-  say(text: string) {
-    this.sendText({ type: "chat", text });
-  }
-
-  close() {
+  /** Out of the room: the game goes on alone, for a host. */
+  close(note?: string) {
     this.started = false;
-    this.setState("ended", this.isHost ? "You closed the room." : "You left the room.");
     this.timers.forEach(clearInterval);
-    this.ws.close();
+    this.setState("ended", note ?? "");
   }
 
   private sendText(msg: object) {
-    if (this.ws.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify(msg));
+    this.hooks.send(JSON.stringify(msg));
   }
 
   /** Sends a binary message: [to, from] then the body. */
   private sendBinary(to: number, body: Uint8Array) {
-    if (this.ws.readyState !== WebSocket.OPEN) return;
     const out = new Uint8Array(body.length + 2);
     out[0] = to;
     out.set(body, 2);
-    this.ws.send(out);
+    this.hooks.send(out);
   }
 
   private name(id: number): string {
     return this.members.get(id)?.name ?? `Player ${id}`;
-  }
-
-  private system(text: string) {
-    this.hooks.chat({ from: null, name: "", text, at: Date.now() });
   }
 
   private noteTimer: ReturnType<typeof setTimeout> | undefined;
@@ -302,18 +317,19 @@ export class Session {
     const members: Member[] = [...this.members].map(([id, m]) => ({
       id,
       name: m.name,
-      host: id === HOST_ID,
+      host: id === this.host,
+      registered: m.registered,
       me: id === this.me,
       playing: m.playing,
       rtt: id === this.me ? median(this.rtts) : m.rtt,
     }));
     this.hooks.status({
       state: this.state,
-      code: this.code,
+      epoch: this.epoch,
       me: this.me,
       members,
       ports: this.isHost ? this.wantedPorts : this.ports,
-      rtt: median(this.rtts),
+      assigned: this.autoAssigned,
       delay: this.started ? this.delay : null,
       waitingFor: this.waitingFor,
       view: this.view,
@@ -326,8 +342,7 @@ export class Session {
    * goes through it, from this member to the slowest other. */
   private adapt() {
     const mine = median(this.rtts);
-    if (mine === null || this.me === null) return;
-    this.sendText({ type: "rtt", ms: Math.round(mine) });
+    if (mine === null) return;
     const others = [...this.members].filter(([id]) => id !== this.me).map(([, m]) => m.rtt ?? mine);
     const emu = this.hooks.emu();
     const frameMs = 1000 / (emu?.isPal ? 50 : 60);
@@ -336,60 +351,116 @@ export class Session {
     this.report();
   }
 
+  /** Starts an epoch: what was under way is dropped. */
+  private newEpoch(epoch: number) {
+    this.epoch = epoch;
+    this.started = false;
+    this.inputs.clear();
+    this.history.clear();
+    this.checks.clear();
+    this.checkFloor = 0;
+    this.latestHost = -1;
+    this.stalledSince = 0;
+    this.waitingFor = [];
+    this.resyncAskedAt = 0;
+    this.askers.clear();
+    this.sentAt.clear();
+    for (const [id, m] of this.members) m.playing = id === this.host;
+  }
+
+  /** Host: runs in step with the room from `frame` (inputs go through
+   * it), and sends its state to those who asked. */
+  private begin(frame: number) {
+    this.started = true;
+    this.frame = frame;
+    this.nextSend = frame;
+    this.checkFloor = frame;
+    const me = this.members.get(this.me);
+    if (me) me.playing = true;
+    this.setState("playing", "");
+    for (const id of this.askers) void this.sendSnapshot(id);
+    this.askers.clear();
+    this.hooks.onStarted?.();
+  }
+
+  /** A guest asks the host for its state, to run in step with it. */
+  private hello() {
+    this.sendText({ type: "hello", to: this.host, epoch: this.epoch });
+    this.setState("syncing");
+  }
+
+  /** A message from the room, relayed by the page. */
+  receive(data: string | ArrayBuffer) {
+    if (this.state === "ended") return;
+    if (typeof data === "string") this.onText(JSON.parse(data) as Record<string, unknown>);
+    else void this.onBinary(new DataView(data));
+  }
+
   private onText(msg: Record<string, unknown>) {
     const from = typeof msg.from === "number" ? msg.from : null;
+    // Requests of an earlier epoch are about what is gone.
+    const request = msg.type === "hello" || msg.type === "resync" || msg.type === "playing" || msg.type === "idle";
+    if (request && msg.epoch !== this.epoch) return;
     switch (msg.type) {
-      case "welcome": {
-        this.code = String(msg.code);
-        this.me = Number(msg.you);
-        for (const m of msg.members as { id: number; name: string }[]) {
-          this.members.set(m.id, { name: m.name, playing: m.id !== this.me || this.isHost, rtt: null });
-        }
-        if (this.isHost) {
-          // From now on, frames are counted and input goes through the room.
-          this.started = true;
-          this.frame = 0;
-          this.nextSend = 0;
-          this.setState("playing");
+      case "game":
+        // Another game (or none): the page starts another player.
+        this.close();
+        break;
+      case "host": {
+        // The host left: another member took over, and goes on.
+        const id = Number(msg.id);
+        const wasRunning = this.started;
+        this.host = id;
+        this.newEpoch(Number(msg.epoch));
+        if (!this.isHost) this.hello();
+        else if (wasRunning) {
+          // The controllers stay with who has them (who left let go of theirs).
+          this.wantedPorts = this.ports.map((ids) => ids.filter((x) => this.members.has(x))) as Ports;
+          this.autoAssigned = true;
+          this.begin(this.frame);
         } else {
-          this.sendText({ type: "hello", to: HOST_ID });
-          this.setState("syncing");
+          // Not in step yet: nothing to go on from. The page stops the game.
+          this.close();
         }
-        // After the status: the room's chat starts with its code.
-        for (const line of msg.chat as ChatLine[]) this.hooks.chat(line);
+        this.report();
         break;
       }
       case "joined": {
         const id = Number(msg.id);
-        this.members.set(id, { name: String(msg.name), playing: false, rtt: null });
-        if (this.isHost && this.view) this.sendText({ type: "view", to: id, view: this.view });
-        this.system(`${String(msg.name)} joined.`);
+        this.members.set(id, { name: String(msg.name), registered: msg.registered === true, playing: false, rtt: null });
         this.report();
         break;
       }
       case "left": {
         const id = Number(msg.id);
-        const name = this.name(id);
         this.members.delete(id);
-        if (this.isHost) {
-          this.wantedPorts = this.wantedPorts.map((ids) => ids.filter((x) => x !== id)) as Ports;
-        }
-        this.system(`${name} left.`);
+        this.askers.delete(id);
+        if (this.isHost) this.wantedPorts = this.wantedPorts.map((ids) => ids.filter((x) => x !== id)) as Ports;
         this.report();
         break;
       }
+      case "idle":
+        // A member left the game (not the room): nobody waits for it.
+        if (from !== null) {
+          const m = this.members.get(from);
+          if (m) m.playing = false;
+          if (this.isHost) this.wantedPorts = this.wantedPorts.map((ids) => ids.filter((x) => x !== from)) as Ports;
+          this.report();
+        }
+        break;
       case "closed":
-        this.started = false;
-        this.system("The host closed the room.");
-        this.setState("ended", "The host closed the room.");
-        this.ws.close();
+        this.close("The room was closed.");
         break;
       case "hello":
-        // A member wants the game's state, to start (or to catch up).
-        if (this.isHost && from !== null) void this.sendSnapshot(from);
+        // A member wants the game's state, to start (or to catch up); once
+        // the game runs, when it is starting.
+        if (this.isHost && from !== null) {
+          if (!this.started) this.askers.add(from);
+          else if (performance.now() - (this.sentAt.get(from) ?? -Infinity) > HELLO_EVERY) void this.sendSnapshot(from);
+        }
         break;
       case "resync":
-        if (from !== null) {
+        if (from !== null && this.started) {
           void this.sendSnapshot(from);
           this.flash(
             msg.reason === "behind"
@@ -411,7 +482,7 @@ export class Session {
         }
         break;
       case "view":
-        if (from === HOST_ID) {
+        if (from === this.host) {
           const v = msg.view;
           this.view = v === "top" || v === "bottom" || v === "left" || v === "right" ? v : null;
           this.report();
@@ -430,9 +501,6 @@ export class Session {
           if (this.rtts.length === 1) this.adapt();
         }
         break;
-      case "chat":
-        this.hooks.chat({ from, name: String(msg.name), text: String(msg.text), at: Number(msg.at) });
-        break;
     }
   }
 
@@ -441,17 +509,24 @@ export class Session {
   private async sendSnapshot(to: number) {
     const emu = this.hooks.emu();
     if (!emu || !this.started) return;
+    this.sentAt.set(to, performance.now());
     const frame = this.frame;
     const state = emu.saveState();
     const cards = [0, 1].map((slot) => emu.memoryCard(slot) ?? new Uint8Array());
     const pending: [number, number, Packet][] = [];
     for (const [f, set] of this.inputs) if (f >= frame) for (const [id, p] of set) pending.push([id, f, p]);
+    const epoch = this.epoch;
     const gz = await this.hooks.gzip(state);
-    const w = new Writer().u8(SNAPSHOT).u32(frame).u16(pending.length);
+    if (epoch !== this.epoch) return;
+    const w = new Writer().u8(SNAPSHOT).u8(epoch & 0xff).u32(frame).u16(pending.length);
     for (const [id, f, p] of pending) {
       w.u8(id);
       writePacket(w, f, p);
     }
+    // Who runs the game: those whose input to wait for.
+    const players = [...this.members].filter(([, m]) => m.playing).map(([id]) => id);
+    w.u8(players.length);
+    players.forEach((id) => w.u8(id));
     w.u32(gz.length).bytes(gz);
     for (const c of cards) w.u32(c.length).bytes(c);
     this.sendBinary(to, w.done());
@@ -461,19 +536,22 @@ export class Session {
     let set = this.inputs.get(frame);
     if (!set) this.inputs.set(frame, (set = new Map()));
     if (!set.has(id)) set.set(id, p);
-    if (id === HOST_ID && frame > this.latestHost) this.latestHost = frame;
+    if (id === this.host && frame > this.latestHost) this.latestHost = frame;
   }
 
   private async onBinary(view: DataView) {
     const r = new Reader(view);
     r.u8(); // to
     const from = r.u8();
-    switch (r.u8()) {
+    const kind = r.u8();
+    // Of an earlier epoch: another game, or another host's.
+    if (r.u8() !== (this.epoch & 0xff)) return;
+    switch (kind) {
       case INPUT: {
         const [frame, p] = readPacket(r);
         if (!this.started || frame >= this.frame) this.store(from, frame, p);
         // Far behind (the tab was hidden): ask for the state.
-        if (from === HOST_ID && this.started && frame - this.frame > TOO_FAR_BEHIND) this.askForState(HOST_ID, "behind");
+        if (from === this.host && this.started && frame - this.frame > TOO_FAR_BEHIND) this.askForState(this.host, "behind");
         break;
       }
       case CHECK: {
@@ -492,7 +570,7 @@ export class Session {
     const now = performance.now();
     if (now - this.resyncAskedAt < 5000) return;
     this.resyncAskedAt = now;
-    this.sendText({ type: "resync", to, reason });
+    this.sendText({ type: "resync", to, reason, epoch: this.epoch });
   }
 
   /** Loads another member's state: to start, or to resynchronise. */
@@ -505,16 +583,21 @@ export class Session {
       const [f, p] = readPacket(r);
       pending.push([id, f, p]);
     }
+    const players = Array.from({ length: r.u8() }, () => r.u8());
     const gz = r.bytes(r.u32());
     const cards = [0, 1].map(() => r.bytes(r.u32()));
     const emu = this.hooks.emu();
     if (!emu) return;
+    const epoch = this.epoch;
     const state = await this.hooks.gzip(gz, true);
+    // A change while it was unpacked: no longer the room's game.
+    if (epoch !== this.epoch || this.state === "ended") return;
     emu.loadState(state);
     cards.forEach((c, slot) => {
       if (c.length) emu.insertMemoryCard(slot, c);
     });
     for (const [id, f, p] of pending) this.store(id, f, p);
+    for (const [id, m] of this.members) m.playing = id === this.me || players.includes(id);
     this.checks.clear();
     this.checkFloor = frame;
     this.resyncAskedAt = 0;
@@ -523,8 +606,8 @@ export class Session {
       this.nextSend = frame;
       this.started = true;
       for (const f of this.inputs.keys()) if (f < frame) this.inputs.delete(f);
-      this.sendText({ type: "playing" });
-      const me = this.me !== null ? this.members.get(this.me) : undefined;
+      this.sendText({ type: "playing", epoch: this.epoch });
+      const me = this.members.get(this.me);
       if (me) me.playing = true;
       this.setState("playing", "");
       this.hooks.onStarted?.();
@@ -549,7 +632,7 @@ export class Session {
   /** Runs the next frame if the inputs it needs are known. False when stalled. */
   step(): boolean {
     const emu = this.hooks.emu();
-    if (!this.started || !emu || this.me === null) return false;
+    if (!this.started || !emu) return false;
     const f = this.frame;
     while (this.nextSend <= f + this.delay) {
       const p: Packet = {
@@ -560,15 +643,18 @@ export class Session {
       };
       this.pendingAnalog = false;
       this.store(this.me, this.nextSend, p);
-      const w = new Writer().u8(INPUT);
+      const w = new Writer().u8(INPUT).u8(this.epoch & 0xff);
       writePacket(w, this.nextSend, p);
       this.sendBinary(EVERYONE, w.done());
       this.nextSend++;
     }
     const set = this.inputs.get(f);
-    const host = set?.get(HOST_ID);
-    // Members who left send nothing more: their controllers go idle.
-    const missing = host ? owners(host.ports).filter((id) => !set!.has(id) && this.members.has(id)) : [HOST_ID];
+    const host = set?.get(this.host);
+    // Members who left (the room, or the game) send nothing more: their
+    // controllers go idle.
+    const missing = host
+      ? owners(host.ports).filter((id) => !set!.has(id) && this.members.get(id)?.playing === true)
+      : [this.host];
     if (!set || missing.length) {
       const now = performance.now();
       if (!this.stalledSince) this.stalledSince = now;
@@ -591,7 +677,7 @@ export class Session {
     this.frame = f + 1;
     if (f % CHECK_EVERY === 0) {
       const sum = emu.stateChecksum();
-      this.sendBinary(EVERYONE, new Writer().u8(CHECK).u32(f).u32(sum).done());
+      this.sendBinary(EVERYONE, new Writer().u8(CHECK).u8(this.epoch & 0xff).u32(f).u32(sum).done());
       this.check(f, this.me, sum);
     }
     return true;
@@ -599,7 +685,7 @@ export class Session {
 
   /** Sets the controllers from their owners' input. */
   private apply(emu: Emulator, set: Map<number, Packet>) {
-    const ports = set.get(HOST_ID)!.ports;
+    const ports = set.get(this.host)!.ports;
     if (JSON.stringify(ports) !== JSON.stringify(this.ports)) {
       this.ports = ports;
       this.report();
@@ -621,13 +707,13 @@ export class Session {
    * it has a controller, else the owner of the first controller, then of
    * the second, else the host. */
   private authority(frame: number): number {
-    const ports = this.history.get(frame)?.get(HOST_ID)?.ports ?? this.ports;
-    const list = owners(ports).filter((id) => this.members.has(id));
-    return list.includes(HOST_ID) ? HOST_ID : (list[0] ?? HOST_ID);
+    const ports = this.history.get(frame)?.get(this.host)?.ports ?? this.ports;
+    const list = owners(ports).filter((id) => this.members.get(id)?.playing);
+    return list.includes(this.host) ? this.host : (list[0] ?? this.host);
   }
 
   private check(frame: number, id: number, sum: number) {
-    if (frame < this.checkFloor || this.me === null) return;
+    if (frame < this.checkFloor) return;
     let sums = this.checks.get(frame);
     if (!sums) this.checks.set(frame, (sums = new Map()));
     sums.set(id, sum);
