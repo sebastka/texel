@@ -16,7 +16,7 @@ texel-ps2.workspace = true
 texel-disc.workspace = true
 anyhow = "1.0.104"
 argon2 = { version = "0.5.3", default-features = false, features = ["alloc", "password-hash"] }
-base64 = "0.22.1"
+base64 = "0.23.1"
 axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "tokio", "query", "ws"] }
 chd = "0.4.0"
 flate2 = { version = "1.1.11", default-features = false, features = ["zlib-rs"] }
