@@ -368,3 +368,12 @@ Jak and Daxter's jungle needs about 160 million VU1 instructions per second of c
 - **Microcode uploaded again.** Games upload one renderer's microcode after another to the same addresses, every frame (Jak: more than a dozen versions). A start address keeps up to 64 compiled versions, each with the instructions it was compiled from, checked against micro memory only after it was written to.
 - **Result.** VU1 runs about 13 times faster (about 190 million instructions a second compiled), VU0 too; the jungle went from 5.4 to 7.9 frames a second (Node, the GS not drawing). The EE is now the limit (its interpreted instructions, COP2 among them), then VIF's unpacking.
 
+
+## D50. The PS2 runs in slices of 512 EE cycles
+
+The PS2 ran in slices of 128 EE cycles: the EE ran 128 instructions (compiled or interpreted, D30), then the IOP its share, then the timers, DMA, the interrupt lines and the rest caught up. With the EE and VUs compiled (D49), the slices themselves cost about a tenth of the time in Jak and Daxter's jungle.
+
+- **512.** In WebAssembly, the jungle runs at 11.5 frames a second with slices of 512 (10.9 with 256, 10.2 with 128). Interrupts are seen up to 512 EE cycles late (1.7 µs; a scanline is about 18,700), and the IOP runs 64 of its cycles at a time instead of 16.
+- **Tested on the library.** Eighteen PS2 games booted for a minute of console time at 128, 256, 512 and 1024 (natively, start and cross pressed in turn, a frame a second compared): the same games get as far, with the same SIF traffic and primitives drawn within a fraction of a percent. Half of them do not get past a black screen in that minute, so for those only their boot is tested.
+- **What it found first.** At 512, Jak 3 waited forever for the IOP: its DMA interrupt was raised only when a channel finished with the master enable on, not when the kernel turned the enable back on with a flag up, as DICR bit 31 rising does on the console. Fixed; two games that hung at boot at some slice lengths boot at all of them since. A game hanging with longer slices points to such a race in the emulation rather than to the slice: the console has none.
+- **Not longer, for now.** 1024 behaved the same in that test but gains little more; slices that end early at the next event due (timers, VBlank, DMA) would allow longer ones where nothing is due.

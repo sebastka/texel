@@ -27,8 +27,9 @@ use bus::Bus;
 use ee::Ee;
 use texel_ps1::cpu::{Cpu, CpuBus};
 
-/// Instructions run between updates of the timers and interrupt lines.
-const SLICE: u64 = 128;
+/// Instructions run between updates of the timers and interrupt lines
+/// (and the IOP's turn, in its slower cycles). See D50.
+const SLICE: u64 = 512;
 
 /// The machine, as far as it goes.
 #[derive(serde::Serialize, serde::Deserialize)]
