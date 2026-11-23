@@ -6,10 +6,10 @@
 //! A block runs from its first instruction to a branch and its delay slot,
 //! or to an instruction after which the interpreter must look again (COP0,
 //! SYSCALL, BREAK), or to the end of its 4 KiB page, or `MAX_LEN`
-//! instructions. The integer instructions and the branches are compiled;
-//! the others call `exec` (the interpreter, for that one instruction), and
-//! the block stops early when one of those takes an exception or changes
-//! where the EE goes next.
+//! instructions. The integer instructions, the branches, and the moves to
+//! and from the FPU and VU0 are compiled; the others call `exec` (the
+//! interpreter, for that one instruction), and the block stops early when
+//! one of those takes an exception or changes where the EE goes next.
 
 use std::mem::offset_of;
 
@@ -173,6 +173,25 @@ fn gpr(r: u32) -> u32 {
 
 const fn field(offset: usize) -> u32 {
     offset as u32
+}
+
+/// FPU register `f`, in the `Ee`.
+fn fpr(f: u32) -> u32 {
+    (offset_of!(Ee, fpu) + offset_of!(super::super::fpu::Fpu, fpr) + 4 * f as usize) as u32
+}
+
+/// VU0's VF register `v`, in the `Bus`.
+fn vf(v: u32) -> u32 {
+    (offset_of!(crate::bus::Bus, vu0) + offset_of!(crate::vu::Vu, vf) + 16 * v as usize) as u32
+}
+
+/// The register a load or store reads or writes: the EE's own, the FPU's
+/// (LWC1, SWC1), VU0's (LQC2, SQC2).
+#[derive(Clone, Copy)]
+enum Reg {
+    Gpr(u32),
+    Fpr(u32),
+    Vf(u32),
 }
 
 /// Emits the compiled block.
@@ -368,10 +387,21 @@ impl Gen {
             0x2B => (4, 0, op::I64_STORE32),
             0x3F => (8, 0, op::I64_STORE),
             0x1F => (16, 0, op::I64_STORE),
+            // LWC1, SWC1, LQC2, SQC2.
+            0x31 => (4, op::I32_LOAD, 0),
+            0x39 => (4, 0, op::I32_STORE),
+            0x36 => (16, op::I64_LOAD, 0),
+            0x3E => (16, 0, op::I64_STORE),
             _ => return false,
         };
+        let reg = match i >> 26 {
+            0x31 | 0x39 => Reg::Fpr(rt),
+            0x36 | 0x3E => Reg::Vf(rt),
+            _ => Reg::Gpr(rt),
+        };
         let write = store != 0;
-        if !write && rt == 0 {
+        // r0 and VF0 keep their values: the interpreter loads into them.
+        if !write && rt == 0 && !matches!(reg, Reg::Fpr(_)) {
             return false;
         }
         // VA = rs + offset (LQ and SQ: aligned to 16 bytes).
@@ -386,7 +416,7 @@ impl Gen {
         // interpreter.
         self.fast(write);
         self.code.if_();
-        self.access(write, size, load, store, rt, self.layout.ram, !(size as i32 - 1));
+        self.access(write, size, load, store, reg, self.layout.ram, !(size as i32 - 1));
         self.code.op(op::ELSE);
         self.code
             .local_get(PA)
@@ -396,7 +426,7 @@ impl Gen {
             .op(op::I32_EQ)
             .if_();
         let mask = (SCRATCHPAD_SIZE - 1) & !(size as i32 - 1);
-        self.access(write, size, load, store, rt, self.layout.scratchpad, mask);
+        self.access(write, size, load, store, reg, self.layout.scratchpad, mask);
         self.code.op(op::ELSE);
         self.exec(i, pc, index, slot);
         self.code.op(op::END);
@@ -404,31 +434,37 @@ impl Gen {
         true
     }
 
-    /// The access itself, at `base` + (PA & `mask`).
+    /// The access itself, at `base` + (PA & `mask`), of `size` bytes with
+    /// the wasm `load` or `store`: a register's (a 16-byte access in two
+    /// halves).
     #[allow(clippy::too_many_arguments)]
-    fn access(&mut self, write: bool, size: u32, load: u8, store: u8, rt: u32, base: u32, mask: i32) {
-        let at = |g: &mut Self| {
-            g.code.local_get(PA).i32_const(mask).op(op::I32_AND);
-        };
-        if write {
-            at(self);
-            self.get(rt);
-            self.code.mem(store, size.min(8).trailing_zeros(), base);
-            if size == 16 {
-                at(self);
-                self.get_high(rt);
-                self.code.mem(store, 3, base + 8);
-            }
-        } else {
-            self.code.local_get(EE);
-            at(self);
-            self.code.mem(load, size.min(8).trailing_zeros(), base);
-            self.code.mem(op::I64_STORE, 3, gpr(rt));
-            if size == 16 {
-                self.code.local_get(EE);
-                at(self);
-                self.code.mem(op::I64_LOAD, 3, base + 8);
-                self.code.mem(op::I64_STORE, 3, gpr(rt) + 8);
+    fn access(&mut self, write: bool, size: u32, load: u8, store: u8, reg: Reg, base: u32, mask: i32) {
+        let align = size.min(8).trailing_zeros();
+        let halves: &[u32] = if size == 16 { &[0, 8] } else { &[0] };
+        for &h in halves {
+            if write {
+                self.code.local_get(PA).i32_const(mask).op(op::I32_AND);
+                match reg {
+                    Reg::Gpr(r) if h == 0 => self.get(r),
+                    Reg::Gpr(r) => self.get_high(r),
+                    Reg::Fpr(f) => {
+                        self.code.local_get(EE).mem(op::I32_LOAD, 2, fpr(f));
+                    }
+                    Reg::Vf(v) => {
+                        self.code.local_get(BUS).mem(op::I64_LOAD, 3, vf(v) + h);
+                    }
+                }
+                self.code.mem(store, align, base + h);
+            } else {
+                let (local, at, reg_store, reg_align) = match reg {
+                    Reg::Gpr(r) => (EE, gpr(r), op::I64_STORE, 3),
+                    Reg::Fpr(f) => (EE, fpr(f), op::I32_STORE, 2),
+                    Reg::Vf(v) => (BUS, vf(v), op::I64_STORE, 3),
+                };
+                self.code.local_get(local);
+                self.code.local_get(PA).i32_const(mask).op(op::I32_AND);
+                self.code.mem(load, align, base + h);
+                self.code.mem(reg_store, reg_align, at + h);
             }
         }
     }
@@ -606,6 +642,37 @@ impl Gen {
             }),
             // CACHE, PREF.
             0x2F | 0x33 => {}
+            // MFC1, MTC1.
+            0x11 if rs == 0x00 => self.set(rt, |g| {
+                g.code.local_get(EE).mem(op::I64_LOAD32_S, 2, fpr(rd));
+            }),
+            0x11 if rs == 0x04 => {
+                self.code.local_get(EE);
+                self.get(rt);
+                self.code.op(op::I32_WRAP_I64).mem(op::I32_STORE, 2, fpr(rd));
+            }
+            // QMFC2, QMTC2 (VF0 keeps its value).
+            0x12 if rs == 0x01 => {
+                if rt != 0 {
+                    for h in [0, 8] {
+                        self.code
+                            .local_get(EE)
+                            .local_get(BUS)
+                            .mem(op::I64_LOAD, 3, vf(rd) + h)
+                            .mem(op::I64_STORE, 3, gpr(rt) + h);
+                    }
+                }
+            }
+            0x12 if rs == 0x05 => {
+                if rd != 0 {
+                    self.code.local_get(BUS);
+                    self.get(rt);
+                    self.code.mem(op::I64_STORE, 3, vf(rd));
+                    self.code.local_get(BUS);
+                    self.get_high(rt);
+                    self.code.mem(op::I64_STORE, 3, vf(rd) + 8);
+                }
+            }
             _ => return false,
         }
         true
@@ -669,7 +736,8 @@ fn segment(src: &Source, k: usize) -> usize {
 /// A compiled block.
 pub struct Compiled {
     pub module: Vec<u8>,
-    /// The instructions it must have left to start: its first segment.
+    /// The instructions it must have left to start: its first, with its
+    /// delay slot when it is a branch (it can stop after any other).
     pub first: u32,
     /// Its instructions, and those compiled (not left to the interpreter;
     /// branches included).
@@ -681,10 +749,12 @@ pub struct Compiled {
 /// (its first instruction is one the interpreter keeps).
 ///
 /// Conditional branches leave the block when taken, and it goes on when
-/// not (a superblock); jumps end it. Each segment after the first starts by
-/// leaving the block if it has fewer instructions left than the segment
-/// needs. Every way out stores pc and next_pc and returns how many
-/// instructions ran.
+/// not (a superblock); jumps end it. Each instruction after the first
+/// starts by leaving the block if none are left to run (two for a branch,
+/// which runs with its delay slot): the slices of time the EE runs in are
+/// short (`Ps2::run`), and the interpreter takes the rest of one where a
+/// block stops, as it would have. Every way out stores pc and next_pc and
+/// returns how many instructions ran.
 ///
 /// `exec`: the function-table index of the interpreter's entry point (see
 /// `Backend::exec_index`); `layout`: where the EE's memory is.
@@ -700,14 +770,18 @@ pub fn compile(src: &Source, exec: u32, layout: Layout) -> Option<Compiled> {
     let mut k = 0;
     let mut ran = 0u32;
     let mut ended = false;
-    let first = segment(src, 0);
-    let mut segment_start = true;
+    // To start: the first instruction, with its delay slot if a branch.
+    let is_branch = |k: usize| {
+        let pc = src.va.wrapping_add(4 * k as u32);
+        matches!(branch(src.words[k], pc, &src.idle), Ok(Some(_)))
+    };
+    let first = if is_branch(0) { 2 } else { 1 }.min(segment(src, 0));
     while k < src.words.len() && k < MAX_LEN {
         let i = src.words[k];
         let pc = src.va.wrapping_add(4 * k as u32);
-        if segment_start && k > 0 {
-            // Out here unless the next segment fits in what is left.
-            let need = segment(src, k) as i32;
+        if k > 0 {
+            // Out here unless this instruction (and its delay slot) fits.
+            let need = if is_branch(k) { 2 } else { 1 };
             g.code
                 .local_get(LEFT)
                 .i32_const(ran as i32 + need)
@@ -716,7 +790,6 @@ pub fn compile(src: &Source, exec: u32, layout: Layout) -> Option<Compiled> {
             g.set_pc(pc);
             g.code.i32_const(ran as i32).op(op::RETURN).op(op::END);
         }
-        segment_start = false;
         let b = match branch(i, pc, &src.idle) {
             Err(()) => break,
             Ok(None) => {
@@ -794,7 +867,6 @@ pub fn compile(src: &Source, exec: u32, layout: Layout) -> Option<Compiled> {
             }
         }
         k += 2;
-        segment_start = true;
         if ended {
             break;
         }
