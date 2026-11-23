@@ -6,9 +6,9 @@ export interface StartMessage {
   console: "ps1" | "ps2";
   biosId: string;
   gameId: string | null;
-  /** The game whose memory cards to insert: the game's own by default
-   * (without a game: blank cards, not kept). */
-  cardsId: string | null;
+  /** The user's memory cards to insert, in slots 1 and 2 (null: a blank
+   * card, not kept). */
+  cards: Slots;
   cue: string | null;
   files: { name: string; size: number }[];
   /** The disc has an SBI file (LibCrypt protection). */
@@ -21,6 +21,9 @@ export interface StartMessage {
   /** Netplay: the room whose game this is, to run in step with it. */
   room: RoomSnapshot | null;
 }
+
+/** A memory card per slot: the user's card ids (null: none of theirs). */
+export type Slots = [number | null, number | null];
 
 /** Owners of each controller: member ids (several share a controller). */
 export type Ports = [number[], number[]];

@@ -1,6 +1,7 @@
-// The user's memory cards: each game's two cards, the saves on them (with
-// their icons), and what can be done with them: delete a save, copy or move
-// it to another game's card, download or replace a whole card.
+// The user's memory cards, per console: their own, named, inserted in
+// whichever game they play (chosen before it starts). Here: creating,
+// renaming and deleting cards, and their saves (with their icons): delete
+// a save, copy or move it to another card, download or replace a card.
 
 import { ApiError, api, type Card, type CardSave, type Console } from "./api";
 import { h } from "./dom";
@@ -33,37 +34,34 @@ function icon(save: CardSave): HTMLElement {
   return canvas;
 }
 
-export async function renderCards(shell: Shell) {
+/** A button that acts on its second click: no dialog boxes. */
+function confirmButton(label: string, run: () => void): HTMLElement {
+  const b = h(
+    "button.ghost.small-button.danger",
+    {
+      onclick: () => {
+        if (b.dataset.armed) run();
+        else {
+          b.dataset.armed = "1";
+          b.textContent = `${label}: sure?`;
+        }
+      },
+    },
+    label,
+  );
+  return b;
+}
+
+export async function renderCards(shell: Shell, platform: Console) {
   const status = h("p.error", { hidden: true, role: "alert" });
   const fail = (e: unknown) => {
     status.textContent = e instanceof ApiError ? e.message : String(e);
     status.hidden = false;
   };
   const body = h("div.cards", {}, h("p.muted", {}, "Loading…"));
-  shell.app.replaceChildren(
-    shell.header("cards"),
-    h(
-      "main.page",
-      {},
-      h("div.page-head", {}, h("h1", {}, "Memory cards")),
-      h(
-        "p.muted",
-        {},
-        "Each game has its own two memory cards, yours alone. Here are the ones your games wrote to, with their saves: " +
-          "copy a save to another game's card (games sharing saves, a game's other edition), move it, or delete it.",
-      ),
-      status,
-      body,
-    ),
-  );
-  let cards: Card[];
-  try {
-    cards = await api.cards();
-  } catch (e) {
-    body.replaceChildren();
-    return fail(e);
-  }
-  const reload = () => void renderCards(shell);
+  const tabs = h("div");
+  const name = h("input", { placeholder: "Name", maxLength: 64, required: true, "aria-label": "New card's name" });
+  const reload = () => void renderCards(shell, platform);
   const act = async (what: () => Promise<unknown>) => {
     status.hidden = true;
     try {
@@ -73,111 +71,124 @@ export async function renderCards(shell: Shell) {
       fail(e);
     }
   };
-  if (!cards.length) {
-    body.replaceChildren(h("p.muted", {}, "No memory card yet: they appear once a game saves."));
-    return;
+  const create = h(
+    "form.card-new",
+    {
+      onsubmit: (e: Event) => {
+        e.preventDefault();
+        const n = name.value.trim();
+        if (n) void act(() => api.createCard(platform, n));
+      },
+    },
+    name,
+    h("button.primary", { type: "submit" }, "New card"),
+  );
+  shell.app.replaceChildren(
+    shell.header("cards"),
+    h(
+      "main.page",
+      {},
+      h("div.page-head", {}, h("h1", {}, "Memory cards")),
+      tabs,
+      h(
+        "p.muted",
+        {},
+        "Your memory cards, yours alone: you choose which ones a game gets before it starts, and it saves to them. " +
+          "Here, their saves: copy one to another card, move it, or delete it.",
+      ),
+      create,
+      status,
+      body,
+    ),
+  );
+  let all: Card[];
+  try {
+    all = await api.cards();
+  } catch (e) {
+    body.replaceChildren();
+    return fail(e);
   }
-  // Destinations: every game of the console (first discs), each with two
-  // slots.
-  const destinations = (c: Console) =>
-    shell
-      .games()
-      .filter((g) => g.console === c && (!g.discs.length || g.discs[0]?.id === g.id))
-      .sort((a, b) => a.title.localeCompare(b.title));
-
-  const copyForm = (card: Card, save: CardSave) => {
-    const game = card.game!;
-    const target = h(
-      "select",
-      { "aria-label": "Destination" },
-      ...destinations(card.console).flatMap((g) =>
-        [1, 2]
-          .filter((slot) => !(g.id === game.id && slot === card.slot))
-          .map((slot) => h("option", { value: `${g.id}/${slot}` }, `${g.title} — card ${slot}`)),
+  tabs.replaceChildren(shell.consoleTabs("cards", platform, (c) => all.filter((card) => card.console === c).length));
+  const cards = all.filter((c) => c.console === platform);
+  name.value = `Card ${cards.length + 1}`;
+  if (!cards.length) {
+    body.replaceChildren(
+      h(
+        "p.muted",
+        {},
+        `No ${CONSOLE_NAMES[platform]} memory card yet: create one here, or one is made for the first game you start.`,
       ),
     );
-    const go = (move: boolean) => () => {
-      const [toGame, toSlot] = target.value.split("/");
-      void act(() => api.copySave(game.id, card.slot, save.id, toGame!, Number(toSlot), move));
-    };
+    return;
+  }
+
+  const copyForm = (card: Card, save: CardSave) => {
+    const others = cards.filter((c) => c.id !== card.id);
+    const target = h(
+      "select",
+      { "aria-label": "Destination card" },
+      ...others.map((c) => h("option", { value: String(c.id) }, c.name)),
+    );
+    const go = (move: boolean) => () => void act(() => api.copySave(card.id, save.id, Number(target.value), move));
     return h(
       "div.copy-form",
       { hidden: true },
-      target,
-      h("button.ghost.small-button", { onclick: go(false) }, "Copy"),
-      h("button.ghost.small-button", { onclick: go(true) }, "Move"),
+      ...(others.length
+        ? [
+            target,
+            h("button.ghost.small-button", { onclick: go(false) }, "Copy"),
+            h("button.ghost.small-button", { onclick: go(true) }, "Move"),
+          ]
+        : [h("span.muted.small", {}, "Create another card to copy it to.")]),
     );
   };
 
   const saveRow = (card: Card, save: CardSave) => {
-    const form = card.game ? copyForm(card, save) : null;
-    const del = h(
-      "button.ghost.small-button.danger",
-      {
-        onclick: () => {
-          if (del.dataset.armed) {
-            void act(() => api.deleteSave(card.game!.id, card.slot, save.id));
-          } else {
-            // Asked twice: no dialog boxes.
-            del.dataset.armed = "1";
-            del.textContent = "Delete: sure?";
-          }
-        },
-      },
-      "Delete",
-    );
+    const form = copyForm(card, save);
     return h(
       "li.save",
       {},
       icon(save),
       h("div.save-name", {}, h("div", {}, save.title || save.id), h("div.muted.small.mono", {}, save.id)),
       h("span.muted.small.nowrap", {}, size(save.size)),
-      card.game
-        ? h(
-            "div.save-actions",
-            {},
-            h(
-              "button.ghost.small-button",
-              {
-                onclick: () => {
-                  if (form) form.hidden = !form.hidden;
-                },
-              },
-              "Copy or move…",
-            ),
-            del,
-          )
-        : null,
+      h(
+        "div.save-actions",
+        {},
+        h("button.ghost.small-button", { onclick: () => (form.hidden = !form.hidden) }, "Copy or move…"),
+        confirmButton("Delete", () => void act(() => api.deleteSave(card.id, save.id))),
+      ),
       form,
     );
   };
 
   const cardBox = (card: Card) => {
-    const g = card.game;
     const upload = h("input", {
       type: "file",
       hidden: true,
       onchange: () => {
         const file = upload.files?.[0];
-        if (!file || !g) return;
-        void act(async () => api.putCard(g.id, card.slot, await file.arrayBuffer()));
+        if (file) void act(async () => api.putCard(card.id, await file.arrayBuffer()));
       },
     }) as HTMLInputElement;
-    const remove = h(
-      "button.ghost.small-button.danger",
+    // Renaming in place.
+    const title = h("h2", {}, card.name);
+    const rename = h("input", { value: card.name, maxLength: 64, required: true, "aria-label": "Card name" });
+    const renameForm = h(
+      "form.card-rename",
       {
-        onclick: () => {
-          if (!g) return;
-          if (remove.dataset.armed) void act(() => api.deleteCard(g.id, card.slot));
-          else {
-            remove.dataset.armed = "1";
-            remove.textContent = "Delete the card: sure?";
-          }
+        hidden: true,
+        onsubmit: (e: Event) => {
+          e.preventDefault();
+          const n = rename.value.trim();
+          if (n && n !== card.name) void act(() => api.renameCard(card.id, n));
+          else renameForm.hidden = true;
         },
       },
-      "Delete the card",
+      rename,
+      h("button.ghost.small-button", { type: "submit" }, "Save"),
     );
     const saves = card.saves ?? [];
+    const updated = new Date(card.updatedAt * 1000).toLocaleString();
     return h(
       "section.card-box",
       {},
@@ -187,40 +198,45 @@ export async function renderCards(shell: Shell) {
         h(
           "div",
           {},
-          h("h2", {}, g ? h("a", { href: `#/game/${g.id}` }, g.title) : card.key, ` · card ${card.slot}`),
+          title,
+          renameForm,
           h(
             "div.muted.small",
             {},
-            g?.serial ?? card.key,
             card.error
-              ? ` · ${card.error}`
+              ? card.error
               : card.formatted === false
-                ? " · not formatted"
-                : ` · ${saves.length} save${saves.length === 1 ? "" : "s"}, ${size(card.free ?? 0)} free of ${size(card.capacity ?? 0)}`,
+                ? "Not formatted: a game formats it"
+                : `${saves.length} save${saves.length === 1 ? "" : "s"}, ${size(card.free ?? 0)} free of ${size(card.capacity ?? 0)}`,
+            ` · written ${updated}`,
           ),
         ),
-        g
-          ? h(
-              "div.card-actions",
-              {},
-              h(
-                "a.button.ghost.small-button",
-                { href: api.cardUrl(g.id, card.slot), download: `${g.serial ?? g.id}-${card.slot}.${card.console === "ps1" ? "mcd" : "ps2"}` },
-                "Download",
-              ),
-              h("button.ghost.small-button", { onclick: () => upload.click(), title: "Replace this card with an image file" }, "Replace…"),
-              remove,
-              upload,
-            )
-          : h("span.muted.small", {}, "This game left the library."),
+        h(
+          "div.card-actions",
+          {},
+          h(
+            "button.ghost.small-button",
+            {
+              onclick: () => {
+                renameForm.hidden = !renameForm.hidden;
+                if (!renameForm.hidden) rename.select();
+              },
+            },
+            "Rename",
+          ),
+          h(
+            "a.button.ghost.small-button",
+            { href: api.cardUrl(card.id), download: `${card.name}.${card.console === "ps1" ? "mcd" : "ps2"}` },
+            "Download",
+          ),
+          h("button.ghost.small-button", { onclick: () => upload.click(), title: "Replace this card with an image file" }, "Replace…"),
+          confirmButton("Delete the card", () => void act(() => api.deleteCard(card.id))),
+          upload,
+        ),
       ),
       saves.length ? h("ul.saves", {}, ...saves.map((s) => saveRow(card, s))) : null,
     );
   };
 
-  const sections = (["ps1", "ps2"] as Console[])
-    .map((c) => [c, cards.filter((card) => card.console === c)] as const)
-    .filter(([, list]) => list.length)
-    .map(([c, list]) => h("section", {}, h("h2.console-title", {}, CONSOLE_NAMES[c]), ...list.map(cardBox)));
-  body.replaceChildren(...sections);
+  body.replaceChildren(...cards.map(cardBox));
 }

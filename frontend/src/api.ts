@@ -80,6 +80,8 @@ export interface GameDetail extends Game {
   details: Details | null;
   /** The BIOS the game was last started with, or its save states use. */
   lastBios: string | null;
+  /** The memory cards the game was last played with (ids), in its slots. */
+  lastCards: [number | null, number | null];
   /** The disc has an SBI file: the subchannel data of its LibCrypt protection. */
   sbi: boolean;
   /** Other pages about the game, from its YAML file: name → URL. */
@@ -178,11 +180,15 @@ export interface CardSave {
   icon?: string[];
 }
 
+/** One of the user's memory cards: named, of one console, inserted in
+ * whichever game the user plays. */
 export interface Card {
-  game: { id: string; title: string; console: Console; serial: string | null } | null;
-  key: string;
-  slot: number;
+  id: number;
+  name: string;
   console: Console;
+  /** Unix seconds. */
+  createdAt: number;
+  updatedAt: number;
   formatted?: boolean;
   saves?: CardSave[];
   free?: number;
@@ -200,6 +206,9 @@ export interface SaveState {
   /** The BIOS it was saved with: it loads only with it. */
   bios: string | null;
 }
+
+/** A card's image: what the emulator inserts and writes back. */
+export const cardUrl = (id: number) => `/api/cards/${id}/data`;
 
 export const api = {
   /** The signed-in user, or null. */
@@ -224,25 +233,25 @@ export const api = {
   invites: () => json<InviteRow[]>("/api/admin/invites"),
   createInvite: (note: string) => send<{ id: number; token: string }>("POST", "/api/admin/invites", { note }),
   deleteInvite: (id: number) => send("DELETE", `/api/admin/invites/${id}`),
-  cards: () => json<Card[]>("/api/cards"),
-  deleteCard: (game: string, slot: number) => send("DELETE", `/api/cards/${encodeURIComponent(game)}/${slot}`),
-  deleteSave: (game: string, slot: number, save: string) =>
-    send("DELETE", `/api/cards/${encodeURIComponent(game)}/${slot}/saves/${encodeURIComponent(save)}`),
-  copySave: (game: string, slot: number, save: string, toGame: string, toSlot: number, move: boolean) =>
-    send("POST", `/api/cards/${encodeURIComponent(game)}/${slot}/saves/${encodeURIComponent(save)}/copy`, {
-      toGame,
-      toSlot,
-      move,
-    }),
-  /** A whole card image: replaces the game's card. */
-  putCard: (game: string, slot: number, data: ArrayBuffer) =>
-    fetch(`/api/games/${encodeURIComponent(game)}/memcards/${slot}`, { method: "PUT", body: data }).then(check),
-  cardUrl: (game: string, slot: number) => `/api/games/${encodeURIComponent(game)}/memcards/${slot}`,
+  /** The user's memory cards (of a console), with their saves. */
+  cards: (console?: Console) => json<Card[]>(console ? `/api/cards?console=${console}` : "/api/cards"),
+  /** A new card, formatted. */
+  createCard: (console: Console, name: string) => send<Card>("POST", "/api/cards", { console, name }),
+  renameCard: (id: number, name: string) => send("PATCH", `/api/cards/${id}`, { name }),
+  deleteCard: (id: number) => send("DELETE", `/api/cards/${id}`),
+  deleteSave: (card: number, save: string) => send("DELETE", `/api/cards/${card}/saves/${encodeURIComponent(save)}`),
+  /** Copies (or moves) a save to another card of the same console. */
+  copySave: (card: number, save: string, to: number, move: boolean) =>
+    send("POST", `/api/cards/${card}/saves/${encodeURIComponent(save)}/copy`, { to, move }),
+  /** A whole card image: replaces the card's. */
+  putCard: (id: number, data: ArrayBuffer) => fetch(cardUrl(id), { method: "PUT", body: data }).then(check),
+  cardUrl,
+  /** Records the cards a game is played with, chosen again next time. */
+  setGameCards: (game: string, cards: [number | null, number | null]) =>
+    send("PUT", `/api/games/${encodeURIComponent(game)}/cards`, { cards }),
   states: (id: string) => json<SaveState[]>(`/api/games/${encodeURIComponent(id)}/states`),
   bios: () => json<Bios[]>("/api/bios"),
   games: () => json<GameListItem[]>("/api/games"),
-  /** The games with saved memory cards (a game on several discs: its first). */
-  memcards: () => json<string[]>("/api/memcards"),
   game: (id: string) => json<GameDetail>(`/api/games/${encodeURIComponent(id)}`),
   room: (code: string) =>
     json<{ game: string | null; bios: string | null; full: boolean }>(`/api/netplay/rooms/${encodeURIComponent(code)}`),

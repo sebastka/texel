@@ -8,7 +8,8 @@ import { RING_FRAMES, Ring } from "./audio";
 import type { FromDrawer, ToDrawer } from "./draw-worker";
 import { Painter } from "./paint";
 import { Session } from "./netplay";
-import type { Axes, FromWorker, RoomSnapshot, StartMessage, ToWorker } from "./protocol";
+import { cardUrl } from "./api";
+import type { Axes, FromWorker, RoomSnapshot, Slots, StartMessage, ToWorker } from "./protocol";
 
 const scope = self as unknown as DedicatedWorkerGlobalScope;
 const post = (msg: FromWorker) => scope.postMessage(msg);
@@ -55,9 +56,9 @@ let canvas: OffscreenCanvas | null = null;
 let viewport = { width: 640, height: 480 };
 let smooth = false;
 let gameId: string | null = null;
-/** The game whose memory cards are inserted (and saved): `gameId`'s, or one
- * chosen to start a console without a disc. */
-let cardsId: string | null = null;
+/** The user's memory cards in the two slots (ids; null: a blank card,
+ * not kept). */
+let cards: Slots = [null, null];
 /** Recorded with save states, which load only with it. */
 let biosId = "";
 /** The memory cards are this user's, and saved: not a netplay guest's
@@ -216,12 +217,14 @@ async function start(msg: StartMessage) {
       (msg.sbi ? await fetchSbi(gameId) : undefined) ?? undefined,
     );
   }
-  cardsId = msg.cardsId ?? gameId;
   // A guest gets the host's memory cards with the game's state.
   const guest = msg.room !== null && msg.room.me !== msg.room.host;
   ownCards = !guest;
+  cards = guest ? [null, null] : msg.cards;
   for (const slot of guest ? [] : MEMCARD_SLOTS) {
-    const card = cardsId ? await fetchBytes(`/api/games/${encodeURIComponent(cardsId)}/memcards/${slot + 1}`) : null;
+    const id = cards[slot];
+    const card = id !== null && id !== undefined ? await fetchBytes(cardUrl(id)) : null;
+    if (id !== null && id !== undefined && !card) throw new Error(`memory card ${slot + 1} not found`);
     emu.insertMemoryCard(slot, card ?? undefined);
   }
   canvas = msg.canvas;
@@ -494,13 +497,15 @@ function saveMemoryCards(): Promise<void> {
 
 async function uploadCards() {
   // The cards' owner keeps the saves: a guest's cards are copies.
-  if (!emu || !cardsId || !ownCards) return;
+  if (!emu || !ownCards) return;
   for (const slot of MEMCARD_SLOTS) {
     const data = emu.takeWrittenMemoryCard(slot) ?? unsaved[slot];
-    if (!data) continue;
+    const id = cards[slot];
+    // A blank card is not kept.
+    if (!data || id === null || id === undefined) continue;
     let status: number | string;
     try {
-      const resp = await fetch(`/api/games/${encodeURIComponent(cardsId)}/memcards/${slot + 1}`, {
+      const resp = await fetch(cardUrl(id), {
         method: "PUT",
         body: data as Uint8Array<ArrayBuffer>,
       });
@@ -603,7 +608,6 @@ scope.onmessage = (e: MessageEvent<ToWorker>) => {
       ]).then(([sbi]) => {
         if (!emu) return;
         gameId = msg.gameId;
-        cardsId = msg.gameId;
         emu.insertDisc(
           msg.cue ?? undefined,
           msg.files.map((f) => f.name),

@@ -49,11 +49,25 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/admin/users/{id}/reset", post(auth::reset_user))
         .route("/admin/invites", get(auth::list_invites).post(auth::create_invite))
         .route("/admin/invites/{id}", axum::routing::delete(auth::delete_invite))
-        .route("/cards", get(list_cards))
-        .route("/cards/{id}/{slot}", axum::routing::delete(delete_card))
-        .route("/cards/{id}/{slot}/saves/{save}", axum::routing::delete(delete_save))
         .route(
-            "/cards/{id}/{slot}/saves/{save}/copy",
+            "/cards",
+            get(list_cards).post(create_card).layer(DefaultBodyLimit::max(4096)),
+        )
+        .route(
+            "/cards/{id}",
+            axum::routing::patch(rename_card)
+                .delete(delete_card)
+                .layer(DefaultBodyLimit::max(4096)),
+        )
+        .route(
+            "/cards/{id}/data",
+            get(get_card_data)
+                .put(put_card_data)
+                .layer(DefaultBodyLimit::max(PS2_MEMCARD_SIZE + 1024)),
+        )
+        .route("/cards/{id}/saves/{save}", axum::routing::delete(delete_save))
+        .route(
+            "/cards/{id}/saves/{save}/copy",
             post(copy_save).layer(DefaultBodyLimit::max(4096)),
         )
         .route("/bios", get(list_bios))
@@ -63,12 +77,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/games/{id}/files/{index}", get(game_file))
         .route("/games/{id}/sbi", get(game_sbi))
         .route("/games/{id}/images/{kind}", get(game_image))
-        .route("/memcards", get(list_memcards))
         .route(
-            "/games/{id}/memcards/{slot}",
-            get(get_memcard)
-                .put(put_memcard)
-                .layer(DefaultBodyLimit::max(PS2_MEMCARD_SIZE + 1024)),
+            "/games/{id}/cards",
+            axum::routing::put(put_game_cards).layer(DefaultBodyLimit::max(4096)),
         )
         .route("/games/{id}/states", get(list_states))
         .route("/games/{id}/bios", axum::routing::put(put_bios))
@@ -314,6 +325,8 @@ struct GameDetailJson {
     details: Option<metadata::Details>,
     /// The BIOS the game was last started with, or its save states use.
     last_bios: Option<String>,
+    /// The memory cards the game was last played with (ids), in its slots.
+    last_cards: [Option<u64>; 2],
     /// Whether the disc has an SBI file (LibCrypt protection).
     sbi: bool,
     /// Other pages about the game, from its YAML file: name → URL.
@@ -363,6 +376,13 @@ async fn game_detail(State(state): AppStateRef, viewer: Viewer, Path(id): Path<S
             .filter(|b| lib.bios(b).is_some()),
         _ => None,
     };
+    let last_cards = match (save_keys(&state, &id).await, &viewer.user) {
+        (Some(keys), Some(user)) => state.db.last_cards(user.id, &keys.cards).await.unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "reading the cards of a game failed");
+            [None, None]
+        }),
+        _ => [None, None],
+    };
     Json(GameDetailJson {
         game,
         volume_id: g.volume_id.clone(),
@@ -371,6 +391,7 @@ async fn game_detail(State(state): AppStateRef, viewer: Viewer, Path(id): Path<S
         redump_tracks,
         details,
         last_bios,
+        last_cards,
         sbi: g.sbi.is_some(),
         links: g.overrides.as_ref().map(|o| o.links.clone()).unwrap_or_default(),
         overrides_error: g.overrides_error.clone(),
@@ -490,14 +511,12 @@ async fn game_image(
 
 /// The keys of a game's saves (see db.rs): the disc's serial, which stays
 /// the same whatever the image format or dump ("SLES-00049"), or
-/// "file-<id>" for discs without one. Multi-disc games keep their memory
-/// cards and settings with the first disc's, so that every disc shares
+/// "file-<id>" for discs without one. Multi-disc games keep their settings
+/// (BIOS, memory cards) with the first disc's, so that every disc shares
 /// them; save states stay with their disc.
 struct SaveKeys {
     cards: String,
     states: String,
-    /// The size of the game's console's memory cards.
-    card_size: usize,
 }
 
 fn save_key(g: &Game) -> String {
@@ -518,10 +537,6 @@ async fn save_keys(state: &AppState, id: &str) -> Option<SaveKeys> {
     Some(SaveKeys {
         cards: save_key(first_disc.unwrap_or(game)),
         states: save_key(game),
-        card_size: match game.console {
-            Console::Ps1 => MEMCARD_SIZE,
-            Console::Ps2 => PS2_MEMCARD_SIZE,
-        },
     })
 }
 
@@ -540,73 +555,6 @@ fn blob(data: Vec<u8>, mime: &'static str) -> Response {
         data,
     )
         .into_response()
-}
-
-/// The games with saved memory cards: their first disc, for a game on
-/// several (its discs share them).
-async fn list_memcards(State(state): AppStateRef, CurrentUser(user, _): CurrentUser) -> Response {
-    let keys: std::collections::HashSet<String> = match state.db.memory_cards(user.id).await {
-        Ok(cards) => cards.into_iter().map(|(k, _)| k).collect(),
-        Err(e) => return db_error("listing memory cards", &e),
-    };
-    let lib = state.library.read().await.clone();
-    let groups = state.disc_groups().await;
-    let ids: Vec<&str> = lib
-        .games
-        .iter()
-        .filter(|g| {
-            groups
-                .get(&g.id)
-                .and_then(|d| d.discs.first())
-                .is_none_or(|d| d.id == g.id)
-        })
-        .filter(|g| keys.contains(&save_key(g)))
-        .map(|g| g.id.as_str())
-        .collect();
-    Json(ids).into_response()
-}
-
-async fn get_memcard(
-    State(state): AppStateRef,
-    CurrentUser(user, _): CurrentUser,
-    Path((id, slot)): Path<(String, u8)>,
-) -> Response {
-    if !(1..=2).contains(&slot) {
-        return not_found("memory card");
-    }
-    let Some(keys) = save_keys(&state, &id).await else {
-        return not_found("game");
-    };
-    match state.db.memory_card(user.id, &keys.cards, slot).await {
-        Ok(Some(data)) => blob(data, "application/octet-stream"),
-        Ok(None) => not_found("memory card"),
-        Err(e) => db_error("reading a memory card", &e),
-    }
-}
-
-async fn put_memcard(
-    State(state): AppStateRef,
-    CurrentUser(user, _): CurrentUser,
-    Path((id, slot)): Path<(String, u8)>,
-    body: Bytes,
-) -> Response {
-    if !(1..=2).contains(&slot) {
-        return not_found("memory card");
-    }
-    let Some(keys) = save_keys(&state, &id).await else {
-        return not_found("game");
-    };
-    if body.len() != keys.card_size {
-        return (
-            StatusCode::BAD_REQUEST,
-            format!("this game's memory cards are {} bytes", keys.card_size),
-        )
-            .into_response();
-    }
-    match state.db.put_memory_card(user.id, &keys.cards, slot, &body).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(e) => db_error("saving a memory card", &e),
-    }
 }
 
 #[derive(Serialize)]
@@ -783,122 +731,205 @@ async fn rescan(State(state): AppStateRef, _: Admin) -> StatusCode {
     StatusCode::NO_CONTENT
 }
 
-// --- Memory cards, save by save ------------------------------------------------------
+// --- Memory cards ------------------------------------------------------------------
+// The user's own cards: named, of one console, inserted in whichever game
+// the user plays. The server reads them (the saves on them), edits them
+// (deleting a save, copying one to another card) and formats new ones.
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct CardGame {
-    id: String,
-    title: String,
-    console: Console,
-    serial: Option<String>,
+/// Cards a user may have, per console.
+const MAX_CARDS: u64 = 100;
+const MAX_CARD_NAME: usize = 64;
+
+fn console_key(c: Console) -> &'static str {
+    match c {
+        Console::Ps1 => "ps1",
+        Console::Ps2 => "ps2",
+    }
+}
+
+fn console_of(key: &str) -> Console {
+    if key == "ps2" { Console::Ps2 } else { Console::Ps1 }
+}
+
+fn card_size(c: Console) -> usize {
+    match c {
+        Console::Ps1 => MEMCARD_SIZE,
+        Console::Ps2 => PS2_MEMCARD_SIZE,
+    }
+}
+
+/// A card's name: no control characters, at most MAX_CARD_NAME characters.
+fn card_name(name: &str) -> Option<String> {
+    let name: String = name.chars().filter(|c| !c.is_control()).take(MAX_CARD_NAME).collect();
+    let name = name.trim();
+    (!name.is_empty()).then(|| name.to_owned())
 }
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CardJson {
-    /// The game the card belongs to (its first disc); none when it left the
-    /// library.
-    game: Option<CardGame>,
-    key: String,
-    slot: u8,
+    id: u64,
+    name: String,
     console: Console,
+    /// Unix seconds.
+    created_at: u64,
+    updated_at: u64,
     #[serde(flatten)]
     info: Option<crate::cards::CardInfo>,
     /// Why the card could not be read.
     error: Option<String>,
 }
 
-/// The games (first discs) by the key of their memory cards.
-async fn games_by_card_key(state: &AppState) -> HashMap<String, CardGame> {
-    let lib = state.library.read().await.clone();
-    let groups = state.disc_groups().await;
-    let mut out = HashMap::new();
-    for g in &lib.games {
-        let first = groups
-            .get(&g.id)
-            .and_then(|d| d.discs.first())
-            .is_none_or(|d| d.id == g.id);
-        if first {
-            out.entry(save_key(g)).or_insert(CardGame {
-                id: g.id.clone(),
-                title: state.identify(g).await.title,
-                console: g.console,
-                serial: g.serial.clone(),
-            });
-        }
+fn card_json(meta: crate::db::CardMeta, data: &[u8]) -> CardJson {
+    let console = console_of(&meta.console);
+    let (info, error) = match crate::cards::list(console, data) {
+        Ok(i) => (Some(i), None),
+        Err(e) => (None, Some(e.to_string())),
+    };
+    CardJson {
+        id: meta.id,
+        name: meta.name,
+        console,
+        created_at: meta.created_at,
+        updated_at: meta.updated_at,
+        info,
+        error,
     }
-    out
 }
 
-/// The user's memory cards, with their saves.
-async fn list_cards(State(state): AppStateRef, CurrentUser(user, _): CurrentUser) -> Response {
-    let cards = match state.db.memory_cards(user.id).await {
-        Ok(c) => c,
-        Err(e) => return db_error("listing memory cards", &e),
-    };
-    let games = games_by_card_key(&state).await;
-    let mut out = Vec::with_capacity(cards.len());
-    for (key, slot) in cards {
-        let data = match state.db.memory_card(user.id, &key, slot).await {
-            Ok(Some(d)) => d,
-            Ok(None) => continue,
-            Err(e) => return db_error("reading a memory card", &e),
-        };
-        let console = if data.len() == MEMCARD_SIZE {
-            Console::Ps1
-        } else {
-            Console::Ps2
-        };
-        let game = games.get(&key).map(|g| CardGame {
-            id: g.id.clone(),
-            title: g.title.clone(),
-            console: g.console,
-            serial: g.serial.clone(),
-        });
-        let (info, error) = match crate::cards::list(console, &data) {
-            Ok(i) => (Some(i), None),
-            Err(e) => (None, Some(e.to_string())),
-        };
-        out.push(CardJson {
-            game,
-            key,
-            slot,
-            console,
-            info,
-            error,
-        });
-    }
-    out.sort_by(|a, b| {
-        let title = |c: &CardJson| {
-            c.game
-                .as_ref()
-                .map_or_else(|| c.key.to_lowercase(), |g| g.title.to_lowercase())
-        };
-        title(a).cmp(&title(b)).then(a.slot.cmp(&b.slot))
-    });
-    let mut resp = Json(out).into_response();
+fn no_store(mut resp: Response) -> Response {
     resp.headers_mut()
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     resp
 }
 
-/// A game's card: its key, its console, and the card (None: none yet).
-async fn card_of(
-    state: &AppState,
-    user: u64,
-    id: &str,
-    slot: u8,
-) -> Result<(String, Console, Option<Vec<u8>>), Box<Response>> {
-    if !(1..=2).contains(&slot) {
-        return Err(Box::new(not_found("memory card")));
-    }
-    let console = state.library.read().await.game(id).map(|g| g.console);
-    let (Some(keys), Some(console)) = (save_keys(state, id).await, console) else {
-        return Err(Box::new(not_found("game")));
+#[derive(serde::Deserialize)]
+struct CardsQuery {
+    console: Option<Console>,
+}
+
+/// The user's cards (of a console, or all), with their saves.
+async fn list_cards(
+    State(state): AppStateRef,
+    CurrentUser(user, _): CurrentUser,
+    Query(q): Query<CardsQuery>,
+) -> Response {
+    let consoles = match q.console {
+        Some(c) => vec![c],
+        None => vec![Console::Ps1, Console::Ps2],
     };
-    match state.db.memory_card(user, &keys.cards, slot).await {
-        Ok(card) => Ok((keys.cards, console, card)),
+    let mut out = Vec::new();
+    for c in consoles {
+        match state.db.cards(user.id, console_key(c)).await {
+            Ok(cards) => out.extend(cards.into_iter().map(|(meta, data)| card_json(meta, &data))),
+            Err(e) => return db_error("listing memory cards", &e),
+        }
+    }
+    no_store(Json(out).into_response())
+}
+
+#[derive(serde::Deserialize)]
+struct NewCard {
+    console: Console,
+    name: String,
+}
+
+/// A new card, formatted, as the console would.
+async fn create_card(
+    State(state): AppStateRef,
+    CurrentUser(user, _): CurrentUser,
+    Json(req): Json<NewCard>,
+) -> Response {
+    let Some(name) = card_name(&req.name) else {
+        return (StatusCode::BAD_REQUEST, "a card needs a name").into_response();
+    };
+    let console = console_key(req.console);
+    match state.db.count_cards(user.id, console).await {
+        Ok(n) if n >= MAX_CARDS => {
+            return (StatusCode::CONFLICT, format!("at most {MAX_CARDS} cards per console")).into_response();
+        }
+        Ok(_) => {}
+        Err(e) => return db_error("counting memory cards", &e),
+    }
+    let data = crate::cards::blank(req.console);
+    match state.db.create_card(user.id, console, &name, &data).await {
+        Ok(id) => match state.db.card(user.id, id).await {
+            Ok(Some((meta, data))) => (StatusCode::CREATED, Json(card_json(meta, &data))).into_response(),
+            Ok(None) => not_found("memory card"),
+            Err(e) => db_error("reading a memory card", &e),
+        },
+        Err(e) => db_error("creating a memory card", &e),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct CardRename {
+    name: String,
+}
+
+async fn rename_card(
+    State(state): AppStateRef,
+    CurrentUser(user, _): CurrentUser,
+    Path(id): Path<u64>,
+    Json(req): Json<CardRename>,
+) -> Response {
+    let Some(name) = card_name(&req.name) else {
+        return (StatusCode::BAD_REQUEST, "a card needs a name").into_response();
+    };
+    match state.db.rename_card(user.id, id, &name).await {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => not_found("memory card"),
+        Err(e) => db_error("renaming a memory card", &e),
+    }
+}
+
+async fn delete_card(State(state): AppStateRef, CurrentUser(user, _): CurrentUser, Path(id): Path<u64>) -> Response {
+    match state.db.delete_card(user.id, id).await {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => not_found("memory card"),
+        Err(e) => db_error("deleting a memory card", &e),
+    }
+}
+
+/// A card's image: what the emulator inserts, or a download.
+async fn get_card_data(State(state): AppStateRef, CurrentUser(user, _): CurrentUser, Path(id): Path<u64>) -> Response {
+    match state.db.card(user.id, id).await {
+        Ok(Some((_, data))) => blob(data, "application/octet-stream"),
+        Ok(None) => not_found("memory card"),
+        Err(e) => db_error("reading a memory card", &e),
+    }
+}
+
+/// Replaces a card's image: what the emulator wrote, or an uploaded file.
+async fn put_card_data(
+    State(state): AppStateRef,
+    CurrentUser(user, _): CurrentUser,
+    Path(id): Path<u64>,
+    body: Bytes,
+) -> Response {
+    let console = match state.db.card_console(user.id, id).await {
+        Ok(Some(c)) => console_of(&c),
+        Ok(None) => return not_found("memory card"),
+        Err(e) => return db_error("reading a memory card", &e),
+    };
+    if body.len() != card_size(console) {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("this console's memory cards are {} bytes", card_size(console)),
+        )
+            .into_response();
+    }
+    match state.db.put_card(user.id, id, &body).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => db_error("saving a memory card", &e),
+    }
+}
+
+/// One of the user's cards, for editing: its console and image.
+async fn card_of(state: &AppState, user: u64, id: u64) -> Result<(Console, Vec<u8>), Box<Response>> {
+    match state.db.card(user, id).await {
+        Ok(Some((meta, data))) => Ok((console_of(&meta.console), data)),
+        Ok(None) => Err(Box::new(not_found("memory card"))),
         Err(e) => Err(Box::new(db_error("reading a memory card", &e))),
     }
 }
@@ -913,85 +944,62 @@ fn card_error(e: &crate::cards::CardError) -> Response {
     (status, e.to_string()).into_response()
 }
 
-async fn delete_card(
-    State(state): AppStateRef,
-    CurrentUser(user, _): CurrentUser,
-    Path((id, slot)): Path<(String, u8)>,
-) -> Response {
-    let (key, _, _) = match card_of(&state, user.id, &id, slot).await {
-        Ok(c) => c,
-        Err(r) => return *r,
-    };
-    match state.db.delete_memory_card(user.id, &key, slot).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(e) => db_error("deleting a memory card", &e),
-    }
-}
-
 async fn delete_save(
     State(state): AppStateRef,
     CurrentUser(user, _): CurrentUser,
-    Path((id, slot, save)): Path<(String, u8, String)>,
+    Path((id, save)): Path<(u64, String)>,
 ) -> Response {
-    let (key, console, card) = match card_of(&state, user.id, &id, slot).await {
+    let (console, mut card) = match card_of(&state, user.id, id).await {
         Ok(c) => c,
         Err(r) => return *r,
-    };
-    let Some(mut card) = card else {
-        return not_found("memory card");
     };
     if let Err(e) = crate::cards::delete(console, &mut card, &save) {
         return card_error(&e);
     }
-    match state.db.put_memory_card(user.id, &key, slot, &card).await {
+    match state.db.put_card(user.id, id, &card).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => db_error("saving a memory card", &e),
     }
 }
 
 #[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct CopyRequest {
-    to_game: String,
-    to_slot: u8,
+    /// The destination card.
+    to: u64,
     /// Delete it from its card once copied.
     #[serde(default)]
     r#move: bool,
 }
 
-/// Copies (or moves) a save to another game's card, of the same console:
-/// created (formatted) when the game has none yet.
+/// Copies (or moves) a save to another of the user's cards, of the same
+/// console.
 async fn copy_save(
     State(state): AppStateRef,
     CurrentUser(user, _): CurrentUser,
-    Path((id, slot, save)): Path<(String, u8, String)>,
+    Path((id, save)): Path<(u64, String)>,
     Json(req): Json<CopyRequest>,
 ) -> Response {
-    let (from_key, console, from) = match card_of(&state, user.id, &id, slot).await {
+    if req.to == id {
+        return (StatusCode::BAD_REQUEST, "the save is already on this card").into_response();
+    }
+    let (console, mut from) = match card_of(&state, user.id, id).await {
         Ok(c) => c,
         Err(r) => return *r,
     };
-    let Some(mut from) = from else {
-        return not_found("memory card");
-    };
-    let (to_key, to_console, to) = match card_of(&state, user.id, &req.to_game, req.to_slot).await {
+    let (to_console, to) = match card_of(&state, user.id, req.to).await {
         Ok(c) => c,
         Err(r) => return *r,
     };
     if to_console != console {
         return (StatusCode::BAD_REQUEST, "a card of another console").into_response();
     }
-    if to_key == from_key && req.to_slot == slot {
-        return (StatusCode::BAD_REQUEST, "the save is already on this card").into_response();
-    }
-    // A new card, or a PS2 card never formatted (nothing on it), is
-    // formatted first.
-    let mut to = match to {
-        Some(c) if crate::cards::list(console, &c).is_ok_and(|i| i.formatted) => c,
-        Some(c) if crate::cards::list(console, &c).is_err() => {
+    // A PS2 card never formatted (nothing on it) is formatted first.
+    let mut to = match crate::cards::list(console, &to) {
+        Ok(i) if i.formatted => to,
+        Ok(_) => crate::cards::blank(console),
+        Err(_) => {
             return (StatusCode::UNPROCESSABLE_ENTITY, "the destination card is damaged").into_response();
         }
-        _ => crate::cards::blank(console),
     };
     if let Err(e) = crate::cards::copy(console, &from, &save, &mut to) {
         return card_error(&e);
@@ -1000,16 +1008,43 @@ async fn copy_save(
         if let Err(e) = crate::cards::delete(console, &mut from, &save) {
             return card_error(&e);
         }
-        state
-            .db
-            .put_memory_cards(user.id, [(&to_key, req.to_slot, &to), (&from_key, slot, &from)])
-            .await
+        state.db.put_cards(user.id, [(req.to, &to), (id, &from)]).await
     } else {
-        state.db.put_memory_card(user.id, &to_key, req.to_slot, &to).await
+        state.db.put_card(user.id, req.to, &to).await
     };
     match written {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => db_error("saving a memory card", &e),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct GameCards {
+    cards: [Option<u64>; 2],
+}
+
+/// Records the cards a game is played with: chosen again next time.
+async fn put_game_cards(
+    State(state): AppStateRef,
+    CurrentUser(user, _): CurrentUser,
+    Path(id): Path<String>,
+    Json(req): Json<GameCards>,
+) -> Response {
+    let console = state.library.read().await.game(&id).map(|g| g.console);
+    let (Some(keys), Some(console)) = (save_keys(&state, &id).await, console) else {
+        return not_found("game");
+    };
+    for card in req.cards.iter().flatten() {
+        match state.db.card_console(user.id, *card).await {
+            Ok(Some(c)) if console_of(&c) == console => {}
+            Ok(Some(_)) => return (StatusCode::BAD_REQUEST, "a card of another console").into_response(),
+            Ok(None) => return not_found("memory card"),
+            Err(e) => return db_error("reading a memory card", &e),
+        }
+    }
+    match state.db.set_last_cards(user.id, &keys.cards, req.cards).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => db_error("saving the cards of a game", &e),
     }
 }
 
@@ -1018,6 +1053,19 @@ mod card_size_tests {
     #[test]
     fn ps2_card_size_matches() {
         assert_eq!(super::PS2_MEMCARD_SIZE, texel_ps2::memcard::SIZE);
+    }
+
+    #[test]
+    fn card_names() {
+        assert_eq!(
+            super::card_name("  Fighting\u{7} games "),
+            Some("Fighting games".to_owned())
+        );
+        assert_eq!(super::card_name(" \n "), None);
+        assert_eq!(
+            super::card_name(&"x".repeat(100)).map(|n| n.len()),
+            Some(super::MAX_CARD_NAME)
+        );
     }
 }
 

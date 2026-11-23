@@ -350,3 +350,12 @@ Tekken 3 sends, at the end of some fights, a command list (DMA channel 2, linked
 - Sending the list at the GPU's pace instead (the CPU running meanwhile, as on the console), in case the game mended it before the transfer got there, was tried: the game does not, it waits for the GPU with its interrupts off, and the transfer never ended. The list must not loop on the console: something earlier differs (not found); other emulators bound or cut such lists too.
 - Lists that do not loop are sent as before (D42's timing).
 
+## D48. Memory cards are the user's own, chosen before playing
+
+D9 kept two memory cards per game (by serial), D43 let a console without a disc borrow a game's. A card belonged to a game: a save could not follow its owner to another edition but by copying, and a console's own habit, one card for many games, was out of reach.
+
+- **Cards.** A card is the user's: named, of one console, with its image (`cards`). The Memory cards page lists a console's cards (sub-tabs, as the Games and BIOS pages), creates them (formatted by the server, for both consoles: the PS2's as the console's browser would), renames and deletes them, and works on their saves as before (delete one, copy or move it to another card), all on the server: the PlayStation's directory and the PS2's file system are read and edited there, without starting a console.
+- **Before playing.** A game's page asks for its two slots' cards: the game's last ones, else the card used last, else (no card yet) a new one named after the game, made when it starts; or a blank card, not kept. The choice goes in the player's address (`#/play/<game>/<BIOS>/<card 1>-<card 2>`), and is remembered per game (`game_settings`, with its BIOS). A console without a disc chooses the same way; the PS2's game launch too.
+- **Migration.** Each game's cards became cards named after its key and slot ("SLES-01893 card 1"), and stay that game's last cards: nothing changes for a game already played. The old table is dropped.
+- **Netplay.** Unchanged: the host's cards go with its state, guests save nothing (D46).
+

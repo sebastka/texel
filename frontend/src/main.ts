@@ -31,7 +31,8 @@ import { controlsDiagram } from "./controls";
 import { h, type Child } from "./dom";
 import { gamepadChip } from "./gamepad-ui";
 import { Player } from "./player";
-import type { NetStatus } from "./protocol";
+import type { NetStatus, Slots } from "./protocol";
+import { cardSlots, parseSlots, slotsParam } from "./card-slots";
 import { roomBar, saveName, savedName } from "./room";
 import { Room, wsUrl, type RoomGame } from "./room-link";
 
@@ -243,7 +244,7 @@ function header(active: Page | null, ...right: Node[]): DocumentFragment {
     ? [
         tab("games", `#/games/${shownConsole}`, "Games"),
         tab("bios", `#/bios/${shownConsole}`, "BIOS"),
-        tab("cards", "#/cards", "Memory cards"),
+        tab("cards", `#/cards/${shownConsole}`, "Memory cards"),
         tab("join", "#/join", "Join"),
         ...(me.role === "admin" ? [tab("admin", "#/admin", "Admin")] : []),
       ]
@@ -305,6 +306,8 @@ export interface Shell {
   signedIn: (user: User | null, hash?: string) => void;
   games: () => GameListItem[];
   stopPlayer: () => void;
+  /** One tab per console, under a page's title. */
+  consoleTabs: (page: "games" | "bios" | "cards", active: Console, count: (c: Console) => number) => HTMLElement;
 }
 
 const shell: Shell = {
@@ -322,10 +325,11 @@ const shell: Shell = {
   },
   games: () => games,
   stopPlayer,
+  consoleTabs: (page, active, count) => consoleTabs(page, active, count),
 };
 
 /** One tab per console, under a page's title: `#/games/ps2`, `#/bios/ps1`... */
-function consoleTabs(page: "games" | "bios", active: Console, count: (c: Console) => number) {
+function consoleTabs(page: "games" | "bios" | "cards", active: Console, count: (c: Console) => number) {
   return h(
     "nav.subtabs",
     { "aria-label": "Console" },
@@ -816,18 +820,32 @@ function playSection(g: GameDetail) {
   const preferred = preferredBios(list);
   // The game's own BIOS (last started with, or its save states'), else the usual choice.
   let selected = (list.some((b) => b.id === g.lastBios) ? g.lastBios : null) ?? defaultBios(g)?.id ?? "";
+  // The memory cards it starts with (a new one named after it, if the
+  // user has none).
+  const slots = cardSlots(g.console, g.lastCards, g.title);
+  const playError = h("p.error", { hidden: true, role: "alert" });
   const play = h(
     "button.primary",
     {
       disabled: !list.length || !!g.error,
-      onclick: () => {
-        rememberBios(selected);
-        void api.setBios(g.id, selected).catch(() => undefined);
-        location.hash = `#/play/${g.id}/${selected}`;
+      onclick: async () => {
+        play.disabled = true;
+        playError.hidden = true;
+        try {
+          const cards = await slots.value();
+          rememberBios(selected);
+          void api.setBios(g.id, selected).catch(() => undefined);
+          void api.setGameCards(g.id, cards).catch(() => undefined);
+          location.hash = `#/play/${g.id}/${selected}/${slotsParam(cards)}`;
+        } catch (e) {
+          playError.textContent = `The memory card could not be created: ${String(e)}`;
+          playError.hidden = false;
+          play.disabled = false;
+        }
       },
     },
     "Play",
-  );
+  ) as HTMLButtonElement;
   const rank = { best: 0, match: 1, any: 2, mismatch: 3 };
   const ranked = list
     .map((b) => ({ b, rel: biosRelevance(b, g, preferred) }))
@@ -857,6 +875,8 @@ function playSection(g: GameDetail) {
     "section.panel",
     {},
     h("div.panel-head", {}, h("h2", {}, "Play"), play),
+    playError,
+    slots.element,
     list.length
       ? h(
           "table.bios-pick",
@@ -1323,15 +1343,16 @@ function fastToggle() {
   return button;
 }
 
-/** A PlayStation game in the player; `roomGame`: the room's, for a guest
+/** A PlayStation game in the player, with the user's memory `cards` (the
+ * game's last ones when not given); `roomGame`: the room's, for a guest
  * (the host's game becomes the room's when it starts one in a room). */
-function renderPlayer(id: string, biosId: string, roomGame = false) {
+function renderPlayer(id: string, biosId: string, roomGame = false, cards: Slots | null = null) {
   stopPlayer();
   const game = games.find((g) => g.id === id);
   const bios = biosList.find((b) => b.id === biosId);
   if (game) document.title = `${game.title} · Texel`;
   if (game?.console === "ps2") {
-    renderConsole(biosId, game);
+    renderConsole(biosId, game, cards);
     return;
   }
   // A guest runs the room's game; a host's game becomes the room's.
@@ -1563,9 +1584,10 @@ function renderPlayer(id: string, biosId: string, roomGame = false) {
       if (player !== started) return;
       if (guest && room) {
         attach(room);
-        return started.start(biosId, g, room.snapshot());
+        // The host's cards come with its state.
+        return started.start(biosId, g, [null, null], room.snapshot());
       }
-      const done = started.start(biosId, g);
+      const done = started.start(biosId, g, cards ?? g.lastCards);
       // A host's game is the room's: everyone follows (see the room's
       // `game` event).
       if (room?.isHost && room.state === "open") room.load({ game: id, bios: biosId });
@@ -1577,7 +1599,7 @@ function renderPlayer(id: string, biosId: string, roomGame = false) {
 
 /** A console: a BIOS to its menu (with a game's memory cards, `cardsId`,
  * or blank ones), or for the PlayStation 2 with a game's disc. */
-function renderConsole(biosId: string, game?: Game, cardsId: string | null = null) {
+function renderConsole(biosId: string, game?: Game, cards: Slots | null = null) {
   stopPlayer();
   const bios = [...biosList, ...ps2BiosList].find((b) => b.id === biosId);
   const platform: Console = game?.console ?? bios?.console ?? "ps2";
@@ -1619,7 +1641,7 @@ function renderConsole(biosId: string, game?: Game, cardsId: string | null = nul
             ),
           ),
           ...(states ? [states.panel] : []),
-          ...(game ? [] : [cardsPicker(platform, biosId, cardsId)]),
+          ...(game ? [] : [consoleCards(platform, biosId, cards ?? [null, null])]),
           screen,
         ),
         h(
@@ -1653,55 +1675,24 @@ function renderConsole(biosId: string, game?: Game, cardsId: string | null = nul
     onAnalog: () => undefined,
   });
   if (!game) {
-    void player.startConsole(platform, biosId, undefined, cardsId);
+    void player.startConsole(platform, biosId, cards ?? [null, null]);
     return;
   }
   const p = player;
   void api.game(game.id).then(
-    (detail) => p.startConsole(platform, biosId, detail),
+    (detail) => p.startConsole(platform, biosId, cards ?? detail.lastCards, detail),
     (e: unknown) => (status.textContent = `Cannot load the game: ${String(e)}`),
   );
 }
 
-/** Which memory cards a console started without a disc gets: a game's
- * (what is written goes to them), or blank ones, not kept. Changing
+/** The memory cards a console started without a disc gets: the user's
+ * (its menu then manages their saves), or blank ones, not kept. Changing
  * restarts the console. */
-function cardsPicker(platform: Console, biosId: string, cardsId: string | null): HTMLElement {
-  const ofConsole = games.filter((g) => g.console === platform && (!g.disc || g.disc === 1));
-  const option = (g: GameListItem) =>
-    h("option", { value: g.id, selected: g.id === cardsId }, g.serial ? `${g.title} (${g.serial})` : g.title);
-  const saved = h("optgroup", { label: "Games with saved cards" });
-  const others = h("optgroup", { label: "Other games" }, ...ofConsole.map(option));
-  const select = h(
-    "select",
-    {
-      onchange: () => {
-        const id = select.value;
-        location.hash = id ? `#/console/${biosId}/${encodeURIComponent(id)}` : `#/console/${biosId}`;
-      },
-    },
-    h("option", { value: "", selected: !cardsId }, "Blank cards, not kept"),
-    saved,
-    others,
-  );
-  // The games with cards first (their own group); the list holds every
-  // game meanwhile.
-  void api.memcards().then(
-    (ids) => {
-      const withCards = new Set(ids);
-      saved.replaceChildren(...ofConsole.filter((g) => withCards.has(g.id)).map(option));
-      others.replaceChildren(...ofConsole.filter((g) => !withCards.has(g.id)).map(option));
-      saved.hidden = !saved.children.length;
-    },
-    () => undefined,
-  );
-  saved.hidden = true;
-  return h(
-    "div.console-cards",
-    {},
-    h("label", {}, "Memory cards", select),
-    h("span.muted.small", {}, cardsId ? "Saves written here go to this game's cards." : "Pick a game to manage its saves."),
-  );
+function consoleCards(platform: Console, biosId: string, cards: Slots): HTMLElement {
+  const slots = cardSlots(platform, cards, null, () => {
+    void slots.value().then((s) => (location.hash = `#/console/${biosId}/${slotsParam(s)}`));
+  });
+  return h("div.console-cards", {}, slots.element);
 }
 
 async function load() {
@@ -1722,7 +1713,7 @@ async function load() {
 const PUBLIC = new Set(["signin", "join", "room"]);
 
 function route() {
-  const [, view, id, extra] = location.hash.split("/");
+  const [, view, id, extra, more] = location.hash.split("/");
   // The player names its game.
   document.title = "Texel";
   // An invitation's link: /register?token=…
@@ -1744,7 +1735,8 @@ function route() {
   }
   if (view === "cards") {
     stopPlayer();
-    void renderCards(shell);
+    shownConsole = parseConsole(id);
+    void renderCards(shell, shownConsole);
   } else if (view === "admin") {
     stopPlayer();
     void renderAdmin(shell);
@@ -1752,8 +1744,8 @@ function route() {
     stopPlayer();
     renderAccount(shell);
   } else if (view === "game" && id) void renderGame(id);
-  else if (view === "play" && id) renderPlayer(id, extra ?? defaultBios()?.id ?? "");
-  else if (view === "console" && id) renderConsole(id, undefined, extra ? decodeURIComponent(extra) : null);
+  else if (view === "play" && id) renderPlayer(id, extra ?? defaultBios()?.id ?? "", false, parseSlots(more));
+  else if (view === "console" && id) renderConsole(id, undefined, parseSlots(extra));
   else if (view === "bios") renderBios(parseConsole(id));
   else if (view === "games") renderGames(parseConsole(id));
   else if (view === "join") renderJoin(id);

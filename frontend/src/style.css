@@ -1459,24 +1459,52 @@ main.join {
   margin: -4px 0 12px;
 }
 
-/* A console started without a disc: whose memory cards it gets. */
+/* The memory cards a game (or a console without a disc) starts with. */
 .console-cards {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 4px 12px;
   margin: 0 0 8px;
 }
 
-.console-cards label {
+.card-slots {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 16px;
+  margin-top: 12px;
+}
+
+.card-slots label {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
   gap: 8px;
 }
 
-.console-cards select {
-  max-width: min(28rem, 100%);
+.card-slots select {
+  max-width: min(22rem, 100%);
+  min-width: 0;
+}
+
+/* The memory cards page: a new card, renaming one. */
+.card-new,
+.card-rename {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 0 0 12px;
+}
+
+.card-new input,
+.card-rename input {
+  flex: 0 1 18rem;
+  min-width: 0;
+}
+
+.card-rename {
+  margin: 6px 0;
+}
+
+.card-rename[hidden] {
+  display: none;
 }
 
 /* --- Accounts ------------------------------------------------------------------- */
