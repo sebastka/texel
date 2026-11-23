@@ -4,7 +4,7 @@ import type { Console, GameDetail } from "./api";
 import { createRing } from "./audio";
 import workletUrl from "./audio-worklet.ts?worker&url";
 import { Input } from "./input";
-import type { FromWorker, NetStatus, Ports, RoomSnapshot, SplitView, StartMessage, ToWorker } from "./protocol";
+import type { FromWorker, NetStatus, Ports, RoomSnapshot, Slots, SplitView, StartMessage, ToWorker } from "./protocol";
 
 interface Callbacks {
   onStatus: (s: string) => void;
@@ -114,13 +114,14 @@ export class Player {
     this.worker.postMessage(msg, transfer);
   }
 
-  /** Starts a game; with `room`, as that netplay room's game. */
-  async start(biosId: string, game: GameDetail, room: RoomSnapshot | null = null) {
+  /** Starts a game with the user's memory `cards`; with `room`, as that
+   * netplay room's game (a guest then gets the host's cards). */
+  async start(biosId: string, game: GameDetail, cards: Slots, room: RoomSnapshot | null = null) {
     await this.launch({
       console: "ps1",
       biosId,
       gameId: game.id,
-      cardsId: null,
+      cards,
       cue: game.cue,
       files: game.files,
       sbi: game.sbi,
@@ -128,14 +129,14 @@ export class Player {
     });
   }
 
-  /** A console: its BIOS, to its menu (with `cardsId`'s memory cards, or
-   * blank ones), or for the PS2 with a game's disc (booted directly). */
-  async startConsole(platform: Console, biosId: string, game?: GameDetail, cardsId: string | null = null) {
+  /** A console: its BIOS, to its menu, or for the PS2 with a game's disc
+   * (booted directly); with the user's memory `cards`. */
+  async startConsole(platform: Console, biosId: string, cards: Slots, game?: GameDetail) {
     await this.launch({
       console: platform,
       biosId,
       gameId: game?.id ?? null,
-      cardsId,
+      cards,
       cue: game?.cue ?? null,
       files: game?.files ?? [],
       sbi: false,
@@ -143,7 +144,7 @@ export class Player {
     });
   }
 
-  private async launch(what: Pick<StartMessage, "console" | "biosId" | "gameId" | "cardsId" | "cue" | "files" | "sbi" | "room">) {
+  private async launch(what: Pick<StartMessage, "console" | "biosId" | "gameId" | "cards" | "cue" | "files" | "sbi" | "room">) {
     const canvas = document.createElement("canvas");
     canvas.width = 640;
     canvas.height = 480;

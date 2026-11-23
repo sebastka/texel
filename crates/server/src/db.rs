@@ -21,6 +21,27 @@ pub struct Db {
     pub(crate) pool: MySqlPool,
 }
 
+/// A memory card, without its image.
+pub struct CardMeta {
+    pub id: u64,
+    /// "ps1" or "ps2".
+    pub console: String,
+    pub name: String,
+    /// Unix seconds.
+    pub created_at: u64,
+    pub updated_at: u64,
+}
+
+fn card_meta(r: &sqlx::mysql::MySqlRow) -> anyhow::Result<CardMeta> {
+    Ok(CardMeta {
+        id: r.try_get("id")?,
+        console: r.try_get("console")?,
+        name: r.try_get("name")?,
+        created_at: r.try_get("created_at")?,
+        updated_at: r.try_get("updated_at")?,
+    })
+}
+
 /// A save state, without its data.
 pub struct StateInfo {
     pub slot: u8,
@@ -64,47 +85,89 @@ impl Db {
     }
 
     // --- Memory cards ---------------------------------------------------------
+    // A user's own cards, named, of one console ("ps1" or "ps2"): inserted in
+    // whichever game the user plays.
 
-    pub async fn memory_card(&self, user: u64, key: &str, slot: u8) -> anyhow::Result<Option<Vec<u8>>> {
+    /// A user's cards of a console, with their images, by name.
+    pub async fn cards(&self, user: u64, console: &str) -> anyhow::Result<Vec<(CardMeta, Vec<u8>)>> {
+        let rows = sqlx::query(
+            "SELECT id, console, name, data, CAST(UNIX_TIMESTAMP(created_at) AS UNSIGNED) AS created_at, \
+             CAST(UNIX_TIMESTAMP(updated_at) AS UNSIGNED) AS updated_at \
+             FROM cards WHERE user_id = ? AND console = ? ORDER BY name, id",
+        )
+        .bind(user)
+        .bind(console)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(|r| Ok((card_meta(r)?, r.try_get("data")?))).collect()
+    }
+
+    /// One of a user's cards: what it is, and its image.
+    pub async fn card(&self, user: u64, id: u64) -> anyhow::Result<Option<(CardMeta, Vec<u8>)>> {
+        let row = sqlx::query(
+            "SELECT id, console, name, data, CAST(UNIX_TIMESTAMP(created_at) AS UNSIGNED) AS created_at, \
+             CAST(UNIX_TIMESTAMP(updated_at) AS UNSIGNED) AS updated_at \
+             FROM cards WHERE user_id = ? AND id = ?",
+        )
+        .bind(user)
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|r| Ok((card_meta(&r)?, r.try_get("data")?))).transpose()
+    }
+
+    /// The console of one of a user's cards (None: not theirs).
+    pub async fn card_console(&self, user: u64, id: u64) -> anyhow::Result<Option<String>> {
         Ok(
-            sqlx::query_scalar("SELECT data FROM memory_cards WHERE user_id = ? AND save_key = ? AND slot = ?")
+            sqlx::query_scalar("SELECT console FROM cards WHERE user_id = ? AND id = ?")
                 .bind(user)
-                .bind(key)
-                .bind(slot)
+                .bind(id)
                 .fetch_optional(&self.pool)
                 .await?,
         )
     }
 
-    /// A user's memory cards: their save keys and slots.
-    pub async fn memory_cards(&self, user: u64) -> anyhow::Result<Vec<(String, u8)>> {
-        Ok(
-            sqlx::query_as("SELECT save_key, slot FROM memory_cards WHERE user_id = ? ORDER BY save_key, slot")
-                .bind(user)
-                .fetch_all(&self.pool)
-                .await?,
-        )
-    }
-
-    pub async fn put_memory_card(&self, user: u64, key: &str, slot: u8, data: &[u8]) -> anyhow::Result<()> {
-        sqlx::query(
-            "INSERT INTO memory_cards (user_id, save_key, slot, data) VALUES (?, ?, ?, ?) \
-             ON DUPLICATE KEY UPDATE data = VALUES(data)",
-        )
-        .bind(user)
-        .bind(key)
-        .bind(slot)
-        .bind(data)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
-    pub async fn delete_memory_card(&self, user: u64, key: &str, slot: u8) -> anyhow::Result<()> {
-        sqlx::query("DELETE FROM memory_cards WHERE user_id = ? AND save_key = ? AND slot = ?")
+    pub async fn count_cards(&self, user: u64, console: &str) -> anyhow::Result<u64> {
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM cards WHERE user_id = ? AND console = ?")
             .bind(user)
-            .bind(key)
-            .bind(slot)
+            .bind(console)
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(u64::try_from(n).unwrap_or(0))
+    }
+
+    /// A new card; returns its id.
+    pub async fn create_card(&self, user: u64, console: &str, name: &str, data: &[u8]) -> anyhow::Result<u64> {
+        let done = sqlx::query("INSERT INTO cards (user_id, console, name, data) VALUES (?, ?, ?, ?)")
+            .bind(user)
+            .bind(console)
+            .bind(name)
+            .bind(data)
+            .execute(&self.pool)
+            .await?;
+        Ok(done.last_insert_id())
+    }
+
+    /// Renames one of a user's cards; false when it is not theirs.
+    pub async fn rename_card(&self, user: u64, id: u64, name: &str) -> anyhow::Result<bool> {
+        if self.card_console(user, id).await?.is_none() {
+            return Ok(false);
+        }
+        sqlx::query("UPDATE cards SET name = ? WHERE user_id = ? AND id = ?")
+            .bind(name)
+            .bind(user)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(true)
+    }
+
+    /// Replaces a card's image (the caller checked it is the user's).
+    pub async fn put_card(&self, user: u64, id: u64, data: &[u8]) -> anyhow::Result<()> {
+        sqlx::query("UPDATE cards SET data = ? WHERE user_id = ? AND id = ?")
+            .bind(data)
+            .bind(user)
+            .bind(id)
             .execute(&self.pool)
             .await?;
         Ok(())
@@ -112,21 +175,54 @@ impl Db {
 
     /// Writes two cards at once (a save moved from one to the other): both
     /// or neither.
-    pub async fn put_memory_cards(&self, user: u64, cards: [(&str, u8, &[u8]); 2]) -> anyhow::Result<()> {
+    pub async fn put_cards(&self, user: u64, cards: [(u64, &[u8]); 2]) -> anyhow::Result<()> {
         let mut tx = self.pool.begin().await?;
-        for (key, slot, data) in cards {
-            sqlx::query(
-                "INSERT INTO memory_cards (user_id, save_key, slot, data) VALUES (?, ?, ?, ?) \
-                 ON DUPLICATE KEY UPDATE data = VALUES(data)",
-            )
-            .bind(user)
-            .bind(key)
-            .bind(slot)
-            .bind(data)
-            .execute(&mut *tx)
-            .await?;
+        for (id, data) in cards {
+            sqlx::query("UPDATE cards SET data = ? WHERE user_id = ? AND id = ?")
+                .bind(data)
+                .bind(user)
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
         }
         tx.commit().await?;
+        Ok(())
+    }
+
+    /// Deletes one of a user's cards; false when it is not theirs.
+    pub async fn delete_card(&self, user: u64, id: u64) -> anyhow::Result<bool> {
+        let done = sqlx::query("DELETE FROM cards WHERE user_id = ? AND id = ?")
+            .bind(user)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(done.rows_affected() > 0)
+    }
+
+    /// The cards a game was last played with, in its two slots.
+    pub async fn last_cards(&self, user: u64, key: &str) -> anyhow::Result<[Option<u64>; 2]> {
+        let row: Option<(Option<u64>, Option<u64>)> =
+            sqlx::query_as("SELECT card1, card2 FROM game_settings WHERE user_id = ? AND save_key = ?")
+                .bind(user)
+                .bind(key)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row.map_or([None, None], |(a, b)| [a, b]))
+    }
+
+    /// Records the cards a game is played with (the caller checked they
+    /// are the user's).
+    pub async fn set_last_cards(&self, user: u64, key: &str, cards: [Option<u64>; 2]) -> anyhow::Result<()> {
+        sqlx::query(
+            "INSERT INTO game_settings (user_id, save_key, card1, card2) VALUES (?, ?, ?, ?) \
+             ON DUPLICATE KEY UPDATE card1 = VALUES(card1), card2 = VALUES(card2)",
+        )
+        .bind(user)
+        .bind(key)
+        .bind(cards[0])
+        .bind(cards[1])
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 

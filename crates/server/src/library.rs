@@ -12,7 +12,7 @@ use crate::images::{self, Cache, Virtual};
 use sha1::Digest;
 
 /// The console a game or a BIOS belongs to.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Console {
     Ps1,
