@@ -26,8 +26,10 @@ pub struct Ps2Emulator {
     bios: Vec<u8>,
     frame: Vec<u8>,
     size: (usize, usize),
-    /// The EE's code is compiled (see `setCompiler`).
+    /// The EE's code is compiled (see `setCompiler`), VU1's microprograms
+    /// too (`setVuCompiler`).
     compiler: bool,
+    vu_compiler: bool,
     audio: Vec<i16>,
     #[cfg(target_arch = "wasm32")]
     gpu: Option<texel_ps2_gpu::GpuGs>,
@@ -46,6 +48,7 @@ impl Ps2Emulator {
             frame: Vec::new(),
             size: (0, 0),
             compiler: false,
+            vu_compiler: false,
             audio: Vec::new(),
             #[cfg(target_arch = "wasm32")]
             gpu: None,
@@ -81,6 +84,31 @@ impl Ps2Emulator {
         Ok(())
     }
 
+    /// Compiles the VUs' microprograms to WebAssembly (`true`), or
+    /// interprets them (`false`). Fails where WebAssembly modules cannot be
+    /// made at run time.
+    #[wasm_bindgen(js_name = setVuCompiler)]
+    pub fn set_vu_compiler(&mut self, on: bool) -> Result<(), JsError> {
+        self.vu_compiler = on;
+        self.ps2.bus.vu0.jit = None;
+        self.ps2.bus.vu1.jit = None;
+        #[cfg(target_arch = "wasm32")]
+        if on {
+            for vu in [&mut self.ps2.bus.vu0, &mut self.ps2.bus.vu1] {
+                let backend = jit::WebBackend::new().map_err(|e| JsError::new(&format!("{e:?}")))?;
+                vu.jit = Some(Box::new(texel_ps2::vu_jit::VuJit::new(Box::new(backend))));
+            }
+        }
+        Ok(())
+    }
+
+    /// What the VUs' compiler did, for diagnostics.
+    #[wasm_bindgen(js_name = vuCompilerStats)]
+    pub fn vu_compiler_stats(&self) -> String {
+        let stats = |vu: &texel_ps2::vu::Vu| vu.jit.as_ref().map_or("off".to_owned(), |j| format!("{:?}", j.stats));
+        format!("VU0 {}; VU1 {}", stats(&self.ps2.bus.vu0), stats(&self.ps2.bus.vu1))
+    }
+
     /// What the compiler did, for diagnostics.
     #[wasm_bindgen(js_name = compilerStats)]
     pub fn compiler_stats(&self) -> String {
@@ -111,7 +139,30 @@ impl Ps2Emulator {
         for w in &self.ps2.bus.gs.mem.words {
             eat(&w.to_le_bytes());
         }
+        // The vector units: registers, flags, data memory.
+        for vu in [&self.ps2.bus.vu0, &self.ps2.bus.vu1] {
+            for r in vu.vf.iter().flatten() {
+                eat(&r.to_le_bytes());
+            }
+            for r in vu.vi {
+                eat(&r.to_le_bytes());
+            }
+            for r in vu
+                .acc
+                .iter()
+                .chain([&vu.q, &vu.p, &vu.i, &vu.r, &vu.mac, &vu.status, &vu.clip])
+            {
+                eat(&r.to_le_bytes());
+            }
+            eat(&vu.data);
+        }
         format!("{h:016x}")
+    }
+
+    /// VU1 instructions run since the start (diagnostics).
+    #[wasm_bindgen(js_name = vu1Steps)]
+    pub fn vu1_steps(&self) -> f64 {
+        self.ps2.bus.vu1.steps as f64
     }
 
     /// The GPU's name, when the GS is on it (empty when the browser does
@@ -149,8 +200,9 @@ impl Ps2Emulator {
     pub fn load_state(&mut self, data: &[u8]) -> Result<(), JsError> {
         self.ps2.load_state(data).map_err(|e| JsError::new(&e))?;
         self.audio.clear();
-        // Fresh blocks for the restored memory.
+        // Fresh blocks for the restored memory, and programs.
         self.set_compiler(self.compiler)?;
+        self.set_vu_compiler(self.vu_compiler)?;
         #[cfg(target_arch = "wasm32")]
         if let Some(gpu) = &mut self.gpu {
             gpu.restore(&self.ps2.bus.gs.mem.words, self.ps2.bus.gs.clut());

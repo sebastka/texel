@@ -57,6 +57,40 @@ fn lanes(f: impl Fn(usize) -> f32) -> ([u32; 4], u32) {
     (v, mac)
 }
 
+/// The MAC, status and clip flags, as the flag instructions see them.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[repr(C)]
+pub struct Flags {
+    pub mac: u32,
+    pub status: u32,
+    pub clip: u32,
+}
+
+/// Q's next value and the instructions left before it lands (0: none
+/// pending). Saved as an `Option` (as states had it).
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(from = "Option<(u32, u32)>", into = "Option<(u32, u32)>")]
+#[repr(C)]
+pub struct PendingQ {
+    pub value: u32,
+    pub left: u32,
+}
+
+impl From<Option<(u32, u32)>> for PendingQ {
+    fn from(p: Option<(u32, u32)>) -> Self {
+        p.map_or(Self::default(), |(value, left)| Self {
+            value,
+            left: left.max(1),
+        })
+    }
+}
+
+impl From<PendingQ> for Option<(u32, u32)> {
+    fn from(p: PendingQ) -> Self {
+        (p.left != 0).then_some((p.value, p.left))
+    }
+}
+
 struct Commit {
     /// A VF register, or None for ACC.
     reg: Option<usize>,
@@ -83,9 +117,9 @@ pub struct Vu {
     /// instructions of a microprogram: they become visible to the flag
     /// instructions four instructions after the one that set them (by
     /// slot: instruction n reads slot n % 4, then writes it).
-    flag_history: [(u32, u32, u32); 4],
+    pub flag_history: [Flags; 4],
     /// The flags the current instruction sees.
-    seen: (u32, u32, u32),
+    seen: Flags,
     pub micro: Box<[u8]>,
     pub data: Box<[u8]>,
     /// The next instruction, in 64-bit units.
@@ -93,7 +127,7 @@ pub struct Vu {
     /// TOP and ITOP (from VIF1 and its double buffering, or VIF0's ITOP).
     pub top: u16,
     pub itop: u16,
-    pending_q: Option<(u32, u32)>,
+    pub pending_q: PendingQ,
     branch: Option<u32>,
     /// Instructions run, and runs stopped for running too long (no end),
     /// for diagnostics.
@@ -111,6 +145,16 @@ pub struct Vu {
     pub trace_from: Option<u32>,
     #[serde(skip)]
     trace: Vec<(u32, [u16; 16])>,
+    /// Microprograms compiled to WebAssembly (in browsers; see `vu_jit`),
+    /// and the instructions a compiled one ran when it stopped.
+    #[serde(skip)]
+    pub jit: Option<Box<crate::vu_jit::VuJit>>,
+    #[serde(skip)]
+    pub run_n: u32,
+    /// Counts writes to micro memory: compiled programs check theirs again
+    /// after one.
+    #[serde(skip)]
+    pub micro_gen: u64,
 }
 
 /// A packet VU1 sent the GIF: where its program started and kicked it,
@@ -127,7 +171,8 @@ pub struct Kick {
     pub micro: Vec<u8>,
 }
 
-const MAX_STEPS: u64 = 4_000_000;
+/// Instructions a microprogram may run (one that never ends is stopped).
+pub const MAX_STEPS: u64 = 4_000_000;
 
 impl Vu {
     pub fn new(index: usize) -> Self {
@@ -146,14 +191,14 @@ impl Vu {
             mac: 0,
             status: 0,
             clip: 0,
-            flag_history: [(0, 0, 0); 4],
-            seen: (0, 0, 0),
+            flag_history: [Flags::default(); 4],
+            seen: Flags::default(),
             micro: vec![0; micro].into_boxed_slice(),
             data: vec![0; data].into_boxed_slice(),
             pc: 0,
             top: 0,
             itop: 0,
-            pending_q: None,
+            pending_q: PendingQ::default(),
             branch: None,
             steps: 0,
             runaways: 0,
@@ -161,6 +206,9 @@ impl Vu {
             kicks: None,
             trace_from: None,
             trace: Vec::new(),
+            jit: None,
+            run_n: 0,
+            micro_gen: 0,
         }
     }
 
@@ -205,19 +253,63 @@ impl Vu {
 
     // --- Running microprograms -------------------------------------------------
 
-    /// Runs the microprogram at `pc` (in 64-bit units) until its end.
+    /// The PC's mask: it wraps at the end of micro memory (2048 or 512
+    /// instructions), as do branch targets and the links saved.
+    pub fn wrap(&self) -> u32 {
+        (self.micro.len() / 8).max(1) as u32 - 1
+    }
+
+    /// The flags as they stand.
+    pub fn flags(&self) -> Flags {
+        Flags {
+            mac: self.mac,
+            status: self.status,
+            clip: self.clip,
+        }
+    }
+
+    /// Runs the microprogram at `pc` (in 64-bit units) until its end:
+    /// compiled, when it is (and no diagnostics are on).
     pub fn run(&mut self, pc: u32, gif: &mut Gif, gs: &mut Gs) {
-        // The PC wraps at the end of micro memory (2048 or 512
-        // instructions), as do branch targets and the links saved.
-        let wrap = (self.micro.len() / 8).max(1) as u32 - 1;
-        self.pc = pc & wrap;
+        self.pc = pc & self.wrap();
         self.start = self.pc;
         self.trace.clear();
         self.branch = None;
-        let mut ending = false;
         // The flags as they stand when the program starts.
-        self.flag_history = [(self.mac, self.status, self.clip); 4];
+        self.flag_history = [self.flags(); 4];
         let mut n = 0;
+        if self.trace_from.is_none()
+            && self.kicks.is_none()
+            && let Some(mut jit) = self.jit.take()
+        {
+            let ran = jit.run(self, gif, gs);
+            self.jit = Some(jit);
+            match ran {
+                // Ended: as the interpreter ends.
+                Some(crate::vu_jit::Ran::Ended) => return self.finish(u64::from(self.run_n)),
+                // Stopped at pc, for the interpreter to go on.
+                Some(crate::vu_jit::Ran::Stopped) => n = u64::from(self.run_n),
+                None => {}
+            }
+        }
+        self.interpret(n, gif, gs);
+    }
+
+    /// Q's last value lands, and a program that never ended counts.
+    fn finish(&mut self, n: u64) {
+        if n >= MAX_STEPS {
+            self.runaways += 1;
+        }
+        if self.pending_q.left != 0 {
+            self.q = self.pending_q.value;
+            self.pending_q = PendingQ::default();
+        }
+    }
+
+    /// Runs the current program from pc, its instruction `n`, to its end.
+    fn interpret(&mut self, mut n: u64, gif: &mut Gif, gs: &mut Gs) {
+        let wrap = self.wrap();
+        let mut ending = false;
         while n < MAX_STEPS {
             let at = self.pc as usize * 8;
             let word = u64::from_le_bytes(self.micro[at..at + 8].try_into().unwrap_or_default());
@@ -240,7 +332,7 @@ impl Vu {
             if let Some(c) = commit {
                 self.commit(c);
             }
-            self.flag_history[(n % 4) as usize] = (self.mac, self.status, self.clip);
+            self.flag_history[(n % 4) as usize] = self.flags();
             self.steps += 1;
             if let Some(target) = branch {
                 self.pc = target & wrap;
@@ -254,28 +346,24 @@ impl Vu {
             }
             n += 1;
         }
-        if n == MAX_STEPS {
-            self.runaways += 1;
-        }
-        if let Some((q, _)) = self.pending_q.take() {
-            self.q = q;
-        }
+        self.finish(n);
     }
 
     fn tick(&mut self) {
-        if let Some((q, left)) = self.pending_q {
-            if left <= 1 {
-                self.q = q;
-                self.pending_q = None;
-            } else {
-                self.pending_q = Some((q, left - 1));
+        match self.pending_q.left {
+            0 => {}
+            1 => {
+                self.q = self.pending_q.value;
+                self.pending_q = PendingQ::default();
             }
+            _ => self.pending_q.left -= 1,
         }
     }
 
     fn wait_q(&mut self) {
-        if let Some((q, _)) = self.pending_q.take() {
-            self.q = q;
+        if self.pending_q.left != 0 {
+            self.q = self.pending_q.value;
+            self.pending_q = PendingQ::default();
         }
     }
 
@@ -378,8 +466,15 @@ impl Vu {
     }
 
     fn minmax(&self, fd: usize, mask: u32, s: [f32; 4], t: [f32; 4], max: bool) -> Option<Commit> {
+        // Ties (+0 and -0) give t, as compiled code has them.
         let value = std::array::from_fn(|k| {
-            let v = if max { s[k].max(t[k]) } else { s[k].min(t[k]) };
+            let v = if max {
+                if s[k] > t[k] { s[k] } else { t[k] }
+            } else if s[k] < t[k] {
+                s[k]
+            } else {
+                t[k]
+            };
             res(v).0
         });
         Some(Commit {
@@ -523,15 +618,15 @@ impl Vu {
                 self.set_vi(it, v as u16);
             }
             // Clip flag tests and setting, on 24 bits.
-            0x10 => self.set_vi(1, u16::from(self.seen.2 & 0xFF_FFFF == instr & 0xFF_FFFF)),
+            0x10 => self.set_vi(1, u16::from(self.seen.clip & 0xFF_FFFF == instr & 0xFF_FFFF)),
             0x11 => self.clip = instr & 0xFF_FFFF,
-            0x12 => self.set_vi(1, u16::from(self.seen.2 & instr & 0xFF_FFFF != 0)),
-            0x13 => self.set_vi(1, u16::from((self.seen.2 | instr) & 0xFF_FFFF == 0xFF_FFFF)),
-            0x1C => self.set_vi(it, (self.seen.2 & 0xFFF) as u16),
+            0x12 => self.set_vi(1, u16::from(self.seen.clip & instr & 0xFF_FFFF != 0)),
+            0x13 => self.set_vi(1, u16::from((self.seen.clip | instr) & 0xFF_FFFF == 0xFF_FFFF)),
+            0x1C => self.set_vi(it, (self.seen.clip & 0xFFF) as u16),
             // Status flag tests (12 bits) and setting (the sticky ones).
             0x14..=0x17 => {
                 let imm12 = (instr & 0x7FF) | ((instr >> 10) & 0x800);
-                let st = self.seen.1 & 0xFFF;
+                let st = self.seen.status & 0xFFF;
                 match op {
                     0x14 => self.set_vi(it, u16::from(st == imm12)),
                     0x15 => self.status = (self.status & 0x3F) | (imm12 & 0xFC0),
@@ -540,9 +635,9 @@ impl Vu {
                 }
             }
             // MAC flag tests.
-            0x18 => self.set_vi(it, u16::from(self.seen.0 & 0xFFFF == vi(is))),
-            0x1A => self.set_vi(it, (self.seen.0 & vi(is)) as u16),
-            0x1B => self.set_vi(it, ((self.seen.0 | vi(is)) & 0xFFFF) as u16),
+            0x18 => self.set_vi(it, u16::from(self.seen.mac & 0xFFFF == vi(is))),
+            0x1A => self.set_vi(it, (self.seen.mac & vi(is)) as u16),
+            0x1B => self.set_vi(it, ((self.seen.mac | vi(is)) & 0xFFFF) as u16),
             // Branches: the delay slot runs first.
             0x20 => self.branch = Some(target(self.pc)),
             0x21 => {
@@ -574,6 +669,12 @@ impl Vu {
             0x40 => self.lower_special(instr, gif, gs),
             _ => {}
         }
+    }
+
+    /// Runs a lower instruction alone (not a branch): compiled programs
+    /// leave the rare ones (the EFU, XGKICK, the random numbers) to it.
+    pub fn exec_lower(&mut self, instr: u32, gif: &mut Gif, gs: &mut Gs) {
+        self.lower(instr, gif, gs);
     }
 
     fn lower_special(&mut self, instr: u32, gif: &mut Gif, gs: &mut Gs) {
@@ -662,7 +763,10 @@ impl Vu {
                         (if r == 0.0 { 0x7F7F_FFFF } else { res(s / r).0 }, 13)
                     }
                 };
-                self.pending_q = Some((q, latency));
+                self.pending_q = PendingQ {
+                    value: q,
+                    left: latency,
+                };
             }
             0x3B => self.wait_q(),
             0x3C => self.set_vi(it, vfs[fsf] as u16),
@@ -745,9 +849,13 @@ impl Vu {
     /// Resets the unit (FBRST).
     pub fn reset(&mut self) {
         let (micro, data) = (std::mem::take(&mut self.micro), std::mem::take(&mut self.data));
+        let jit = self.jit.take();
+        let generation = self.micro_gen;
         *self = Self::new(self.index);
         self.micro = micro;
         self.data = data;
+        self.jit = jit;
+        self.micro_gen = generation;
     }
 
     /// Control registers 16-31 as CFC2 reads them (VU0).

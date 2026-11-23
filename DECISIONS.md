@@ -359,3 +359,12 @@ D9 kept two memory cards per game (by serial), D43 let a console without a disc 
 - **Migration.** Each game's cards became cards named after its key and slot ("SLES-01893 card 1"), and stay that game's last cards: nothing changes for a game already played. The old table is dropped.
 - **Netplay.** Unchanged: the host's cards go with its state, guests save nothing (D46).
 
+## D49. The VUs' microprograms compiled to WebAssembly
+
+Jak and Daxter's jungle needs about 160 million VU1 instructions per second of console time; the interpreter ran 15 million a second in the browser (5 frames a second). Each microprogram is now compiled, as the EE's blocks are (D30): a WebAssembly module per program, in the emulator's function table.
+
+- **A program at a time.** Compiled from its start address when it runs the second time: the blocks reachable from there (to a branch and its delay slot, or to an E bit and the instruction after), a loop dispatching between them on the PC. A jump to a PC no block starts at, and the rare cases (a branch in a delay slot, an E bit on a branch), stop the program for the interpreter, which goes on with the same run.
+- **The interpreter's results, exactly.** Each pair does what the interpreter does, in its order: Q's latency, the upper instruction's result (four lanes at once, in WebAssembly's SIMD: operands and results made PS2 floats, the MAC flags from the lanes' bits), the lower instruction, the commit, the flags recorded for the flag instructions four later. The rare lower instructions (the EFU, XGKICK, the random numbers) call the interpreter's. MIN and MAX now give the second operand on ties (+0 and -0), in both. Checked on Jak's jungle: the state, with the VUs' registers and memory, the same every second as with the interpreter (frontend/scripts/check-ps2-vu.mjs).
+- **Microcode uploaded again.** Games upload one renderer's microcode after another to the same addresses, every frame (Jak: more than a dozen versions). A start address keeps up to 64 compiled versions, each with the instructions it was compiled from, checked against micro memory only after it was written to.
+- **Result.** VU1 runs about 13 times faster (about 190 million instructions a second compiled), VU0 too; the jungle went from 5.4 to 7.9 frames a second (Node, the GS not drawing). The EE is now the limit (its interpreted instructions, COP2 among them), then VIF's unpacking.
+

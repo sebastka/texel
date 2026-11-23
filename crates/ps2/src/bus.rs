@@ -301,6 +301,12 @@ impl Bus {
         if (0x1FC0_0000..0x2000_0000).contains(&pa) {
             return;
         }
+        // The VUs' micro memory: compiled programs check theirs again.
+        if (0x1100_8000..0x1100_C000).contains(&pa) {
+            self.vu1.micro_gen += 1;
+        } else if (0x1100_0000..0x1100_4000).contains(&pa) {
+            self.vu0.micro_gen += 1;
+        }
         if let Some((mem, at)) = self.memory(pa) {
             if let Some(dst) = mem.get_mut(at..at + N) {
                 dst.copy_from_slice(&data);
