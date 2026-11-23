@@ -9,6 +9,8 @@
 //! the SPU's volumes every 250 frames.
 //! `VRAM=FRAME` also writes all of VRAM at that frame (as 15-bit colours).
 //! `SHOTS=FROM:TO` writes a screenshot of every frame in that range.
+//! `WAV=PATH` writes all the sound (44.1 kHz, stereo, 16 bits) to a WAV file.
+//! `SPUVOICES=FRAME` prints the SPU's voices at that frame.
 
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -68,6 +70,25 @@ fn write_ppm(path: &Path, rgba: &[u8], w: usize, h: usize) -> std::io::Result<()
     f.write_all(&rgb)
 }
 
+/// A WAV file of interleaved stereo samples at 44.1 kHz.
+fn write_wav(path: &Path, samples: &[i16]) -> std::io::Result<()> {
+    let data = u32::try_from(samples.len() * 2).unwrap_or(u32::MAX);
+    let mut f = std::io::BufWriter::new(File::create(path)?);
+    f.write_all(b"RIFF")?;
+    f.write_all(&(36 + data).to_le_bytes())?;
+    f.write_all(b"WAVEfmt ")?;
+    // PCM, 2 channels, 44100 Hz, 4 bytes a frame, 16 bits.
+    for v in [16u32, 0x0002_0001, 44_100, 44_100 * 4, 0x0010_0004] {
+        f.write_all(&v.to_le_bytes())?;
+    }
+    f.write_all(b"data")?;
+    f.write_all(&data.to_le_bytes())?;
+    for s in samples {
+        f.write_all(&s.to_le_bytes())?;
+    }
+    f.flush()
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
     let bios = std::fs::read(
@@ -103,6 +124,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let out = PathBuf::from(args.get(4).map_or(".", String::as_str));
     let start = std::time::Instant::now();
     let mut audio = Vec::new();
+    let wav = std::env::var("WAV").ok().map(PathBuf::from);
+    let mut all_audio: Vec<i16> = Vec::new();
     // PRESS="1900:cross,2100:start,2500:square:300": hold a button from a
     // frame, for 6 frames or the number given.
     let presses: Vec<(u32, u16, u32)> = std::env::var("PRESS")
@@ -190,14 +213,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("cd {n}: {line}");
             }
             if n % 250 == 0 {
-                // SPUCNT, main volume, CD volume.
-                let (cnt, main, cd) = (
+                // SPUCNT, main volume, CD volume, voices in noise mode.
+                let (cnt, main, cd, noise) = (
                     system.debug_read32(0x1F80_1DA8),
                     system.debug_read32(0x1F80_1D80),
                     system.debug_read32(0x1F80_1DB0),
+                    system.debug_read32(0x1F80_1D94),
                 );
                 println!(
-                    "spu {n}: SPUCNT {:04x} main volume {main:08x} CD volume {cd:08x}",
+                    "spu {n}: SPUCNT {:04x} main volume {main:08x} CD volume {cd:08x} noise {noise:06x}",
                     cnt >> 16
                 );
             }
@@ -232,6 +256,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         if n % 50 == 0 {
             peak_per_second.push(audio.iter().map(|s| s.unsigned_abs()).max().unwrap_or(0));
+            if wav.is_some() {
+                all_audio.extend_from_slice(&audio);
+            }
             audio.clear();
             flips_per_second.push(system.take_flips());
             changes_per_second.push(std::mem::take(&mut changed));
@@ -240,6 +267,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("frame {n}: {}", system.debug_summary());
             let (rgba, w, h) = system.frame();
             write_ppm(&out.join(format!("frame-{n:05}.ppm")), rgba, w, h)?;
+        }
+        // SPUVOICES=4500: the SPU's voices at that frame: volumes, pitch,
+        // ADSR and its current level, addresses.
+        if std::env::var("SPUVOICES").is_ok_and(|v| v.parse() == Ok(n)) {
+            for i in 0..24u32 {
+                let mut r = |o: u32| system.debug_read32(0x1F80_1C00 + 16 * i + o);
+                let (vol, pitch_start, adsr, level_repeat) = (r(0), r(4), r(8), r(12));
+                println!(
+                    "voice {i:2}: volume L {:04x} R {:04x} pitch {:04x} start {:04x} ADSR {:08x} level {:04x} repeat {:04x}",
+                    vol & 0xffff,
+                    vol >> 16,
+                    pitch_start & 0xffff,
+                    pitch_start >> 16,
+                    adsr,
+                    level_repeat & 0xffff,
+                    level_repeat >> 16
+                );
+            }
         }
         // VRAM=1700: all of VRAM at that frame, as 15-bit colours.
         if std::env::var("VRAM").is_ok_and(|v| v.parse() == Ok(n)) {
@@ -257,6 +302,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         for i in 0..n.parse::<u32>()? {
             println!("{:08x}: {:08x}", a + i * 4, system.debug_read32(a + i * 4));
         }
+    }
+    if let Some(path) = &wav {
+        all_audio.extend_from_slice(&audio);
+        write_wav(path, &all_audio)?;
     }
     let elapsed = start.elapsed().as_secs_f64();
     println!(
