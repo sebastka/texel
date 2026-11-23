@@ -105,12 +105,33 @@ fn fpu_and_vu0_moves() {
         cop(0x12, 0x01, 0, 3),
         cop(0x12, 0x05, 8, 0),
         i(0x36, 29, 0, 16),
-        // CFC2 and a VU0 macro instruction: the interpreter's.
+        // CFC2 and VCALLMS: the interpreter's.
         cop(0x12, 0x02, 8, 3),
-        cop(0x12, 0x10, 8, 3) | 0x28,
+        cop(0x12, 0x10, 0, 0) | 0x38,
     ];
     let c = compiled(words);
     assert_eq!((c.words, c.native), (13, 10));
+}
+
+#[test]
+fn vu0_macro_instructions() {
+    // COP2 with the CO bit: fd 3, fs 1, ft 2, all lanes.
+    let base = (0x12 << 26) | (0x1F << 21) | (2 << 16) | (1 << 11);
+    let vop = |funct: u32| base | (3 << 6) | funct;
+    let special = |op: u32| base | ((op >> 2) << 6) | 0x3C | (op & 3);
+    let mut words: Vec<u32> = (0..0x30).map(vop).collect();
+    let uppers: Vec<u32> = (0..0x30).filter(|&op| op != 0x2B && op != 0x2F).collect();
+    words.extend(uppers.iter().map(|&op| special(op)));
+    // Its NOP and the integer and lower ones: the interpreter's.
+    words.extend([special(0x2F), vop(0x30), special(0x30)]);
+    // In blocks of at most `MAX_LEN`.
+    let (mut total, mut native) = (0, 0);
+    for chunk in words.chunks(32) {
+        let c = compiled(chunk.to_vec());
+        assert_eq!(c.words, chunk.len() as u32);
+        (total, native) = (total + c.words, native + c.native);
+    }
+    assert_eq!((total, native), (words.len() as u32, words.len() as u32 - 3));
 }
 
 #[test]

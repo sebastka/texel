@@ -6,8 +6,9 @@
 //! A block runs from its first instruction to a branch and its delay slot,
 //! or to an instruction after which the interpreter must look again (COP0,
 //! SYSCALL, BREAK), or to the end of its 4 KiB page, or `MAX_LEN`
-//! instructions. The integer instructions, the branches, and the moves to
-//! and from the FPU and VU0 are compiled; the others call `exec` (the
+//! instructions. The integer instructions, the branches, the moves to and
+//! from the FPU and VU0, and VU0's upper instructions in macro mode (with
+//! the VU compiler's code) are compiled; the others call `exec` (the
 //! interpreter, for that one instruction), and the block stops early when
 //! one of those takes an exception or changes where the EE goes next.
 
@@ -16,6 +17,7 @@ use std::mem::offset_of;
 use super::super::Ee;
 use super::EXEC_TYPE;
 use super::wasm::{self, Code, FuncType, I32, op};
+use crate::vu_jit::{MACRO_I32_LOCALS, MACRO_V128_LOCALS, V128_TYPE, macro_upper};
 
 /// Instructions in a block, at most (its delay slot not counted).
 pub const MAX_LEN: usize = 64;
@@ -30,6 +32,9 @@ const DEST: u32 = 5;
 const VA: u32 = 6;
 const PA: u32 = 7;
 const TMP: u32 = 8;
+/// VU0's address, for its macro instructions (whose code uses locals up to
+/// 18: see `vu_jit::macro_upper`).
+const VU0: u32 = 9;
 
 /// Where the state compiled blocks read directly is, in the emulator's
 /// memory (addresses, which only mean something in WebAssembly): the TLB's
@@ -201,6 +206,8 @@ struct Gen {
     layout: Layout,
     /// Instructions compiled (not left to the interpreter).
     natives: u32,
+    /// Whether it has VU0 macro instructions (which need their locals).
+    vu0: bool,
 }
 
 impl Gen {
@@ -663,6 +670,20 @@ impl Gen {
                     }
                 }
             }
+            // VU0's upper instructions in macro mode.
+            0x12 if rs & 0x10 != 0 => {
+                let mut c = Code::default();
+                if !macro_upper(&mut c, i, VU0) {
+                    return false;
+                }
+                self.code
+                    .local_get(BUS)
+                    .i32_const((offset_of!(crate::bus::Bus, vu0)) as i32)
+                    .op(op::I32_ADD)
+                    .local_set(VU0);
+                self.code.bytes.extend_from_slice(&c.bytes);
+                self.vu0 = true;
+            }
             0x12 if rs == 0x05 => {
                 if rd != 0 {
                     self.code.local_get(BUS);
@@ -764,6 +785,7 @@ pub fn compile(src: &Source, exec: u32, layout: Layout) -> Option<Compiled> {
         exec,
         layout,
         natives: 0,
+        vu0: false,
     };
     // k: the next word; ran: the instructions run so far on the path
     // compiled (a likely branch not taken skips its delay slot).
@@ -890,7 +912,11 @@ pub fn compile(src: &Source, exec: u32, layout: Layout) -> Option<Compiled> {
                 results: &[I32],
             },
         ],
-        &[(6, I32)],
+        &if g.vu0 {
+            vec![(MACRO_I32_LOCALS, I32), (MACRO_V128_LOCALS, V128_TYPE)]
+        } else {
+            vec![(6, I32)]
+        },
         &g.code,
     );
     Some(Compiled {
