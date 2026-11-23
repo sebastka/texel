@@ -341,3 +341,12 @@ A room followed one game, opened from the player and closed when its host left. 
 - **Epochs.** Each change of game or host starts an epoch, counted by the server. Inputs, checksums and states carry its low byte, and requests (`hello`, `resync`, `playing`, `idle`) the epoch: those of an earlier one are about another game, or another host's frames, and are dropped. A guest asks for the host's state again until it gets it (the host may still be starting the game); the host's state lists who plays, whose input to wait for.
 - **Handing over.** When the host leaves, the server makes the first other member with an account the host (one without an account was let in by a code only), or closes the room when there is none. In a game, the new host goes on from its frame, keeping the controllers with whoever has them, and the others get its state; out of one, the game stops for everyone.
 - **Memory cards.** Only the member whose cards they are saves them: the host who loaded them. A member who took over keeps the session's cards, which came from the previous host, without saving them over their own; the next game they start is played on theirs.
+
+## D47. A GPU command list that loops ends where it loops
+
+Tekken 3 sends, at the end of some fights, a command list (DMA channel 2, linked list) whose nodes loop back: from its 106th node, 64 nodes round and round. The transfer was sent whole, up to a bound of a million nodes: half a second of drawing for the GPU's timing (D39), which the game waited for, its picture held half drawn (the winner's animation missing) and its sound neglected, four times a match.
+
+- A list now ends where it comes back to a node it sent, found with a second walker going at half speed (Floyd's cycle detection: no memory of the nodes, one more read every other node). The loop's nodes are sent two or three times rather than a million; the game draws its winner's animation, and nothing stalls.
+- Sending the list at the GPU's pace instead (the CPU running meanwhile, as on the console), in case the game mended it before the transfer got there, was tried: the game does not, it waits for the GPU with its interrupts off, and the transfer never ended. The list must not loop on the console: something earlier differs (not found); other emulators bound or cut such lists too.
+- Lists that do not loop are sent as before (D42's timing).
+

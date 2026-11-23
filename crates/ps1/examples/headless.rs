@@ -8,6 +8,7 @@
 //! `CDLOG=1` prints the CD-ROM's commands and the XA sectors played, with
 //! the SPU's volumes every 250 frames.
 //! `VRAM=FRAME` also writes all of VRAM at that frame (as 15-bit colours).
+//! `SHOTS=FROM:TO` writes a screenshot of every frame in that range.
 
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -132,6 +133,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Some((frame, b, len))
         })
         .collect();
+    let shots: Option<(u32, u32)> = std::env::var("SHOTS").ok().and_then(|s| {
+        let (from, to) = s.split_once(':')?;
+        Some((from.parse().ok()?, to.parse().ok()?))
+    });
     // SWAP="3000:3060": open the lid at a frame, close it on the disc again later.
     let swap: Option<(u32, u32)> = std::env::var("SWAP").ok().and_then(|s| {
         let (a, b) = s.split_once(':')?;
@@ -231,7 +236,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             flips_per_second.push(system.take_flips());
             changes_per_second.push(std::mem::take(&mut changed));
         }
-        if n % 60 == 0 || n == frames {
+        if n % 60 == 0 || n == frames || shots.is_some_and(|(from, to)| (from..=to).contains(&n)) {
             println!("frame {n}: {}", system.debug_summary());
             let (rgba, w, h) = system.frame();
             write_ppm(&out.join(format!("frame-{n:05}.ppm")), rgba, w, h)?;

@@ -349,6 +349,10 @@ impl Bus {
 
     /// Sends a GPU command list; returns the words transferred, and the
     /// drawing its last commands (its last node's) add.
+    ///
+    /// A list that loops back to a node it sent ends there. Tekken 3 sends
+    /// some, at the end of its fights: sent round and round (up to a bound),
+    /// they held its picture and sound for half a second each.
     fn dma_linked_list(&mut self, mut addr: u32) -> (u32, u64) {
         let mut total = 0;
         let mut last = 0;
@@ -356,8 +360,11 @@ impl Bus {
             // At its end already.
             return (0, 0);
         }
-        // Bounded, in case of a malformed (looping) list.
-        for _ in 0..0x10_0000 {
+        // A second walker, at half speed: the first meets it again in a
+        // loop (Floyd's cycle detection: no memory of the nodes needed).
+        let mut slow = addr;
+        // Bounded too, as the walk is.
+        for step in 0..0x10_0000u32 {
             let header = read_u32(&self.ram, (addr & 0x1f_fffc) as usize);
             let words = header >> 24;
             total += words + 1;
@@ -373,6 +380,12 @@ impl Bus {
                 break;
             }
             addr = header & 0x1f_fffc;
+            if step % 2 == 1 {
+                slow = read_u32(&self.ram, (slow & 0x1f_fffc) as usize) & 0x1f_fffc;
+            }
+            if addr == slow & 0x1f_fffc {
+                break;
+            }
         }
         (total, last)
     }
@@ -485,6 +498,24 @@ mod tests {
         let drawing = bus.gpu.drawing();
         bus.store32(0x1f80_10a8, 0x0100_0401);
         assert_eq!(bus.gpu.drawing(), drawing, "nothing sent");
+    }
+
+    #[test]
+    fn a_command_list_ends_where_it_loops() {
+        let mut once = Bus::new(vec![0; 512 * 1024].into_boxed_slice());
+        list(&mut once, 0x1000, &[FILL, &[0xe100_0000]]);
+        send(&mut once, 0x1000);
+        let fill = once.gpu.drawing();
+        // The same list, its second node leading back to the first.
+        let mut bus = Bus::new(vec![0; 512 * 1024].into_boxed_slice());
+        list(&mut bus, 0x1000, &[FILL, &[0xe100_0000]]);
+        write_u32(&mut bus.ram, 0x1000 + 4 * 4, (1 << 24) | 0x1000);
+        send(&mut bus, 0x1000);
+        let drawing = bus.gpu.drawing();
+        assert!(
+            drawing >= fill && drawing <= 3 * fill,
+            "drawn {drawing}, one fill {fill}"
+        );
     }
 
     #[test]

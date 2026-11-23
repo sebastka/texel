@@ -547,7 +547,7 @@ impl System {
     /// A one-line summary of the machine state, for debugging.
     pub fn debug_summary(&mut self) -> String {
         format!(
-            "pc={:08x} fault={:08x?} {} mdec={:08x} dma2={:08x} i_stat={:03x} gpustat={:08x} display={}x{} {}",
+            "pc={:08x} fault={:08x?} {} mdec={:08x} dma2={:08x} i_stat={:03x} gpustat={:08x} drawing={} display={}x{} {}",
             self.cpu.pc,
             self.cpu.last_fault,
             self.bus.cdrom.debug(),
@@ -555,6 +555,7 @@ impl System {
             self.bus.dma.channel(dma::Port::MdecOut).control,
             self.bus.irq.read(0),
             self.bus.gpu.status(),
+            self.bus.gpu.drawing(),
             self.frame_size.0,
             self.frame_size.1,
             self.bus.gpu.debug_display(),

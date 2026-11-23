@@ -16,6 +16,9 @@ const post = (msg: FromWorker) => scope.postMessage(msg);
 /** Audio kept queued: enough to ride out a slow frame, little latency. */
 const AUDIO_TARGET = 3 * 1024;
 const MEMCARD_SLOTS = [0, 1];
+/** How often memory cards the game wrote go to the server: soon after a
+ * save, so that closing the page loses nothing. */
+const CARDS_EVERY_MS = 2000;
 
 let emu: Emulator | null = null;
 /** Drawing on the GPU (the PS2's GS, the PlayStation's scaled drawing):
@@ -72,6 +75,7 @@ let audioRunning = false;
 let timer: ReturnType<typeof setTimeout> | undefined;
 let nextFrameAt = 0;
 let frames = 0;
+let cardsCheckedAt = 0;
 let statsAt = 0;
 /** Netplay session (the room's game), if any. */
 let net: Session | null = null;
@@ -280,7 +284,11 @@ function tick() {
     while (net && net.behind > 0 && ran < 12 && advance()) ran++;
     if (ran > 0) {
       draw();
-      if (frames % 120 === 0) void saveMemoryCards();
+      // (`frames` counts the second's frames, for the stats: a clock here.)
+      if (now - cardsCheckedAt >= CARDS_EVERY_MS) {
+        cardsCheckedAt = now;
+        void saveMemoryCards();
+      }
     }
     if (now - statsAt >= 1000) {
       post({ type: "stats", fps: (frames * 1000) / (now - statsAt), width: emu.frameWidth, height: emu.frameHeight });
@@ -472,18 +480,37 @@ async function loadState(slot: number) {
   post({ type: "state-loaded", slot });
 }
 
-async function saveMemoryCards() {
+/** Uploads, one after the other (an older one must not land last), and
+ * cards whose upload failed, to send again. */
+let uploads: Promise<void> = Promise.resolve();
+const unsaved: (Uint8Array | null)[] = [null, null];
+
+/** Sends the memory cards the game wrote since to the server; resolves
+ * once every upload asked for so far is done. */
+function saveMemoryCards(): Promise<void> {
+  uploads = uploads.then(uploadCards);
+  return uploads;
+}
+
+async function uploadCards() {
   // The cards' owner keeps the saves: a guest's cards are copies.
   if (!emu || !cardsId || !ownCards) return;
   for (const slot of MEMCARD_SLOTS) {
-    const data = emu.takeWrittenMemoryCard(slot);
+    const data = emu.takeWrittenMemoryCard(slot) ?? unsaved[slot];
     if (!data) continue;
-    const resp = await fetch(`/api/games/${encodeURIComponent(cardsId)}/memcards/${slot + 1}`, {
-      method: "PUT",
-      body: data as Uint8Array<ArrayBuffer>,
-    });
-    if (resp.ok) post({ type: "saved", slot });
-    else post({ type: "error", message: `saving memory card ${slot + 1}: HTTP ${resp.status}` });
+    let status: number | string;
+    try {
+      const resp = await fetch(`/api/games/${encodeURIComponent(cardsId)}/memcards/${slot + 1}`, {
+        method: "PUT",
+        body: data as Uint8Array<ArrayBuffer>,
+      });
+      status = resp.ok ? 0 : `HTTP ${resp.status}`;
+    } catch (e) {
+      status = String(e);
+    }
+    unsaved[slot] = status === 0 ? null : data;
+    if (status === 0) post({ type: "saved", slot });
+    else post({ type: "error", message: `saving memory card ${slot + 1}: ${status} (tried again soon)` });
   }
 }
 
@@ -549,6 +576,12 @@ scope.onmessage = (e: MessageEvent<ToWorker>) => {
       paused = msg.paused;
       if (paused) void saveMemoryCards();
       else schedule(0);
+      break;
+    case "stop":
+      // The player goes: once the memory cards are saved.
+      paused = true;
+      net?.close();
+      void saveMemoryCards().finally(() => post({ type: "stopped" }));
       break;
     case "reset":
       emu?.reset();

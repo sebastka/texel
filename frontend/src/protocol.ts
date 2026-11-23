@@ -92,6 +92,8 @@ export type ToWorker =
   | { type: "axes"; ports: [Axes, Axes] }
   | { type: "analog-button"; port: number }
   | { type: "pause"; paused: boolean }
+  /** The player goes: the worker saves the memory cards, then `stopped`. */
+  | { type: "stop" }
   /** PlayStation enhancements: precise geometry (GPU), widescreen. */
   | { type: "precise"; on: boolean }
   | { type: "widescreen"; on: boolean }
@@ -140,4 +142,5 @@ export type FromWorker =
   | { type: "net"; status: NetStatus }
   /** A message for the room. */
   | { type: "net-out"; data: string | Uint8Array }
+  | { type: "stopped" }
   | { type: "error"; message: string };
