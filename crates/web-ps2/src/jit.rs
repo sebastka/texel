@@ -1,6 +1,6 @@
-//! Compiled EE blocks in the browser: modules are compiled and instantiated
-//! with this module's own memory and function table, their functions added
-//! to the table, and called from there.
+//! Compiled EE blocks and VU1 programs in the browser: modules are compiled
+//! and instantiated with this module's own memory and function table, their
+//! functions added to the table, and called from there.
 //!
 //! The workspace's only unsafe code is here, and only on wasm32: compiled
 //! blocks get the EE and the bus as addresses in this module's memory
@@ -13,10 +13,16 @@ use js_sys::{Object, Reflect, Uint8Array, WebAssembly};
 use texel_ps2::bus::Bus;
 use texel_ps2::ee::Ee;
 use texel_ps2::ee::jit::{Backend, helpers};
+use texel_ps2::gif::Gif;
+use texel_ps2::gs::Gs;
+use texel_ps2::vu::Vu;
+use texel_ps2::vu_jit::{VuBackend, helpers as vu_helpers};
 use wasm_bindgen::{JsCast, JsValue};
 
 type Block = extern "C" fn(*mut Ee, *mut Bus, u32) -> u32;
 type Exec = extern "C" fn(*mut Ee, *mut Bus, u32, u32, u32) -> u32;
+type Program = extern "C" fn(*mut Vu, *mut u8, *mut Gif, *mut Gs) -> u32;
+type Lower = extern "C" fn(*mut Vu, *mut Gif, *mut Gs, u32, u32);
 
 pub struct WebBackend {
     table: WebAssembly::Table,
@@ -78,4 +84,35 @@ extern "C" fn exec(ee: *mut Ee, bus: *mut Bus, instr: u32, pc: u32, flags: u32) 
     // and bus, borrowed for the call; they pass them back here unchanged.
     let (ee, bus) = unsafe { (&mut *ee, &mut *bus) };
     helpers::exec(ee, bus, instr, pc, flags)
+}
+
+impl VuBackend for WebBackend {
+    fn install(&mut self, module: &[u8]) -> Option<u32> {
+        Backend::install(self, module)
+    }
+
+    fn release(&mut self, func: u32) {
+        self.free.push(func);
+    }
+
+    fn call(&mut self, func: u32, vu: &mut Vu, gif: &mut Gif, gs: &mut Gs) -> u32 {
+        // SAFETY: `func` is the table index `install` gave a program's
+        // function, whose type is `Program`.
+        let program = unsafe { std::mem::transmute::<usize, Program>(func as usize) };
+        let data = vu.data.as_mut_ptr();
+        program(vu, data, gif, gs)
+    }
+
+    fn helper_index(&self) -> u32 {
+        lower as Lower as usize as u32
+    }
+}
+
+/// What compiled programs call for the lower instructions they leave to
+/// the interpreter (see `vu_helpers::lower`).
+extern "C" fn lower(vu: *mut Vu, gif: *mut Gif, gs: *mut Gs, instr: u32, pc: u32) {
+    // SAFETY: programs are only run by `call`, which gives them the live VU,
+    // GIF and GS, borrowed for the call; they pass them back here unchanged.
+    let (vu, gif, gs) = unsafe { (&mut *vu, &mut *gif, &mut *gs) };
+    vu_helpers::lower(vu, gif, gs, instr, pc);
 }

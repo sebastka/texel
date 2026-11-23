@@ -21,6 +21,7 @@ pub mod spu2;
 pub mod timers;
 pub mod vif;
 pub mod vu;
+pub mod vu_jit;
 
 use bus::Bus;
 use ee::Ee;

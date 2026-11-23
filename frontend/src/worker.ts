@@ -142,7 +142,7 @@ function fetchSbi(id: string): Promise<Uint8Array | null> {
 /** What the PS2 runs on, for the player's status: the GS on the GPU, the
  * EE's code compiled. */
 function renderer(): string | null {
-  const parts = [gpu ? (gpu.renderer ? `WebGPU (${gpu.renderer})` : "WebGPU") : null, compiled ? "EE compiled" : null];
+  const parts = [gpu ? (gpu.renderer ? `WebGPU (${gpu.renderer})` : "WebGPU") : null, compiled ? "EE and VUs compiled" : null];
   const shown = parts.filter((p) => p !== null);
   return shown.length > 0 ? shown.join(" · ") : null;
 }
@@ -182,9 +182,10 @@ async function start(msg: StartMessage) {
     // browser will not make modules.
     try {
       ps2emu.setCompiler(true);
+      ps2emu.setVuCompiler(true);
       compiled = true;
     } catch (e) {
-      console.warn("The EE's compiler is not available, interpreting:", e);
+      console.warn("The EE's and VUs' compilers are not available, interpreting:", e);
     }
     emu = ps2emu as unknown as Emulator;
     gameId = null;

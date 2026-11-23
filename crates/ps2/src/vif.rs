@@ -115,6 +115,7 @@ impl Vif {
             Pending::Mpg(left, at) => {
                 let at = at as usize % vu.micro.len();
                 vu.micro[at..at + 4].copy_from_slice(&w.to_le_bytes());
+                vu.micro_gen += 1;
                 self.pending = if left > 1 {
                     Pending::Mpg(left - 1, at as u32 + 4)
                 } else {
