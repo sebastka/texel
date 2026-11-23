@@ -343,7 +343,9 @@ pub mod helpers {
     /// `instr`, at `pc`; `flags`: bit 0, it is a delay slot; above, how many
     /// of the block's instructions ran before it. The block has set pc and
     /// next_pc as `step` would have. Returns 1 when the block must stop
-    /// there (an exception, or a change of where the EE goes next).
+    /// there: an exception, a change of where the EE goes next, or a poll
+    /// of INTC_STAT found (the rest of the slice then passes at once, from
+    /// right after it, as with the interpreter).
     pub fn exec(ee: &mut Ee, bus: &mut Bus, instr: u32, pc: u32, flags: u32) -> u32 {
         ee.catch_up(flags >> 1);
         let (p, n) = (ee.pc, ee.next_pc);
@@ -351,6 +353,6 @@ pub mod helpers {
         ee.in_delay = flags & 1 != 0;
         ee.delay_pending = false;
         ee.execute(instr, bus);
-        u32::from(ee.pc != p || ee.next_pc != n || ee.delay_pending)
+        u32::from(ee.pc != p || ee.next_pc != n || ee.delay_pending || ee.polling)
     }
 }

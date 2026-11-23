@@ -239,7 +239,10 @@ impl Vif {
         let (elements, bits) = self.format();
         let vector_bytes = if bits == 5 { 2 } else { (elements * bits / 8) as usize };
         while self.vectors_left() > 0 && self.needs_data() && self.bytes.len() >= vector_bytes {
-            let data: Vec<u8> = self.bytes.drain(..vector_bytes).collect();
+            // At most 16 bytes (V4-32).
+            let mut data = [0u8; 16];
+            data[..vector_bytes].copy_from_slice(&self.bytes[..vector_bytes]);
+            self.bytes.drain(..vector_bytes);
             let signed = self.code & (1 << 14) == 0;
             let get = |k: usize| -> u32 {
                 match bits {

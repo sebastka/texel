@@ -56,7 +56,8 @@ fn integer_instructions() {
     words.push(r(4, 5, 0, 0, 0x21));
     let n = words.len() as u32;
     let c = compiled(words);
-    assert_eq!((c.words, c.native, c.first), (n, n, n));
+    // It starts with one instruction left: it can stop after any.
+    assert_eq!((c.words, c.native, c.first), (n, n, 1));
 }
 
 #[test]
@@ -87,6 +88,32 @@ fn loads_stores_and_the_interpreter() {
 }
 
 #[test]
+fn fpu_and_vu0_moves() {
+    let cop = |op: u32, rs: u32, rt: u32, rd: u32| (op << 26) | (rs << 21) | (rt << 16) | (rd << 11);
+    let words = vec![
+        // LWC1, SWC1, LQC2, SQC2.
+        i(0x31, 29, 3, 4),
+        i(0x39, 29, 3, 4),
+        i(0x36, 29, 3, 16),
+        i(0x3E, 29, 3, 16),
+        // MFC1, MTC1, QMFC2, QMTC2.
+        cop(0x11, 0x00, 8, 3),
+        cop(0x11, 0x04, 8, 3),
+        cop(0x12, 0x01, 8, 3),
+        cop(0x12, 0x05, 8, 3),
+        // To r0 and VF0: nothing, or the interpreter's for LQC2.
+        cop(0x12, 0x01, 0, 3),
+        cop(0x12, 0x05, 8, 0),
+        i(0x36, 29, 0, 16),
+        // CFC2 and a VU0 macro instruction: the interpreter's.
+        cop(0x12, 0x02, 8, 3),
+        cop(0x12, 0x10, 8, 3) | 0x28,
+    ];
+    let c = compiled(words);
+    assert_eq!((c.words, c.native), (13, 10));
+}
+
+#[test]
 fn every_branch() {
     let nop = 0;
     let branches = [
@@ -98,12 +125,13 @@ fn every_branch() {
     for b in branches {
         // A jump ends the block, after its delay slot.
         let c = compiled(vec![r(4, 5, 6, 0, 0x21), b, r(4, 5, 7, 0, 0x21), nop, nop]);
-        assert_eq!((c.words, c.first), (3, 3));
+        assert_eq!((c.words, c.first), (3, 1));
     }
     for op in [0x04, 0x05, 0x06, 0x07, 0x14, 0x15, 0x16, 0x17] {
         let words = vec![i(op, 4, 5, rel(0, 3)), nop, nop, nop];
         // Conditional: the block goes on past it.
         let c = compiled(words);
+        // A branch first: it runs with its delay slot.
         assert_eq!((c.words, c.first), (4, 2));
     }
     for rt in [0x00, 0x01, 0x02, 0x03, 0x10, 0x11, 0x12, 0x13] {
@@ -128,7 +156,7 @@ fn segments_and_stops() {
         nop,
     ];
     let c = compiled(words);
-    assert_eq!((c.words, c.first), (8, 3));
+    assert_eq!((c.words, c.first), (8, 1));
     // A branch whose delay slot is another branch: not compiled.
     let c = compiled(vec![nop, i(0x04, 4, 5, 4), i(0x04, 4, 5, 4), nop]);
     assert_eq!(c.words, 1);

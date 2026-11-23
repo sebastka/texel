@@ -83,7 +83,7 @@ async function run(vuCompiled) {
   const secs = (performance.now() - started) / 1000;
   const steps = emu.vu1Steps() - steps0;
   const name = vuCompiled === null ? "VU1 interpreted (no compiler in this build)" : vuCompiled ? "VU1 compiled" : "VU1 interpreted";
-  const stats = vuCompiled && emu.vuCompilerStats ? `; ${emu.vuCompilerStats()}` : "";
+  const stats = vuCompiled && emu.vuCompilerStats ? `; ${emu.vuCompilerStats()}; EE ${emu.compilerStats()}` : "";
   console.log(
     `${name}: ${((seconds * fps) / secs).toFixed(1)} frames per second, ` +
       `${(steps / secs / 1e6).toFixed(1)} M VU1 instructions per second (${(steps / seconds / 1e6).toFixed(1)} M per console second)${stats}`,
