@@ -253,6 +253,43 @@ const BIOS_NOTES: Record<string, string> = {
   // v4.5 A, SCPH-101
   dcffe16bd90a723499ad46c641424981338d8378:
     "From the PSone, the smaller redesign of 2000: the latest North American BIOS Redump lists, with the 1995 kernel.",
+  // v1.1 J, SCPH-3000
+  b06f4a861f74270be819aa2a07db8d0563a7cc4e:
+    "The second Japanese BIOS, of January 1995, still with the 1994 kernel and its bugs: for testing early behaviour.",
+  // v2.0 A, SCPH-1001
+  "649895efd79d14790eabb362e94eb0622093dfb9":
+    "The earliest North American BIOS Redump lists, still with the 1994 kernel and its bugs: less compatible than later ones.",
+  // v2.1 A, SCPH-1001
+  ca7af30b50d9756cbd764640126c454cff658479:
+    "An interim version of July 1995, the only one with its kernel: newer than the 1994 one, older than the 1995 one most " +
+    "games were tested with. Prefer v2.2 or later for playing.",
+  // v2.1 E, SCPH-1002
+  "76cf6b1b2a7c571a6ad07f2bac0db6cd8f71e2cc":
+    "European counterpart of the North American v2.1: an interim version with its own kernel. Prefer v2.2 or later for playing.",
+  // v2.1 J, SCPH-3500
+  e38466a4ba8005fba7e9e3c7b9efeba7205bee3f:
+    "Japanese counterpart of the North American v2.1: an interim version with its own kernel. Prefer v2.2 or later for playing.",
+  // v2.2 E, SCPH-1002
+  b6a11579caef3875504fcf3831b8e3922746df2c:
+    "The first European BIOS with the 1995 kernel that almost every later BIOS kept, so it is very compatible.",
+  // v2.2 D, DTL-H1100
+  "73107d468fc7cb1d2c5b18b269715dd889ecef06":
+    "From a development console (region letter D), and much of it differs from the retail v2.2 BIOSes. Not for playing.",
+  // v4.1 A, SCPH-7000W
+  "1b0dbdb23da9dc0776aac58d0755dc80fea20975":
+    "A month older than the other v4.1 BIOSes, and much of it differs from theirs. Has the 1995 kernel.",
+  // v4.3 J, SCPH-100
+  "339a48f4fcf63e10b5b867b8c93cfd40945faf6c":
+    "From the Japanese PSone: the latest Japanese BIOS Redump lists, with the 1995 kernel.",
+  // v4.4 A, SCPH-101
+  "7771d6e90980408f753891648685def6dd42ef6d":
+    "The first North American PSone BIOS, replaced two months later by v4.5. Has the 1995 kernel.",
+  // v4.4 E, SCPH-102
+  beb0ac693c0dc26daf5665b3314db81480fa5c7c:
+    "The first European PSone BIOS: the same code as the North American v4.4 but for its region letter.",
+  // v4.5 E, SCPH-102
+  dbc7339e5d85827c095764fc077b41f78fd2ecae:
+    "From the PSone: the latest European BIOS Redump lists, the same code as the North American v4.5 but for its region letter.",
 };
 
 /** What is worth knowing about a BIOS, beyond its version, date, region
