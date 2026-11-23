@@ -20,7 +20,7 @@ fn micro(prog: &[(u32, u32)]) -> Vec<u8> {
 }
 
 fn compiled(prog: &[(u32, u32)]) -> super::Compiled {
-    let c = compile(&micro(prog), 0, 1024, 7).expect("a program");
+    let c = compile(&micro(prog), 0, &[], 1024, 7).expect("a program");
     let mut v = wasmparser::Validator::new();
     if let Err(e) = v.validate_all(&c.module) {
         panic!("invalid module: {e}");
@@ -133,4 +133,26 @@ fn rare_cases_stop_for_the_interpreter() {
     assert_eq!(c.words.len(), 1);
     let c = compiled(&[(NOP | E, b(2)), (NOP, LNOP)]);
     assert!(c.words.is_empty());
+}
+
+#[test]
+fn entries_found_at_run_time_start_blocks() {
+    let iaddiu = |it: u32, is: u32, imm: u32| (0x08 << 25) | (it << 16) | (is << 11) | imm;
+    let jr = |is: u32| (0x24 << 25) | (is << 11);
+    // vi1 = 3; JR vi1 (to 3, just after its delay slot); then on to the end.
+    let prog = [
+        (NOP, iaddiu(1, 0, 3)),
+        (NOP, jr(1)),
+        (NOP, LNOP),
+        (NOP, iaddiu(2, 2, 1)),
+        (NOP | E, LNOP),
+        (NOP, LNOP),
+    ];
+    let without = compile(&micro(&prog), 0, &[], 1024, 7).expect("a program");
+    assert!(!without.starts.contains(&3));
+    let with = compile(&micro(&prog), 0, &[3], 1024, 7).expect("a program");
+    assert!(with.starts.contains(&3));
+    let mut v = wasmparser::Validator::new();
+    v.validate_all(&with.module).expect("valid");
+    assert_eq!(with.words.len(), prog.len());
 }
