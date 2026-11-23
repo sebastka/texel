@@ -29,7 +29,9 @@ pub async fn verify(password: String, hash: Option<String>) -> bool {
         let known = hash.is_some();
         let hash = hash.unwrap_or_else(|| DUMMY.to_owned());
         // An unparsable hash fails to verify.
-        let ok = Argon2::default().verify_password(password.as_bytes(), hash.as_str()).is_ok();
+        let ok = Argon2::default()
+            .verify_password(password.as_bytes(), hash.as_str())
+            .is_ok();
         known && ok
     })
     .await
