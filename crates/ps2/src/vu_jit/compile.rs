@@ -258,6 +258,7 @@ pub fn compile(micro: &[u8], start: u32, qwords: u32, helper: u32) -> Option<Com
     }
     let mut e = Emitter {
         code: Code::default(),
+        vu: VU,
         helper,
         wrap,
         qmask: qwords.max(1) - 1,
@@ -370,8 +371,51 @@ pub fn compile(micro: &[u8], start: u32, qwords: u32, helper: u32) -> Option<Com
     Some(Compiled { module, words })
 }
 
+/// The locals `macro_upper`'s code uses, past the function's first three
+/// (the EE block's parameters): i32s up to index 12 (`vu` among them, at
+/// most 12, and T0, T1 at 6 and 7 as scratch), then the v128s at 13 to 18.
+pub(crate) const MACRO_I32_LOCALS: u32 = 10;
+pub(crate) const MACRO_V128_LOCALS: u32 = V128_LOCALS;
+pub(crate) const V128_TYPE: u8 = V128;
+const _: () = assert!(VS == 3 + MACRO_I32_LOCALS && FLAGS < VS && T0 > 5 && T1 > 5);
+
+/// Compiles VU0's upper instruction `instr` as the EE runs it in macro mode
+/// (COP2): its result committed at once, with its flags, as `Vu::macro_upper`
+/// does; on the `Vu` whose address is in local `vu`. False (and nothing
+/// emitted) if it is not one compiled.
+pub(crate) fn macro_upper(code: &mut Code, instr: u32, vu: u32) -> bool {
+    let funct = instr & 0x3F;
+    let compiled = match funct {
+        0x00..=0x2F => true,
+        // The special table's upper instructions, not its NOP or the
+        // undefined one.
+        0x3C..=0x3F => {
+            let op = (funct & 3) | ((instr >> 4) & 0x7C);
+            op < 0x30 && op != 0x2B && op != 0x2F
+        }
+        _ => false,
+    };
+    if !compiled {
+        return false;
+    }
+    let mut e = Emitter {
+        code: std::mem::take(code),
+        vu,
+        helper: 0,
+        wrap: 0,
+        qmask: 0,
+    };
+    if let Some((reg, mask, flags)) = e.upper(instr) {
+        e.commit(reg, mask, flags);
+    }
+    *code = e.code;
+    true
+}
+
 struct Emitter {
     code: Code,
+    /// The local holding the `Vu`'s address.
+    vu: u32,
     helper: u32,
     wrap: u32,
     /// Data addresses wrap at the data memory's size (in quadwords).
@@ -440,26 +484,26 @@ impl Emitter {
     }
 
     fn load_vu_v128(&mut self, offset: u32) {
-        self.code.local_get(VU);
+        self.code.local_get(self.vu);
         self.simd_mem(simd::LOAD, offset);
     }
 
     fn load_vu_i32(&mut self, offset: u32) {
-        self.code.local_get(VU).mem(op::I32_LOAD, 2, offset);
+        self.code.local_get(self.vu).mem(op::I32_LOAD, 2, offset);
     }
 
     fn store_i32(&mut self, offset: u32, value: impl FnOnce(&mut Code)) {
-        self.code.local_get(VU);
+        self.code.local_get(self.vu);
         value(&mut self.code);
         self.code.mem(op::I32_STORE, 2, offset);
     }
 
     fn load_vi(&mut self, r: usize) {
-        self.code.local_get(VU).mem(op::I32_LOAD16_U, 1, vi(r));
+        self.code.local_get(self.vu).mem(op::I32_LOAD16_U, 1, vi(r));
     }
 
     fn load_vi_signed(&mut self, r: usize) {
-        self.code.local_get(VU).mem(op::I32_LOAD16_S, 1, vi(r));
+        self.code.local_get(self.vu).mem(op::I32_LOAD16_S, 1, vi(r));
     }
 
     /// VI r = the i32 `value` pushes (its low 16 bits); VI0 stays 0.
@@ -468,7 +512,7 @@ impl Emitter {
             // Still evaluated for its effects? None have any: skip it.
             return;
         }
-        self.code.local_get(VU);
+        self.code.local_get(self.vu);
         value(self);
         self.code.mem(op::I32_STORE16, 1, vi(r));
     }
@@ -626,7 +670,7 @@ impl Emitter {
         if mask == 0 {
             return;
         }
-        self.code.local_get(VU);
+        self.code.local_get(self.vu);
         value(self);
         if mask != 0xF {
             self.load_vu_v128(offset);
@@ -676,8 +720,9 @@ impl Emitter {
                 self.code.i32_const(k).op(op::I32_SHL).op(op::I32_OR);
             }
             self.code.local_set(T1);
+            let vu = self.vu;
             self.store_i32(field(offset_of!(Vu, status)), |c| {
-                c.local_get(VU).mem(op::I32_LOAD, 2, field(offset_of!(Vu, status)));
+                c.local_get(vu).mem(op::I32_LOAD, 2, field(offset_of!(Vu, status)));
                 c.i32_const(0xFF0).op(op::I32_AND).local_get(T1).op(op::I32_OR);
                 c.local_get(T1).i32_const(6).op(op::I32_SHL).op(op::I32_OR);
             });
@@ -711,7 +756,7 @@ impl Emitter {
             .op(op::I32_AND)
             .i32_const(size)
             .op(op::I32_MUL);
-        self.code.local_get(VU).op(op::I32_ADD).local_set(T0);
+        self.code.local_get(self.vu).op(op::I32_ADD).local_set(T0);
         let history = field(offset_of!(Vu, flag_history));
         for (f, from) in [
             (offset_of!(Flags, mac), offset_of!(Vu, mac)),
@@ -735,11 +780,12 @@ impl Emitter {
     /// Q's pending value comes one instruction closer (lands at 1).
     fn tick_q(&mut self) {
         let (value, left) = self.pending();
+        let vu = self.vu;
         self.load_vu_i32(left);
         self.code.local_tee(T0).if_();
         self.code.local_get(T0).i32_const(1).op(op::I32_EQ).if_();
         self.store_i32(field(offset_of!(Vu, q)), |c| {
-            c.local_get(VU).mem(op::I32_LOAD, 2, value);
+            c.local_get(vu).mem(op::I32_LOAD, 2, value);
         });
         self.store_i32(left, |c| {
             c.i32_const(0);
@@ -754,10 +800,11 @@ impl Emitter {
     /// WAITQ: Q's pending value lands now.
     fn wait_q(&mut self) {
         let (value, left) = self.pending();
+        let vu = self.vu;
         self.load_vu_i32(left);
         self.code.if_();
         self.store_i32(field(offset_of!(Vu, q)), |c| {
-            c.local_get(VU).mem(op::I32_LOAD, 2, value);
+            c.local_get(vu).mem(op::I32_LOAD, 2, value);
         });
         self.store_i32(left, |c| {
             c.i32_const(0);
@@ -961,8 +1008,9 @@ impl Emitter {
         self.code.i32_const(7).op(op::I32_AND).local_set(T1);
         // Interleaved: g0 l0 g1 l1 g2 l2.
         let clip = field(offset_of!(Vu, clip));
+        let vu = self.vu;
         self.store_i32(clip, |c| {
-            c.local_get(VU).mem(op::I32_LOAD, 2, clip).i32_const(6).op(op::I32_SHL);
+            c.local_get(vu).mem(op::I32_LOAD, 2, clip).i32_const(6).op(op::I32_SHL);
             for (src, bit, shift) in [(T0, 1, 0), (T1, 1, 1), (T0, 2, 1), (T1, 2, 2), (T0, 4, 2), (T1, 4, 3)] {
                 c.local_get(src)
                     .i32_const(bit)
@@ -1124,8 +1172,9 @@ impl Emitter {
                     }),
                     0x15 => {
                         let status = field(offset_of!(Vu, status));
+                        let vu = self.vu;
                         self.store_i32(status, |c| {
-                            c.local_get(VU)
+                            c.local_get(vu)
                                 .mem(op::I32_LOAD, 2, status)
                                 .i32_const(0x3F)
                                 .op(op::I32_AND);
@@ -1208,7 +1257,7 @@ impl Emitter {
             .op(op::I32_AND)
             .i32_const(size)
             .op(op::I32_MUL);
-        self.code.local_get(VU).op(op::I32_ADD);
+        self.code.local_get(self.vu).op(op::I32_ADD);
         self.code.mem(op::I32_LOAD, 2, field(offset_of!(Vu, flag_history) + f));
     }
 
@@ -1321,12 +1370,12 @@ impl Emitter {
             }),
             0x68 => self.set_vi(it, |e| {
                 e.code
-                    .local_get(VU)
+                    .local_get(e.vu)
                     .mem(op::I32_LOAD16_U, 1, field(offset_of!(Vu, top)));
             }),
             0x69 => self.set_vi(it, |e| {
                 e.code
-                    .local_get(VU)
+                    .local_get(e.vu)
                     .mem(op::I32_LOAD16_U, 1, field(offset_of!(Vu, itop)));
             }),
             // The random numbers, XGKICK, the EFU: the interpreter's.
@@ -1346,7 +1395,7 @@ impl Emitter {
     /// The interpreter runs the lower instruction (its pc as it has it).
     fn helper(&mut self, instr: u32, pc: u32) {
         let next = pc.wrapping_add(1) & self.wrap;
-        self.code.local_get(VU).local_get(GIF).local_get(GS);
+        self.code.local_get(self.vu).local_get(GIF).local_get(GS);
         self.code.i32_const(instr as i32).i32_const(next as i32);
         self.code.i32_const(self.helper as i32).call_indirect(HELPER_TYPE);
     }
@@ -1387,7 +1436,7 @@ impl Emitter {
         match op_ {
             0x38 => {
                 // t == 0: ±max, with s and t's raw signs; else s / t.
-                self.code.local_get(VU);
+                self.code.local_get(self.vu);
                 self.load_vu_i32(s_at);
                 self.load_vu_i32(t_at);
                 self.code
@@ -1406,7 +1455,7 @@ impl Emitter {
                 self.code.mem(op::I32_STORE, 2, value);
             }
             0x39 => {
-                self.code.local_get(VU);
+                self.code.local_get(self.vu);
                 f32_of(&mut self.code, DIV_T);
                 self.code.op(F32_ABS).op(F32_SQRT).op(I32_REINTERPRET_F32);
                 self.sanitize_scalar();
@@ -1420,7 +1469,7 @@ impl Emitter {
                     .op(F32_SQRT)
                     .op(I32_REINTERPRET_F32)
                     .local_set(DIV_T);
-                self.code.local_get(VU);
+                self.code.local_get(self.vu);
                 self.code.i32_const(MAX);
                 f32_of(&mut self.code, DIV_S);
                 f32_of(&mut self.code, DIV_T);

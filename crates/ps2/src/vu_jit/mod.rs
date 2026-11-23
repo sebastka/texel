@@ -16,6 +16,7 @@ mod tests;
 use std::collections::HashMap;
 
 pub use compile::{Compiled, compile};
+pub(crate) use compile::{MACRO_I32_LOCALS, MACRO_V128_LOCALS, V128_TYPE, macro_upper};
 
 use crate::gif::Gif;
 use crate::gs::Gs;
