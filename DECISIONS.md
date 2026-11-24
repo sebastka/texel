@@ -391,7 +391,7 @@ Disc images are often kept zipped. The server reads an image inside a zip withou
 
 ## D52. Several library directories, merged
 
-A library may be spread over several directories (another volume, a second collection). `TEXEL_LIBRARY` and each console's BIOS and game settings take several directories (separated by `:`, as `PATH`, or the option repeated); a console's directories given on their own replace the ones its library roots would give, as before.
+A library may be spread over several directories (another volume, a second collection). Each console's BIOS and game settings (`TEXEL_PS1_BIOS`, `TEXEL_PS1_GAMES`, `TEXEL_PS2_BIOS`, `TEXEL_PS2_GAMES`) take several directories, separated by `:` as in `PATH` (or the option repeated). They are the whole library's configuration: the single library root they used to default under (`TEXEL_LIBRARY`, with its fixed `ps1/bios`… layout) is gone; their defaults are those directories under `/library`, where the container and the Kubernetes manifest mount it.
 
 - **Merged as one.** A game's path is relative to its directory (`games/…`, `ps2/games/…`), whichever directory it is in: its id, and so its saves, settings and verification hash, do not depend on where it lies. Games can move from one directory to another, and a directory can be added, without anything to migrate; with one directory, nothing changes.
 - **Duplicates.** A game found at the same relative path in two directories is taken from the first listed, and the scan warns. A BIOS is identified by its content: found twice, it is listed once.

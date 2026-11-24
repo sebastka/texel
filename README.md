@@ -27,7 +27,7 @@ Boots the BIOS shell and commercial games (tested: Rayman, Gran Turismo) at full
 
 ## Library layout
 
-The server reads a library directory (read-only), with a directory per console:
+The server reads its library (read-only) from four kinds of directories, each set by its own variable (`TEXEL_PS1_BIOS`, `TEXEL_PS1_GAMES`, `TEXEL_PS2_BIOS`, `TEXEL_PS2_GAMES`, see Configuration). By default they are under `/library`, where the container mounts it:
 
 ```
 library/
@@ -56,7 +56,7 @@ library/
     └── games/
 ```
 
-Each of the four directories can also be set on its own (`TEXEL_PS1_BIOS`, `TEXEL_PS1_GAMES`, `TEXEL_PS2_BIOS`, `TEXEL_PS2_GAMES`, see Configuration), for example to keep games on another volume. Each of these settings, and `TEXEL_LIBRARY`, takes several directories, separated by `:` (or the option repeated): a console's directories are merged, as if they were one. A game's path, by which its saves, settings and verification are kept, is relative to its directory, whichever it is: games can move from one directory to another. A game found at the same relative path in two directories is taken from the first (the scan says so); a BIOS found twice is listed once. PlayStation 2 games and BIOSes are listed, identified and verified like PlayStation ones (with Redump's and libretro's PS2 DATs and thumbnails); PS2 games start, but their emulator is in progress (see below).
+Each of the four settings takes several directories, separated by `:` (or the option repeated), for example to keep games on several volumes: a console's directories are merged, as if they were one. A game's path, by which its saves, settings and verification are kept, is relative to its directory, whichever it is: games can move from one directory to another. A game found at the same relative path in two directories is taken from the first (the scan says so); a BIOS found twice is listed once. PlayStation 2 games and BIOSes are listed, identified and verified like PlayStation ones (with Redump's and libretro's PS2 DATs and thumbnails); PS2 games start, but their emulator is in progress (see below).
 
 CHD and PBP images are decompressed by the server, which presents their tracks as BIN files; they are identified and verified against Redump like the others. Zipped images are read in the zip, without unpacking it: a deflated image is indexed once (the first scan that finds it decompresses it whole, a few seconds per GB, and keeps a seek index of about 1% of its size in the state directory's `cache/zip-index`), then read from the closest indexed point (a few milliseconds per seek). Deflate64 zips (Windows' for very large files) are not read: zip them again, or convert them to CHD, which compresses discs better. Symbolic links are followed. Multi-disc games are recognised by their Redump names ("Disc 1", "Disc 2"…): they show as one game, share their settings (BIOS, memory cards), and the player can change discs.
 
@@ -114,7 +114,9 @@ pnpm run wasm                   # build the core to WebAssembly
 pnpm run build                  # build the web app
 cd ..
 export TEXEL_DATABASE_URL=mysql://texel:change-me@127.0.0.1:13306/texel
-cargo run --release -p texel-server -- --library /path/to/library --state ./state --web frontend/dist
+export TEXEL_PS1_BIOS=/path/to/ps1/bios TEXEL_PS1_GAMES=/path/to/ps1/games
+export TEXEL_PS2_BIOS=/path/to/ps2/bios TEXEL_PS2_GAMES=/path/to/ps2/games
+cargo run --release -p texel-server -- --state ./state --web frontend/dist
 ```
 
 Open http://localhost:8080 and sign in (see Accounts: without OpenID Connect, create an invitation first). For frontend development, run the server on port 8080 and `pnpm dev` (Vite proxies `/api`).
@@ -147,11 +149,10 @@ Everyone but administrators is a guest: guests play, keep saves, open and join r
 | Variable | Default | |
 |---|---|---|
 | `TEXEL_LISTEN` | `0.0.0.0:8080` | Listen address |
-| `TEXEL_LIBRARY` | `/library` | Library roots, separated by `:` (each with `ps1/bios/`, `ps1/games/`, `ps2/bios/`, `ps2/games/`) |
-| `TEXEL_PS1_BIOS` | `LIBRARY/ps1/bios` | PlayStation BIOS images (directories, separated by `:`) |
-| `TEXEL_PS1_GAMES` | `LIBRARY/ps1/games` | PlayStation games (directories, separated by `:`) |
-| `TEXEL_PS2_BIOS` | `LIBRARY/ps2/bios` | PlayStation 2 BIOS images (directories, separated by `:`) |
-| `TEXEL_PS2_GAMES` | `LIBRARY/ps2/games` | PlayStation 2 games (directories, separated by `:`; the emulator is in progress) |
+| `TEXEL_PS1_BIOS` | `/library/ps1/bios` | PlayStation BIOS images (directories, separated by `:`) |
+| `TEXEL_PS1_GAMES` | `/library/ps1/games` | PlayStation games (directories, separated by `:`) |
+| `TEXEL_PS2_BIOS` | `/library/ps2/bios` | PlayStation 2 BIOS images (directories, separated by `:`) |
+| `TEXEL_PS2_GAMES` | `/library/ps2/games` | PlayStation 2 games (directories, separated by `:`; the emulator is in progress) |
 | `TEXEL_DATABASE_URL` | | Required: `mysql://user:password@host:3306/database` (MariaDB or MySQL; add `?ssl-mode=required` for TLS) |
 | `TEXEL_STATE` | `/state` | Caches: DATs, artwork, game details (writable; may be emptied) |
 | `TEXEL_WEB` | `/usr/share/texel/web` | Built web app |
