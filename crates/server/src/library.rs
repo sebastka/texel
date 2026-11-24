@@ -50,7 +50,10 @@ pub struct Root {
 pub struct Bios {
     pub id: String,
     pub console: Console,
+    /// The image, or the zip holding it.
     pub path: PathBuf,
+    /// In a zip: the image's name in it.
+    pub entry: Option<String>,
     /// Path relative to the library, for display.
     pub file: String,
     pub sha1: String,
@@ -222,23 +225,19 @@ fn scan_bios(console: Console, dir: &Path) -> Vec<Bios> {
     }
     // Any layout of subdirectories (original/, psxonpsp/, openbios/...):
     // BIOSes are identified by their content.
-    let mut files = Vec::new();
-    walk(dir, &mut files, 0);
     let mut out = Vec::new();
-    for path in files {
-        // `fs::metadata` follows symbolic links, unlike `DirEntry::metadata`.
-        if std::fs::metadata(&path).map(|m| m.len()).ok() != Some(512 * 1024) {
-            continue;
-        }
-        let Ok(rom) = std::fs::read(&path) else { continue };
+    for (path, entry, rom) in bios_candidates(dir, 512 * 1024) {
+        let shown = shown_path(&path, entry.as_deref());
         let Some(info) = texel_ps1::bios::identify(&rom) else {
-            tracing::warn!(file = %path.display(), "not a PlayStation BIOS, ignored");
+            tracing::warn!(file = %shown, "not a PlayStation BIOS, ignored");
             continue;
         };
         let sha1 = hex::encode(sha1::Sha1::digest(&rom));
         let mut info = info;
         let mut commit = None;
+        // SOURCE.md describes a file next to it, not one in a zip.
         if info.variant == Some("OpenBIOS")
+            && entry.is_none()
             && let Some((build, date, hash)) = openbios_source(&path, &rom)
         {
             info.version = Some(format!("build {build}"));
@@ -248,7 +247,8 @@ fn scan_bios(console: Console, dir: &Path) -> Vec<Bios> {
         out.push(Bios {
             console: Console::Ps1,
             id: sha1[..16].to_owned(),
-            file: rel_path("bios", dir, &path),
+            file: rel_with_entry(rel_path("bios", dir, &path), entry.as_deref()),
+            entry,
             path,
             sha1,
             version: info.version,
@@ -262,24 +262,23 @@ fn scan_bios(console: Console, dir: &Path) -> Vec<Bios> {
 }
 
 fn scan_ps2_bios(dir: &Path) -> Vec<Bios> {
-    let mut files = Vec::new();
-    walk(dir, &mut files, 0);
     let mut out = Vec::new();
-    for path in files {
-        if std::fs::metadata(&path).map(|m| m.len()).ok() != Some(texel_ps2::bios::BIOS_SIZE as u64) {
-            continue;
-        }
-        let Ok(rom) = std::fs::read(&path) else { continue };
+    for (path, entry, rom) in bios_candidates(dir, texel_ps2::bios::BIOS_SIZE as u64) {
         let Some(info) = texel_ps2::bios::identify(&rom) else {
-            tracing::warn!(file = %path.display(), "not a PlayStation 2 BIOS, ignored");
+            tracing::warn!(file = %shown_path(&path, entry.as_deref()), "not a PlayStation 2 BIOS, ignored");
             continue;
         };
         let sha1 = hex::encode(sha1::Sha1::digest(&rom));
-        let open = openps2bios_source(&path, &rom);
+        let open = if entry.is_none() {
+            openps2bios_source(&path, &rom)
+        } else {
+            None
+        };
         out.push(Bios {
             console: Console::Ps2,
             id: sha1[..16].to_owned(),
-            file: rel_path("ps2/bios", dir, &path),
+            file: rel_with_entry(rel_path("ps2/bios", dir, &path), entry.as_deref()),
+            entry,
             path,
             sha1,
             version: Some(info.version),
@@ -290,6 +289,76 @@ fn scan_ps2_bios(dir: &Path) -> Vec<Bios> {
         });
     }
     out
+}
+
+/// The files under `dir` of `size` bytes, and the entries of that size in
+/// its zips: (file, entry in the zip, content). Unreadable zips are skipped.
+fn bios_candidates(dir: &Path, size: u64) -> Vec<(PathBuf, Option<String>, Vec<u8>)> {
+    let mut files = Vec::new();
+    walk(dir, &mut files, 0);
+    let mut out = Vec::new();
+    for path in files {
+        if extension(&path) == "zip" {
+            match zipped_of_size(&path, size) {
+                Ok(found) => out.extend(found.into_iter().map(|(name, rom)| (path.clone(), Some(name), rom))),
+                Err(e) => tracing::warn!(file = %path.display(), error = %e, "unreadable zip, ignored"),
+            }
+            continue;
+        }
+        // `fs::metadata` follows symbolic links, unlike `DirEntry::metadata`.
+        if std::fs::metadata(&path).map(|m| m.len()).ok() != Some(size) {
+            continue;
+        }
+        if let Ok(rom) = std::fs::read(&path) {
+            out.push((path, None, rom));
+        }
+    }
+    out
+}
+
+/// A zip's entries of `size` bytes, decompressed: (name, content).
+fn zipped_of_size(path: &Path, size: u64) -> anyhow::Result<Vec<(String, Vec<u8>)>> {
+    let mut archive = zip::ZipArchive::new(std::fs::File::open(path)?)?;
+    let mut out = Vec::new();
+    for i in 0..archive.len() {
+        let mut f = archive.by_index(i)?;
+        if f.is_dir() || f.size() != size {
+            continue;
+        }
+        let name = f.name()?.into_owned();
+        let mut rom = Vec::with_capacity(size as usize);
+        std::io::Read::read_to_end(&mut f, &mut rom)?;
+        out.push((name, rom));
+    }
+    Ok(out)
+}
+
+/// A BIOS image's content: the file, or its entry in a zip. Blocking.
+pub fn read_bios(b: &Bios) -> anyhow::Result<Vec<u8>> {
+    match &b.entry {
+        None => Ok(std::fs::read(&b.path)?),
+        Some(name) => {
+            let mut archive = zip::ZipArchive::new(std::fs::File::open(&b.path)?)?;
+            let mut f = archive.by_name(name)?;
+            let mut rom = Vec::with_capacity(usize::try_from(f.size()).unwrap_or(0));
+            std::io::Read::read_to_end(&mut f, &mut rom)?;
+            Ok(rom)
+        }
+    }
+}
+
+fn shown_path(path: &Path, entry: Option<&str>) -> String {
+    match entry {
+        Some(name) => format!("{}#{name}", path.display()),
+        None => path.display().to_string(),
+    }
+}
+
+fn rel_with_entry(rel: String, entry: Option<&str>) -> String {
+    match entry {
+        Some(name) => format!("{rel}#{name}"),
+        None => rel,
+    }
 }
 
 /// Whether an image is the OpenPS2BIOS that `fetch-openbios.sh` installed,
@@ -623,6 +692,44 @@ fn make_game(console: Console, rel: String, cue: Option<String>, layout: Layout,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn zipped_bios_candidates() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!("texel-zipbios-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        let rom: Vec<u8> = (0..512 * 1024).map(|i| (i * 7 % 251) as u8).collect();
+        std::fs::write(dir.join("plain.bin"), &rom).unwrap();
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(dir.join("sub/bios.zip")).unwrap());
+        let deflated = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        zip.start_file("SCPH-1002/scph1002.bin", deflated).unwrap();
+        zip.write_all(&rom).unwrap();
+        zip.start_file("readme.txt", deflated).unwrap();
+        zip.write_all(b"not a BIOS").unwrap();
+        zip.finish().unwrap();
+        let mut found = bios_candidates(&dir, 512 * 1024);
+        found.sort_by(|a, b| a.1.cmp(&b.1));
+        assert_eq!(found.len(), 2);
+        assert_eq!(found[0].1, None);
+        assert_eq!(found[1].1.as_deref(), Some("SCPH-1002/scph1002.bin"));
+        assert!(found[1].2 == rom);
+        let b = Bios {
+            id: String::new(),
+            console: Console::Ps1,
+            path: found[1].0.clone(),
+            entry: found[1].1.clone(),
+            file: rel_with_entry("bios/sub/bios.zip".to_owned(), found[1].1.as_deref()),
+            sha1: String::new(),
+            version: None,
+            date: None,
+            region: "",
+            variant: None,
+            commit: None,
+        };
+        assert_eq!(b.file, "bios/sub/bios.zip#SCPH-1002/scph1002.bin");
+        assert!(read_bios(&b).unwrap() == rom);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn openbios_source_is_read_only_when_it_matches() {
