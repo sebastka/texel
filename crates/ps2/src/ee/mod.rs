@@ -833,11 +833,11 @@ impl Ee {
                             bus.vu0.reset();
                         }
                         if v & 0x200 != 0 {
-                            bus.vu1q.reset();
+                            bus.vu1q.feed(&mut bus.vu1).reset();
                         }
                     }
                     // CMSAR1: starts VU1 there.
-                    31 => bus.vu1q.start_at(v & 0xFFFF),
+                    31 => bus.vu1q.feed(&mut bus.vu1).start_at(v & 0xFFFF),
                     _ => bus.vu0.set_control(rd, v),
                 }
             }

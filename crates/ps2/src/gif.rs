@@ -137,6 +137,31 @@ impl Gif {
         }
     }
 
+    /// How many quadwords an XGKICK at `addr` sends, from a path between
+    /// packets: up to the end of the first packet marked last (EOP), at
+    /// most `limit`.
+    fn packets_len(vu: &Vu, addr: u32, limit: u32) -> u32 {
+        let mut n: u32 = 0;
+        while n < limit {
+            let w = vu.read_q(addr.wrapping_add(n));
+            let lo = u64::from(w[0]) | u64::from(w[1]) << 32;
+            let nloop = (lo & 0x7FFF) as u32;
+            let nreg = match ((lo >> 60) & 15) as u32 {
+                0 => 16,
+                r => r,
+            };
+            n += 1 + match (lo >> 58) & 3 {
+                0 => nloop * nreg,
+                1 => (nloop * nreg).div_ceil(2),
+                _ => nloop,
+            };
+            if lo & 0x8000 != 0 {
+                break;
+            }
+        }
+        n.min(limit)
+    }
+
     /// An XGKICK's packet has ended: path 1 starts afresh.
     pub fn end_kick(&mut self) {
         self.paths[0] = Path::default();
@@ -199,8 +224,29 @@ impl Gif {
     /// the end of a packet marked as the last (EOP).
     /// Sends the packet at `addr` of VU1's memory: returns its quadwords.
     pub fn kick_path1(&mut self, vu: &Vu, addr: u32, gs: &mut Gs) -> u32 {
+        let limit = vu.data.len() as u32 / 16 * 4;
+        if self.capture.is_some() && self.paths[0].nloop == 0 {
+            // Recording: the packets' lengths from their tags alone, then
+            // their bytes in one go (as many quadwords as the loop below
+            // would take).
+            let n = Self::packets_len(vu, addr, limit);
+            let qwords = vu.data.len() as u32 / 16;
+            let c = self.capture.as_mut().expect("recording");
+            let mut left = n;
+            let mut at = addr % qwords;
+            while left > 0 {
+                let k = left.min(qwords - at);
+                c.path_bytes(0, &vu.data[at as usize * 16..(at + k) as usize * 16]);
+                left -= k;
+                at = (at + k) % qwords;
+            }
+            c.kick_end();
+            self.qwords[0] += u64::from(n);
+            self.end_kick();
+            return n;
+        }
         let mut a = addr;
-        for _ in 0..vu.data.len() / 16 * 4 {
+        for _ in 0..limit {
             let w = vu.read_q(a);
             a = a.wrapping_add(1);
             let q = w
@@ -224,6 +270,49 @@ impl Gif {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Recording an XGKICK reads only the tags: the same quadwords as
+    /// sending them one by one.
+    #[test]
+    fn recorded_kick_lengths() {
+        let tag = |nloop: u128, eop: bool, format: u128, nreg: u128| {
+            nloop | u128::from(eop) << 15 | format << 58 | nreg << 60 | 0x1111_1111_1111_1111u128 << 64
+        };
+        let packets = [
+            tag(2, false, 0, 3),
+            tag(3, false, 1, 3),
+            tag(0, false, 2, 0),
+            tag(4, false, 2, 1),
+            tag(1, true, 0, 0),
+        ];
+        let mut vu = Vu::new(1);
+        let qwords = (vu.data.len() / 16) as u32;
+        for start in [0x10, qwords - 7] {
+            let mut at = start;
+            let mut put = |q: u128| {
+                let a = (at % qwords) as usize * 16;
+                vu.data[a..a + 16].copy_from_slice(&q.to_le_bytes());
+                at += 1;
+            };
+            for (k, &t) in packets.iter().enumerate() {
+                put(t);
+                let data = [6, 5, 0, 4, 16][k];
+                for d in 0..data {
+                    put(0x10 + d);
+                }
+            }
+            let mut gs = Gs::default();
+            let mut sent = Gif::default();
+            let n = sent.kick_path1(&vu, start, &mut gs);
+            let mut recorded = Gif {
+                capture: Some(crate::vu1q::Stream::default()),
+                ..Gif::default()
+            };
+            assert_eq!(recorded.kick_path1(&vu, start, &mut gs), n);
+            assert_eq!(n, 5 + 6 + 5 + 4 + 16);
+            assert!(recorded.idle(0));
+        }
+    }
 
     #[test]
     fn packed_sprite() {

@@ -9,7 +9,9 @@
 //! A VIF reaches its VU through a `VuSink`: VIF0 acts on VU0 at once
 //! (`Direct`), VIF1 queues for VU1 (`vu1q`), which runs when what it owns
 //! is needed. The VIF never reads VU memory: a masked UNPACK writes the
-//! lanes it sets only.
+//! lanes it sets only. With VU1 elsewhere, VIF1's words go there too, to a
+//! VIF1 of its own: this one keeps only its registers and counts, its
+//! UNPACKs reading no values unless they change its registers (MODE 2).
 
 use crate::gif::Gif;
 use crate::gs::Gs;
@@ -27,6 +29,11 @@ pub trait VuSink {
     fn start(&mut self, pc: Option<u32>, itop: u16, top: Option<u16>);
     /// A DIRECT quadword, to the GIF's path 2.
     fn direct(&mut self, q: u128);
+    /// Whether UNPACK's values are wanted (else the VIF only counts its
+    /// vectors: another VIF writes them).
+    fn values(&self) -> bool {
+        true
+    }
 }
 
 /// Acting on a VU at once.
@@ -164,15 +171,21 @@ impl Vif {
     /// for the next vector, or padding after the last vector).
     fn unpack_words(&mut self, words: &[u32], vu: &mut impl VuSink) -> usize {
         let (elements, bits) = self.format();
-        // V4-5, rare (and the undefined 4-bit formats): word by word.
-        if !matches!(bits, 8 | 16 | 32) {
-            return 0;
-        }
-        let signed = self.code & (1 << 14) == 0;
-        let at = match bits {
-            32 => self.unpack_run::<32>(words, elements, signed, vu),
-            16 => self.unpack_run::<16>(words, elements, signed, vu),
-            _ => self.unpack_run::<8>(words, elements, signed, vu),
+        let at = if !vu.values() && self.mode != 2 {
+            // The vectors counted only.
+            let size = if bits == 5 { 2 } else { (elements * bits / 8) as usize };
+            self.unpack_skip(words.len() * 4, size)
+        } else {
+            // V4-5, rare (and the undefined 4-bit formats): word by word.
+            if !matches!(bits, 8 | 16 | 32) {
+                return 0;
+            }
+            let signed = self.code & (1 << 14) == 0;
+            match bits {
+                32 => self.unpack_run::<32>(words, elements, signed, vu),
+                16 => self.unpack_run::<16>(words, elements, signed, vu),
+                _ => self.unpack_run::<8>(words, elements, signed, vu),
+            }
         };
         let byte = |b: usize| (words[b / 4] >> (8 * (b % 4))) as u8;
         let used = at.div_ceil(4);
@@ -425,6 +438,25 @@ impl Vif {
             };
             self.write_vector(values, vu);
             at += size;
+        }
+        at
+    }
+
+    /// `unpack_words`' vectors, counted, not read: of `total` bytes, those
+    /// they use (`size` a vector).
+    fn unpack_skip(&mut self, total: usize, size: usize) -> usize {
+        let mut at = 0;
+        while let Pending::Unpack(n) = self.pending
+            && n > 0
+        {
+            if self.needs_data() {
+                if at + size > total {
+                    break;
+                }
+                at += size;
+            }
+            self.written += 1;
+            self.pending = Pending::Unpack(n - 1);
         }
         at
     }

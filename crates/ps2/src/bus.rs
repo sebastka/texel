@@ -167,10 +167,9 @@ impl Bus {
         self.code_lines = vec![0; RAM_SIZE / CODE_LINE / 64].into_boxed_slice();
         self.iop.transplant(&mut old.iop);
         self.gs.rendering = old.gs.rendering;
-        // VU1 elsewhere: it goes on from the new state.
-        if let Some(b) = old.vu1q.take_backend() {
-            self.vu1q.set_backend(Some(b), &self.vu1, &self.gif);
-        }
+        // VU1 (elsewhere, or here) goes on from the new state.
+        let backend = old.vu1q.take_backend();
+        self.vu1q.set_backend(backend, &self.vu1, &self.gif, &self.vif1);
     }
 
     pub fn new(bios: &[u8]) -> Self {
@@ -454,7 +453,7 @@ impl Bus {
                             gs: &mut self.gs,
                         },
                     ),
-                    0x5000 => self.vif1.write(&words, &mut self.vu1q),
+                    0x5000 => self.vu1q.vif1(&mut self.vif1, &mut self.vu1, &words),
                     _ => {
                         self.sync_vu1(Why::Gif);
                         self.gif.write(2, value, &mut self.gs);
@@ -812,7 +811,7 @@ impl Bus {
                     gs: &mut self.gs,
                 },
             ),
-            1 => self.vif1.write(words, &mut self.vu1q),
+            1 => self.vu1q.vif1(&mut self.vif1, &mut self.vu1, words),
             2 => {
                 self.sync_vu1(Why::Gif);
                 self.gif.write(2, q, &mut self.gs);
