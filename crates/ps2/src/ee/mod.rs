@@ -58,6 +58,10 @@ pub struct Ee {
     /// the EE is found polling it (see `note_poll`).
     poll: (u32, u32),
     pub(crate) polling: bool,
+    /// An interrupt waits for the next read of INTC_STAT: the EE stops
+    /// right after it (as when polling), and the interrupt is taken there.
+    #[serde(skip)]
+    pub(crate) intc_watch: bool,
     /// Compiles code to WebAssembly (in browsers), when set.
     #[serde(skip)]
     pub jit: Option<Box<jit::Jit>>,
@@ -117,6 +121,7 @@ impl Ee {
             counted: 0,
             poll: (0, 0),
             polling: false,
+            intc_watch: false,
             idle: None,
             unimplemented: BTreeMap::new(),
             trace: std::collections::VecDeque::new(),
@@ -623,6 +628,9 @@ impl Ee {
         let v = bus.read32(pa);
         if pa == crate::bus::INTC_STAT {
             self.note_poll(v);
+            if std::mem::take(&mut self.intc_watch) {
+                self.polling = true;
+            }
         }
         Some(v)
     }
