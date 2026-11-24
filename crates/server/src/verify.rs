@@ -33,9 +33,17 @@ impl HashCache {
     }
 }
 
+/// Hashes a file, read once: what it read is not kept in the page cache.
 fn sha1_file(f: &GameFile) -> anyhow::Result<String> {
+    let hash = hash_file(f);
+    crate::pagecache::drop_path(&f.path);
+    hash
+}
+
+fn hash_file(f: &GameFile) -> anyhow::Result<String> {
     let mut hasher = sha1::Sha1::new();
     let mut buf = vec![0u8; 1 << 20];
+    let mut unpaged = 0u64;
     if f.virt.is_none() {
         let mut file = std::fs::File::open(&f.path)?;
         loop {
@@ -44,6 +52,11 @@ fn sha1_file(f: &GameFile) -> anyhow::Result<String> {
                 break;
             }
             hasher.update(&buf[..n]);
+            unpaged += n as u64;
+            if unpaged >= crate::pagecache::STEP {
+                crate::pagecache::drop(&file);
+                unpaged = 0;
+            }
         }
     } else {
         // Tracks inside CHD/PBP containers: hash the decompressed data.
@@ -54,6 +67,11 @@ fn sha1_file(f: &GameFile) -> anyhow::Result<String> {
             read_file(&mut cache, f, offset, &mut buf[..n])?;
             hasher.update(&buf[..n]);
             offset += n as u64;
+            unpaged += n as u64;
+            if unpaged >= crate::pagecache::STEP {
+                crate::pagecache::drop_path(&f.path);
+                unpaged = 0;
+            }
         }
     }
     Ok(hex::encode(hasher.finalize()))

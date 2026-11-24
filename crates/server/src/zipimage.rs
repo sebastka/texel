@@ -158,15 +158,17 @@ pub fn ensure_index(zip: &Path, entry: &ZipEntry) -> anyhow::Result<bool> {
     tracing::info!(zip = %zip.display(), "building a zipped image's seek index (once)");
     let started = std::time::Instant::now();
     let mut file = File::open(zip)?;
-    build_index(
+    let built = build_index(
         &mut file,
         entry.data_start,
         entry.compressed,
         entry.size,
         entry.crc,
         index,
-    )
-    .with_context(|| format!("indexing {}", zip.display()))?;
+    );
+    // Read once: not kept in the page cache.
+    crate::pagecache::drop(&file);
+    built.with_context(|| format!("indexing {}", zip.display()))?;
     tracing::info!(zip = %zip.display(), seconds = started.elapsed().as_secs(), "seek index built");
     Ok(true)
 }
@@ -288,12 +290,18 @@ fn build_index(file: &mut File, start: u64, compressed: u64, size: u64, crc: u32
     // Each point's window is compressed as it is recorded: (out, input,
     // bits, the window's length, compressed).
     let mut points: Vec<(u64, u64, u8, u32, Vec<u8>)> = vec![(0, 0, 0, 0, deflate(&[])?)];
+    let mut unpaged = 0u64;
     loop {
         if in_pos == in_len && left > 0 {
             let n = (CHUNK as u64).min(left) as usize;
             file.read_exact(&mut input[..n])?;
             (in_pos, in_len) = (0, n);
             left -= n as u64;
+            unpaged += n as u64;
+            if unpaged >= crate::pagecache::STEP {
+                crate::pagecache::drop(file);
+                unpaged = 0;
+            }
         }
         if at == WINDOW {
             at = 0;

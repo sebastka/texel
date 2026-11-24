@@ -13,6 +13,7 @@ mod metadata;
 mod netplay;
 mod openbios;
 mod overrides;
+mod pagecache;
 mod state;
 mod verify;
 mod zipimage;
