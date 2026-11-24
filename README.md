@@ -22,7 +22,7 @@ Boots the BIOS shell and commercial games (tested: Rayman, Gran Turismo) at full
 | Memory cards | Each user's own, named, per console, saved in the database: chosen before a game starts (two slots; the game's last ones preselected), created, renamed and deleted on the Memory cards page, which lists their saves (titles, PlayStation icons) and deletes, copies or moves them between cards, PlayStation and PS2; a console started without a disc (Start the console, on the BIOS page) gets chosen cards too, to manage their saves in its BIOS, or blank ones |
 | Save states | Per user: 4 slots per disc, with screenshots and the BIOS they need, saved in the database; each game remembers the BIOS it was last started with |
 | Netplay | Rooms of up to 8 people with a chat: everyone runs the game in step, exchanging controller input through the server; a room lasts the session, beside the pages: the games its host starts are the room's, and another member with an account takes over when the host leaves |
-| Disc images | CUE/BIN (any number of files), ISO, single BIN, CHD, PBP (unencrypted) |
+| Disc images | CUE/BIN (any number of files), ISO, single BIN, CHD, PBP (unencrypted), any of these zipped |
 | Missing | Cycle-accurate timing (DMA and CD-ROM delays are approximate, GPU drawing time is modelled per pixel), SPU Gaussian interpolation, multitap, mouse, light guns, serial port 1, encrypted PBPs |
 
 ## Library layout
@@ -49,6 +49,7 @@ library/
 │       │   └── disc.yaml           # optional: where to find the game's details
 │       ├── Some Game.iso           # or a single ISO / BIN
 │       ├── Another Game.chd        # MAME CHD (`chdman createcd`, in the dev shell)
+│       ├── A Zipped Game.zip       # an ISO, or a CUE sheet and its BINs, zipped (stored or deflated)
 │       └── A PSP Conversion.pbp    # PS1 games converted for the PSP (not encrypted ones)
 └── ps2/                            # PlayStation 2: listed and verified; its emulator is in progress
     ├── bios/
@@ -57,7 +58,7 @@ library/
 
 Each of the four directories can also be set on its own (`TEXEL_PS1_BIOS`, `TEXEL_PS1_GAMES`, `TEXEL_PS2_BIOS`, `TEXEL_PS2_GAMES`, see Configuration), for example to keep games on another volume. PlayStation 2 games and BIOSes are listed, identified and verified like PlayStation ones (with Redump's and libretro's PS2 DATs and thumbnails); PS2 games start, but their emulator is in progress (see below).
 
-CHD and PBP images are decompressed by the server, which presents their tracks as BIN files; they are identified and verified against Redump like the others. Symbolic links are followed. Multi-disc games are recognised by their Redump names ("Disc 1", "Disc 2"…): they show as one game, share their settings (BIOS, memory cards), and the player can change discs.
+CHD and PBP images are decompressed by the server, which presents their tracks as BIN files; they are identified and verified against Redump like the others. Zipped images are read in the zip, without unpacking it: a deflated image is indexed once (the first scan that finds it decompresses it whole, a few seconds per GB, and keeps a seek index of about 1% of its size in the state directory's `cache/zip-index`), then read from the closest indexed point (a few milliseconds per seek). Deflate64 zips (Windows' for very large files) are not read: zip them again, or convert them to CHD, which compresses discs better. Symbolic links are followed. Multi-disc games are recognised by their Redump names ("Disc 1", "Disc 2"…): they show as one game, share their settings (BIOS, memory cards), and the player can change discs.
 
 BIOS images are identified by their content, wherever they are under `bios/`: by their version string and Redump's BIOS DAT. Two region-free BIOSes are known too: the PSP firmware 6.60 PS1 emulator BIOS (`psxonpsp660.bin`, which Redump does not list; the default for games of regions without a BIOS of their own), and [OpenBIOS](https://github.com/pcsx-redux/nugget/tree/main/openbios), PCSX-Redux's open-source replacement (MIT), which needs no dump from a console. OpenBIOS images carry no version; when a `SOURCE.md` next to one lists its SHA-256 (as a fetch script may write it), the server shows its build number, date and PCSX-Redux commit from there. [docs/ps1-bios.md](docs/ps1-bios.md) describes the BIOS versions, which ones to use, and their checksums.
 

@@ -1,7 +1,8 @@
-//! Compressed disc images: CHD (MAME; CDs and DVDs) and PBP (PS1 games
-//! converted for the PSP). The server decompresses them and presents their
-//! tracks as plain BIN files (a DVD as one ISO file) with a generated CUE
-//! sheet, so the browser handles every format the same way.
+//! Compressed disc images: CHD (MAME; CDs and DVDs), PBP (PS1 games
+//! converted for the PSP), and images in zips (`zipimage`). The server
+//! decompresses them and presents their tracks as plain BIN files (a DVD as
+//! one ISO file) with a CUE sheet, so the browser handles every format the
+//! same way.
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -10,11 +11,12 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail, ensure};
 
-/// A track (CHD) or disc (PBP) presented as a file.
+/// A track (CHD), disc (PBP) or zipped image presented as a file.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Virtual {
     Chd(ChdTrack),
     Pbp(PbpDisc),
+    Zip(crate::zipimage::ZipEntry),
 }
 
 impl Virtual {
@@ -22,6 +24,7 @@ impl Virtual {
         match self {
             Self::Chd(t) => u64::from(t.frames) * u64::from(t.data_size),
             Self::Pbp(d) => u64::from(d.sectors) * 2352,
+            Self::Zip(e) => e.size,
         }
     }
 }
@@ -354,9 +357,11 @@ impl PbpHandle {
 enum Handle {
     Chd(Box<ChdHandle>),
     Pbp(PbpHandle),
+    Zip(crate::zipimage::ZipHandle),
 }
 
-/// Open containers, reused across reads (opening a CHD reads its whole map).
+/// Open containers, reused across reads (opening a CHD reads its whole map;
+/// a zip's decompressor goes on from one read to the next).
 #[derive(Default)]
 pub struct Cache {
     open: HashMap<PathBuf, Handle>,
@@ -386,12 +391,14 @@ impl Cache {
                     block: Vec::new(),
                     block_key: None,
                 }),
+                Virtual::Zip(_) => Handle::Zip(crate::zipimage::ZipHandle::open(path)?),
             };
             self.open.insert(path.to_owned(), handle);
         }
         match (self.open.get_mut(path), v) {
             (Some(Handle::Chd(h)), Virtual::Chd(t)) => h.read(t, offset, buf),
             (Some(Handle::Pbp(h)), Virtual::Pbp(d)) => h.read(d, offset, buf),
+            (Some(Handle::Zip(h)), Virtual::Zip(e)) => h.read(e, offset, buf),
             _ => bail!("{} changed format", path.display()),
         }
     }

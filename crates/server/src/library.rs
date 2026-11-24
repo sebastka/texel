@@ -197,14 +197,15 @@ fn mtime(meta: &std::fs::Metadata) -> u64 {
 }
 
 /// Scans the BIOS and game directories of each console. Blocking.
-pub fn scan(roots: &[Root]) -> Library {
+/// `index_dir`: where zipped images' seek indexes are kept (see `zipimage`).
+pub fn scan(roots: &[Root], index_dir: &Path) -> Library {
     let mut lib = Library {
         bios: Vec::new(),
         games: Vec::new(),
     };
     for root in roots {
         lib.bios.extend(scan_bios(root.console, &root.bios));
-        lib.games.extend(scan_games(root.console, &root.games));
+        lib.games.extend(scan_games(root.console, &root.games, index_dir));
     }
     lib.bios.sort_by(|a, b| a.file.cmp(&b.file));
     lib.games.sort_by(|a, b| a.rel.cmp(&b.rel));
@@ -361,7 +362,7 @@ fn resolve(dir: &Path, name: &str) -> Option<PathBuf> {
         .map(|e| e.path())
 }
 
-fn scan_games(console: Console, dir: &Path) -> Vec<Game> {
+fn scan_games(console: Console, dir: &Path, index_dir: &Path) -> Vec<Game> {
     if !dir.is_dir() {
         tracing::warn!(console = console.name(), dir = %dir.display(), "no game directory");
         return Vec::new();
@@ -474,6 +475,65 @@ fn scan_games(console: Console, dir: &Path) -> Vec<Game> {
                 Ok(layout) => games.push(make_game(console, game_rel, Some(disc.cue), layout, game_files)),
                 Err(e) => tracing::warn!(file = %path.display(), error = %e, "bad generated CUE sheet"),
             }
+        }
+    }
+    // Zips: their images (with their CUE sheets, if any) become virtual
+    // files, read without unpacking the zip.
+    for path in files.iter().filter(|p| extension(p) == "zip") {
+        let Ok(meta) = path.metadata() else { continue };
+        let rel = rel_path(kind, dir, path);
+        let listing = match crate::zipimage::list(path, index_dir) {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::warn!(file = %path.display(), error = %e, "unreadable zip, ignored");
+                continue;
+            }
+        };
+        let file_of = |name: &str, entry: &crate::zipimage::ZipEntry| GameFile {
+            name: name.to_owned(),
+            rel: format!("{rel}#{name}"),
+            path: path.clone(),
+            size: entry.size,
+            mtime: mtime(&meta),
+            virt: Some(images::Virtual::Zip(entry.clone())),
+        };
+        let find = |name: &str| listing.images.iter().find(|(n, _)| n.eq_ignore_ascii_case(name));
+        let mut found = Vec::new();
+        let mut used_entries: HashSet<String> = HashSet::new();
+        for (cue_name, text) in &listing.cues {
+            match parse_cue(text, |n| find(n).map(|(_, e)| e.size)) {
+                Ok(layout) => {
+                    let game_files: Vec<GameFile> = layout
+                        .files
+                        .iter()
+                        .filter_map(|n| {
+                            let (name, entry) = find(n)?;
+                            used_entries.insert(name.clone());
+                            Some(GameFile {
+                                name: n.clone(),
+                                ..file_of(name, entry)
+                            })
+                        })
+                        .collect();
+                    found.push((cue_name.clone(), Some(text.clone()), layout, game_files));
+                }
+                Err(e) => {
+                    tracing::warn!(file = %path.display(), cue = %cue_name, error = %e, "invalid CUE sheet in a zip, ignored")
+                }
+            }
+        }
+        for (name, entry) in &listing.images {
+            if used_entries.contains(name) {
+                continue;
+            }
+            if let Some(layout) = Layout::single_file(name, entry.size) {
+                found.push((name.clone(), None, layout, vec![file_of(name, entry)]));
+            }
+        }
+        let multi = found.len() > 1;
+        for (name, cue, layout, game_files) in found {
+            let game_rel = if multi { format!("{rel}#{name}") } else { rel.clone() };
+            games.push(make_game(console, game_rel, cue, layout, game_files));
         }
     }
     // A protected disc's subchannel data, named like its image:
