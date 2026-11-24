@@ -1,5 +1,6 @@
-//! DAT files, for each console: Redump's game (XML) and BIOS (clrmamepro)
-//! DATs, and libretro's Redump-derived DAT, which adds serial numbers.
+//! DAT files, for each console: Redump's game and BIOS DATs (XML), its CUE
+//! sheets and (PS1) SBI files, from redump.info, and libretro's
+//! Redump-derived DAT, which adds serial numbers.
 
 use std::collections::HashMap;
 use std::io::Read;
@@ -8,38 +9,46 @@ use anyhow::Context;
 
 use crate::library::Console;
 
-/// Where a console's DATs come from, and the files they are cached in.
+/// Where a console's files come from, and the files they are cached in.
 pub struct Sources {
+    /// Redump's game DAT (a zip holding it; cached unzipped).
     pub games_url: &'static str,
     pub games_file: &'static str,
     pub serials_url: &'static str,
     pub serials_file: &'static str,
+    /// Redump's BIOS DAT (XML).
     pub bios_url: &'static str,
     pub bios_file: &'static str,
-    /// Redump's BIOS DATs no longer change: pinned.
-    pub bios_sha256: &'static str,
+    /// Redump's CUE sheets (a zip, kept as it is).
+    pub cues_url: &'static str,
+    pub cues_file: &'static str,
+    /// Redump's SBI files (a zip, kept as it is): PS1 discs only.
+    pub sbi: Option<(&'static str, &'static str)>,
 }
 
 pub fn sources(console: Console) -> &'static Sources {
     match console {
         Console::Ps1 => &Sources {
-            games_url: "http://redump.org/datfile/psx/",
+            games_url: "https://redump.info/datfile/PSX",
             games_file: "redump-psx.dat",
             serials_url: "https://raw.githubusercontent.com/libretro/libretro-database/master/metadat/redump/Sony%20-%20PlayStation.dat",
             serials_file: "libretro-psx.dat",
-            bios_url: "http://redump.org/datfile/psx-bios/",
+            bios_url: "https://redump.info/bios/PSX",
             bios_file: "redump-psx-bios.dat",
-            // Unchanged since 2016-10-21.
-            bios_sha256: "8a7c3d6819b636a0d642d975a0156094ea5ff12d4777f70c45792a2286ac3de0",
+            cues_url: "https://redump.info/cues/PSX",
+            cues_file: "redump-psx-cues.zip",
+            sbi: Some(("https://redump.info/sbi/PSX", "redump-psx-sbi.zip")),
         },
         Console::Ps2 => &Sources {
-            games_url: "http://redump.org/datfile/ps2/",
+            games_url: "https://redump.info/datfile/PS2",
             games_file: "redump-ps2.dat",
             serials_url: "https://raw.githubusercontent.com/libretro/libretro-database/master/metadat/redump/Sony%20-%20PlayStation%202.dat",
             serials_file: "libretro-ps2.dat",
-            bios_url: "http://redump.org/datfile/ps2-bios/",
+            bios_url: "https://redump.info/bios/PS2",
             bios_file: "redump-ps2-bios.dat",
-            bios_sha256: "7d9ca6fd4e238e3fcbe9564fd57f4f30b4c400355de02ac189166ccaabdd03f4",
+            cues_url: "https://redump.info/cues/PS2",
+            cues_file: "redump-ps2-cues.zip",
+            sbi: None,
         },
     }
 }
@@ -95,6 +104,22 @@ pub struct Dats {
     serials: HashMap<String, Vec<SerialEntry>>,
     /// BIOS SHA-1 → description, e.g. "SCPH-1002/DTL-H1002 (Version 2.0 05/10/95 E)".
     pub bios: HashMap<String, String>,
+    /// Redump's SBI files: Redump name → content (a few hundred bytes each).
+    pub sbi: HashMap<String, std::sync::Arc<Vec<u8>>>,
+    /// Redump's CUE sheets: Redump name → text.
+    pub cues: HashMap<String, String>,
+    /// A track's Redump file name (lower case) → its game.
+    by_bin: HashMap<String, usize>,
+}
+
+/// Redump's CUE sheet for BIN files found without one (`Dats::match_cues`):
+/// the game's Redump name, the sheet with the files' own names, and the
+/// files (indices into those given) in the sheet's order.
+#[derive(Debug, PartialEq, Eq)]
+pub struct CueMatch {
+    pub name: String,
+    pub cue: String,
+    pub files: Vec<usize>,
 }
 
 struct SerialEntry {
@@ -111,6 +136,9 @@ impl Dats {
         };
         for (i, g) in d.games.iter().enumerate() {
             d.by_name.insert(g.name.clone(), i);
+            for rom in g.bins() {
+                d.by_bin.insert(rom.name.to_lowercase(), i);
+            }
             let mut sizes: Vec<u64> = g.bins().map(|r| r.size).collect();
             sizes.sort_unstable();
             d.by_sizes.entry(sizes).or_default().push(i);
@@ -137,6 +165,91 @@ impl Dats {
             }
         }
         d
+    }
+
+    /// Redump's CUE sheets for BIN files without one, of a directory or a
+    /// zip (name, size): first by the files' names, when they are Redump's
+    /// (every track of a game there); then, for the files left, by their
+    /// sizes, when they are every track of one game only (two tracks or
+    /// more: one file's size alone says too little). A track goes to the
+    /// file of its size (equal sizes, in the files' order), and the sheet
+    /// names the files as they are. The hashes, later, verify the match.
+    pub fn match_cues(&self, files: &[(String, u64)]) -> Vec<CueMatch> {
+        let mut out = Vec::new();
+        let mut taken = vec![false; files.len()];
+        let mut by_game: std::collections::BTreeMap<usize, Vec<usize>> = std::collections::BTreeMap::new();
+        for (k, (name, _)) in files.iter().enumerate() {
+            if let Some(&g) = self.by_bin.get(&name.to_lowercase()) {
+                by_game.entry(g).or_default().push(k);
+            }
+        }
+        for (g, found) in by_game {
+            let game = &self.games[g];
+            let order: Option<Vec<usize>> = game
+                .bins()
+                .map(|rom| {
+                    found
+                        .iter()
+                        .copied()
+                        .find(|&k| files[k].0.eq_ignore_ascii_case(&rom.name))
+                })
+                .collect();
+            if let Some(order) = order
+                && let Some(m) = self.cue_match(game, &order, files)
+            {
+                for &k in &order {
+                    taken[k] = true;
+                }
+                out.push(m);
+            }
+        }
+        let rest: Vec<usize> = (0..files.len()).filter(|&k| !taken[k]).collect();
+        if rest.len() >= 2 {
+            let mut sizes: Vec<u64> = rest.iter().map(|&k| files[k].1).collect();
+            sizes.sort_unstable();
+            let candidates: Vec<&DatGame> = self
+                .by_sizes
+                .get(&sizes)
+                .into_iter()
+                .flatten()
+                .map(|&g| &self.games[g])
+                .filter(|g| self.cues.contains_key(&g.name))
+                .collect();
+            if let [game] = candidates[..] {
+                let mut left = rest.clone();
+                left.sort_by(|&a, &b| files[a].0.cmp(&files[b].0));
+                let order: Option<Vec<usize>> = game
+                    .bins()
+                    .map(|rom| {
+                        let at = left.iter().position(|&k| files[k].1 == rom.size)?;
+                        Some(left.remove(at))
+                    })
+                    .collect();
+                if let Some(order) = order
+                    && let Some(m) = self.cue_match(game, &order, files)
+                {
+                    out.push(m);
+                }
+            }
+        }
+        out
+    }
+
+    /// `game`'s CUE sheet, its tracks renamed to `files[order[i]]`.
+    fn cue_match(&self, game: &DatGame, order: &[usize], files: &[(String, u64)]) -> Option<CueMatch> {
+        let mut cue = self.cues.get(&game.name)?.clone();
+        for (rom, &k) in game.bins().zip(order) {
+            let from = format!("\"{}\"", rom.name);
+            if !cue.contains(&from) {
+                return None;
+            }
+            cue = cue.replace(&from, &format!("\"{}\"", files[k].0));
+        }
+        Some(CueMatch {
+            name: game.name.clone(),
+            cue,
+            files: order.to_vec(),
+        })
     }
 
     pub fn game(&self, name: &str) -> Option<&DatGame> {
@@ -202,7 +315,48 @@ pub fn unzip_dat(bytes: &[u8]) -> anyhow::Result<String> {
     anyhow::bail!("no .dat in the zip")
 }
 
-/// Parses a Logiqx XML DAT (Redump's game DATs).
+/// The CUE sheets of Redump's zip: the name without `.cue` → text.
+pub fn unzip_cues(bytes: &[u8]) -> anyhow::Result<HashMap<String, String>> {
+    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).context("reading the zip")?;
+    let mut out = HashMap::new();
+    for i in 0..zip.len() {
+        let mut file = zip.by_index(i)?;
+        let full = file.name()?.into_owned();
+        let name = full.rsplit('/').next().unwrap_or(&full);
+        if let Some((stem, ext)) = name.rsplit_once('.')
+            && ext.eq_ignore_ascii_case("cue")
+        {
+            let stem = stem.to_owned();
+            let mut text = String::new();
+            file.read_to_string(&mut text)?;
+            out.insert(stem, text);
+        }
+    }
+    Ok(out)
+}
+
+/// The SBI files of Redump's zip: the name without `.sbi` → content.
+pub fn unzip_sbis(bytes: &[u8]) -> anyhow::Result<HashMap<String, std::sync::Arc<Vec<u8>>>> {
+    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).context("reading the zip")?;
+    let mut out = HashMap::new();
+    for i in 0..zip.len() {
+        let mut file = zip.by_index(i)?;
+        let full = file.name()?.into_owned();
+        let name = full.rsplit('/').next().unwrap_or(&full);
+        if let Some((stem, ext)) = name.rsplit_once('.')
+            && ext.eq_ignore_ascii_case("sbi")
+        {
+            let stem = stem.to_owned();
+            let mut data = Vec::new();
+            file.read_to_end(&mut data)?;
+            out.insert(stem, std::sync::Arc::new(data));
+        }
+    }
+    Ok(out)
+}
+
+/// Parses a Logiqx XML DAT (Redump's game and BIOS DATs: `game` or
+/// `machine` entries).
 pub fn parse_xml(xml: &str) -> anyhow::Result<Vec<DatGame>> {
     use quick_xml::XmlVersion;
     use quick_xml::events::Event;
@@ -212,7 +366,7 @@ pub fn parse_xml(xml: &str) -> anyhow::Result<Vec<DatGame>> {
     let mut in_description = false;
     loop {
         match reader.read_event().context("parsing the XML DAT")? {
-            Event::Start(e) | Event::Empty(e) if e.name().as_ref() == "game" => {
+            Event::Start(e) | Event::Empty(e) if e.name().as_ref() == "game" || e.name().as_ref() == "machine" => {
                 let mut g = DatGame::default();
                 for a in e.attributes().flatten() {
                     if a.key.as_ref() == "name" {
@@ -243,7 +397,7 @@ pub fn parse_xml(xml: &str) -> anyhow::Result<Vec<DatGame>> {
                     g.roms.push(rom);
                 }
             }
-            Event::End(e) if e.name().as_ref() == "game" => {
+            Event::End(e) if e.name().as_ref() == "game" || e.name().as_ref() == "machine" => {
                 if let Some(g) = current.take() {
                     games.push(g);
                 }
@@ -450,5 +604,102 @@ game (
         assert!(dats.identify(None, &[1]).is_none());
         assert!(dats.by_hashes(&["bb".into(), "aa".into()]).is_some());
         assert!(dats.bios["20b98f3d80f11cbf5a7bfd0779b0e63760ecc62c"].starts_with("SCPH-1002"));
+    }
+
+    #[test]
+    fn redump_bios_xml_and_sbi_zip() {
+        // redump.info's BIOS DATs: Logiqx XML, `machine` entries.
+        let xml = r#"<?xml version="1.0" encoding="utf-8"?>
+<datafile>
+	<header><name>Sony - PlayStation - BIOS Images</name></header>
+	<machine name="ps-10j">
+		<description>SCPH-1000/DTL-H1000 (Version 1.0 J)</description>
+		<rom name="ps-10j.bin" size="524288" crc="3b601fc8" sha1="343883A7B555646DA8CEE54AADD2795B6E7DD070" />
+	</machine>
+</datafile>"#;
+        let dats = Dats::new(Vec::new(), Vec::new(), parse_xml(xml).unwrap());
+        assert_eq!(
+            dats.bios["343883a7b555646da8cee54aadd2795b6e7dd070"],
+            "SCPH-1000/DTL-H1000 (Version 1.0 J)"
+        );
+        // Its SBI files: one zip, named after the discs.
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        for (name, data) in [("Ape Escape (France).sbi", &b"one"[..]), ("readme.txt", &b"no"[..])] {
+            zip.start_file(name, zip::write::SimpleFileOptions::default()).unwrap();
+            std::io::Write::write_all(&mut zip, data).unwrap();
+        }
+        let bytes = zip.finish().unwrap().into_inner();
+        let sbi = unzip_sbis(&bytes).unwrap();
+        assert_eq!(sbi.len(), 1);
+        assert_eq!(sbi["Ape Escape (France)"].as_slice(), b"one");
+    }
+
+    #[test]
+    fn cue_sheets_for_loose_bins() {
+        let rom = |name: &str, size: u64| DatRom {
+            name: name.to_owned(),
+            size,
+            sha1: String::new(),
+        };
+        let game = |name: &str, roms: Vec<DatRom>| DatGame {
+            name: name.to_owned(),
+            roms,
+            ..Default::default()
+        };
+        let mut dats = Dats::new(
+            vec![
+                game(
+                    "One (Europe)",
+                    vec![
+                        rom("One (Europe) (Track 1).bin", 100),
+                        rom("One (Europe) (Track 2).bin", 200),
+                    ],
+                ),
+                game(
+                    "Two (USA)",
+                    vec![rom("Two (USA) (Track 1).bin", 300), rom("Two (USA) (Track 2).bin", 300)],
+                ),
+                game("Three (Japan)", vec![rom("Three (Japan).bin", 500)]),
+                game("Twin A", vec![rom("A (Track 1).bin", 700), rom("A (Track 2).bin", 800)]),
+                game("Twin B", vec![rom("B (Track 1).bin", 700), rom("B (Track 2).bin", 800)]),
+            ],
+            Vec::new(),
+            Vec::new(),
+        );
+        for g in ["One (Europe)", "Two (USA)", "Three (Japan)", "Twin A", "Twin B"] {
+            let files: Vec<String> = dats
+                .game(g)
+                .unwrap()
+                .bins()
+                .map(|r| format!("FILE \"{}\" BINARY\n", r.name))
+                .collect();
+            dats.cues.insert(g.to_owned(), files.concat());
+        }
+        let files =
+            |list: &[(&str, u64)]| -> Vec<(String, u64)> { list.iter().map(|(n, s)| (n.to_string(), *s)).collect() };
+        // By Redump's names, whatever else is there.
+        let m = dats.match_cues(&files(&[
+            ("x.bin", 1),
+            ("ONE (Europe) (Track 2).bin", 200),
+            ("One (Europe) (Track 1).bin", 100),
+        ]));
+        assert_eq!(m.len(), 1);
+        assert_eq!(
+            (m[0].name.as_str(), m[0].files.as_slice()),
+            ("One (Europe)", &[2, 1][..])
+        );
+        assert!(m[0].cue.contains("FILE \"ONE (Europe) (Track 2).bin\""));
+        // By sizes: equal sizes in the files' order, the sheet renamed.
+        let m = dats.match_cues(&files(&[("b.bin", 300), ("a.bin", 300)]));
+        assert_eq!((m[0].name.as_str(), m[0].files.as_slice()), ("Two (USA)", &[1, 0][..]));
+        assert_eq!(m[0].cue, "FILE \"a.bin\" BINARY\nFILE \"b.bin\" BINARY\n");
+        // Two games of those sizes: neither; one file: not by size.
+        assert!(dats.match_cues(&files(&[("1.bin", 700), ("2.bin", 800)])).is_empty());
+        assert!(dats.match_cues(&files(&[("game.bin", 500)])).is_empty());
+        // One file named as Redump: matched.
+        assert_eq!(
+            dats.match_cues(&files(&[("Three (Japan).bin", 500)]))[0].name,
+            "Three (Japan)"
+        );
     }
 }

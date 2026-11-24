@@ -86,7 +86,7 @@ pub async fn run(state: &AppState) {
                 }
                 state.hashes.write().await.files.insert(rel, entry);
             }
-            Ok(Err(e)) => tracing::warn!(file = %path.display(), error = %e, "hashing failed"),
+            Ok(Err(e)) => tracing::warn!(file = %path.display(), error = format!("{e:#}"), "hashing failed"),
             Err(e) => tracing::warn!(error = %e, "hashing task failed"),
         }
     }

@@ -8,8 +8,9 @@
 //! blocks may refer back to. A read starts at the closest point before it:
 //! a fresh decompressor primed with the bits left in that byte and given
 //! the 32 KiB as its dictionary. The indexes are kept in the server's cache
-//! directory, named after the zip and the entry, and built when the library
-//! scan finds an entry without one.
+//! directory, named after the zip and the entry; the library scan only
+//! names them, and they are built after it, in the background, or when an
+//! image is read before its index is there (`ensure_index`).
 //!
 //! Resuming in the middle of a stream takes zlib's `inflatePrime` and
 //! `Z_BLOCK`, which only its C interface has: `libz-rs-sys` (the same Rust
@@ -41,8 +42,10 @@ pub struct ZipEntry {
     pub compressed: u64,
     /// Its length, decompressed.
     pub size: u64,
-    /// Deflated: its seek index (in the server's cache). Stored: none.
+    /// Deflated: its seek index (in the server's cache), and its CRC (checked
+    /// when the index is built). Stored: none.
     pub index: Option<PathBuf>,
+    pub crc: u32,
 }
 
 /// What a zip holds: its disc images (name, entry), its CUE sheets (name,
@@ -54,8 +57,8 @@ pub struct Listing {
     pub sbis: Vec<(String, String)>,
 }
 
-/// Lists a zip's images and CUE sheets, building the seek index of each
-/// deflated image in `index_dir` if it has none yet.
+/// Lists a zip's images, CUE sheets and SBI files, naming each deflated
+/// image's seek index in `index_dir` (built later: `ensure_index`).
 pub fn list(path: &Path, index_dir: &Path) -> anyhow::Result<Listing> {
     let meta = path.metadata()?;
     let mtime = meta
@@ -105,16 +108,7 @@ pub fn list(path: &Path, index_dir: &Path) -> anyhow::Result<Listing> {
                     zip::CompressionMethod::Stored => None,
                     zip::CompressionMethod::Deflated => {
                         let key = format!("{}\n{}\n{}\n{mtime}\n{name}\n{crc:08x}", path.display(), meta.len(), i);
-                        let index = index_dir.join(format!("{}.idx", crate::state::cache_key(&key)));
-                        if !index.is_file() {
-                            tracing::info!(zip = %path.display(), entry = %name, "building the zip's seek index (once)");
-                            let started = std::time::Instant::now();
-                            let mut file = File::open(path)?;
-                            build_index(&mut file, data_start, compressed, size, crc, &index)
-                                .with_context(|| format!("indexing {name}"))?;
-                            tracing::info!(entry = %name, seconds = started.elapsed().as_secs(), "seek index built");
-                        }
-                        Some(index)
+                        Some(index_dir.join(format!("{}.idx", crate::state::cache_key(&key))))
                     }
                     other => {
                         tracing::warn!(zip = %path.display(), entry = %name, method = ?other, "unsupported compression, ignored");
@@ -126,6 +120,7 @@ pub fn list(path: &Path, index_dir: &Path) -> anyhow::Result<Listing> {
                     compressed,
                     size,
                     index,
+                    crc,
                 };
                 listing.images.push((name, entry));
             }
@@ -133,6 +128,47 @@ pub fn list(path: &Path, index_dir: &Path) -> anyhow::Result<Listing> {
         }
     }
     Ok(listing)
+}
+
+/// Builds a deflated image's seek index if it is not there yet (a few
+/// seconds per GB). Blocking. Two callers for the same index (the
+/// background builder, a player's read) build it once: the second waits.
+/// Returns whether it built it.
+pub fn ensure_index(zip: &Path, entry: &ZipEntry) -> anyhow::Result<bool> {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+    static BUILDING: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
+    let Some(index) = &entry.index else {
+        return Ok(false);
+    };
+    if index.is_file() {
+        return Ok(false);
+    }
+    let lock = BUILDING
+        .get_or_init(Mutex::default)
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .entry(index.clone())
+        .or_default()
+        .clone();
+    let _building = lock.lock().unwrap_or_else(PoisonError::into_inner);
+    if index.is_file() {
+        return Ok(false);
+    }
+    tracing::info!(zip = %zip.display(), "building a zipped image's seek index (once)");
+    let started = std::time::Instant::now();
+    let mut file = File::open(zip)?;
+    build_index(
+        &mut file,
+        entry.data_start,
+        entry.compressed,
+        entry.size,
+        entry.crc,
+        index,
+    )
+    .with_context(|| format!("indexing {}", zip.display()))?;
+    tracing::info!(zip = %zip.display(), seconds = started.elapsed().as_secs(), "seek index built");
+    Ok(true)
 }
 
 // --- zlib ---------------------------------------------------------------------
@@ -382,19 +418,29 @@ struct Cursor {
 
 /// A zip's file, and per deflated entry its points and decompressor.
 pub struct ZipHandle {
+    path: PathBuf,
+    /// Whether a missing seek index is built before reading (else the
+    /// stream is read from its start).
+    indexing: bool,
     file: File,
     entries: std::collections::HashMap<u64, EntryState>,
 }
 
 struct EntryState {
     points: Vec<Point>,
-    index: File,
+    /// The index's file (its windows), when there is one.
+    index: Option<File>,
     cursor: Option<Cursor>,
 }
 
 impl ZipHandle {
-    pub fn open(path: &Path) -> anyhow::Result<Self> {
+    /// `indexing`: build a missing seek index before reading; else read
+    /// from the stream's start (a few reads near the start, as the library
+    /// scan's).
+    pub fn open(path: &Path, indexing: bool) -> anyhow::Result<Self> {
         Ok(Self {
+            path: path.to_owned(),
+            indexing,
             file: File::open(path)?,
             entries: std::collections::HashMap::new(),
         })
@@ -413,8 +459,23 @@ impl ZipHandle {
         let state = match self.entries.entry(entry.data_start) {
             std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
             std::collections::hash_map::Entry::Vacant(e) => e.insert(EntryState {
-                points: load_index(index, entry.size)?,
-                index: File::open(index)?,
+                points: if self.indexing || index.is_file() {
+                    // Not built yet (the background builder has not got to
+                    // it): now, the read waits.
+                    ensure_index(&self.path, entry)?;
+                    load_index(index, entry.size)?
+                } else {
+                    // Only the stream's start.
+                    vec![Point {
+                        out: 0,
+                        input: 0,
+                        bits: 0,
+                        window_at: 0,
+                        window_len: 0,
+                        window_compressed: 0,
+                    }]
+                },
+                index: File::open(index).ok(),
                 cursor: None,
             }),
         };
@@ -427,7 +488,7 @@ impl ZipHandle {
             None => true,
         };
         if resume {
-            state.cursor = Some(start_at(&mut self.file, &mut state.index, entry, &point)?);
+            state.cursor = Some(start_at(&mut self.file, state.index.as_mut(), entry, &point)?);
         }
         let Some(cursor) = state.cursor.as_mut() else {
             bail!("no decompressor");
@@ -444,7 +505,7 @@ impl ZipHandle {
 
 /// A decompressor at `point`: its byte's remaining bits primed, its window
 /// as dictionary.
-fn start_at(file: &mut File, index: &mut File, entry: &ZipEntry, point: &Point) -> anyhow::Result<Cursor> {
+fn start_at(file: &mut File, index: Option<&mut File>, entry: &ZipEntry, point: &Point) -> anyhow::Result<Cursor> {
     let mut inf = Inflater::new()?;
     let mut next_in = point.input;
     if point.bits > 0 {
@@ -456,6 +517,7 @@ fn start_at(file: &mut File, index: &mut File, entry: &ZipEntry, point: &Point) 
         inf.prime(i32::from(point.bits), i32::from(byte[0] >> (8 - point.bits)))?;
     }
     if point.window_len > 0 {
+        let index = index.context("a seek index's window without its file")?;
         let mut packed = vec![0u8; point.window_compressed as usize];
         index.seek(SeekFrom::Start(point.window_at))?;
         index.read_exact(&mut packed)?;
@@ -560,10 +622,19 @@ mod tests {
         let names: Vec<&str> = listing.images.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(names, ["game.bin", "stored.iso"]);
         let (deflated, stored) = (&listing.images[0].1, &listing.images[1].1);
-        assert!(deflated.index.as_ref().is_some_and(|p| p.is_file()));
+        // Named, not built yet: the first read builds it.
+        assert!(deflated.index.as_ref().is_some_and(|p| !p.exists()));
         assert!(stored.index.is_none());
 
-        let mut h = ZipHandle::open(&path).unwrap();
+        // Not indexing (as the library scan reads): from the start, no index
+        // built.
+        let mut scan = ZipHandle::open(&path, false).unwrap();
+        let mut buf = vec![0u8; 4096];
+        scan.read(deflated, 3 << 20, &mut buf).unwrap();
+        assert!(buf[..] == image[3 << 20..(3 << 20) + 4096]);
+        assert!(deflated.index.as_ref().is_some_and(|p| !p.exists()));
+
+        let mut h = ZipHandle::open(&path, true).unwrap();
         // Anywhere, in any order: forwards, backwards, across points, at
         // the end.
         for &(offset, len) in &[
@@ -582,6 +653,10 @@ mod tests {
                 "deflated at {offset}"
             );
         }
+        assert!(
+            deflated.index.as_ref().is_some_and(|p| p.is_file()),
+            "built by the first read"
+        );
         let mut buf = vec![0u8; 1000];
         h.read(stored, 5000, &mut buf).unwrap();
         assert!(buf[..] == small[5000..6000]);
@@ -610,7 +685,11 @@ mod real {
         let dir = std::env::temp_dir().join(format!("texel-real-zip-{}", std::process::id()));
         let started = std::time::Instant::now();
         let listing = list(Path::new(&zip), &dir).unwrap();
-        println!("listed and indexed in {:.1} s", started.elapsed().as_secs_f64());
+        println!("listed in {:.2} s", started.elapsed().as_secs_f64());
+        let started = std::time::Instant::now();
+        assert!(ensure_index(Path::new(&zip), &listing.images[0].1).unwrap());
+        assert!(!ensure_index(Path::new(&zip), &listing.images[0].1).unwrap());
+        println!("indexed in {:.1} s", started.elapsed().as_secs_f64());
         let (name, entry) = &listing.images[0];
         let index_size = entry
             .index
@@ -619,7 +698,7 @@ mod real {
             .map_or(0, |m| m.len());
         println!("{name}: {} MB, index {} KB", entry.size >> 20, index_size >> 10);
         let mut original = File::open(&image).unwrap();
-        let mut h = ZipHandle::open(Path::new(&zip)).unwrap();
+        let mut h = ZipHandle::open(Path::new(&zip), true).unwrap();
         // Random 64 KiB reads, then a sequential stretch.
         let mut x = 0x9E37_79B9u64;
         let mut reads = Vec::new();

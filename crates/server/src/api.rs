@@ -407,7 +407,7 @@ async fn game_detail(State(state): AppStateRef, viewer: Viewer, Path(id): Path<S
         details,
         last_bios,
         last_cards,
-        sbi: state.sbi(&lib, g).await.is_some(),
+        sbi: state.sbi(g).await.is_some(),
         links: g.overrides.as_ref().map(|o| o.links.clone()).unwrap_or_default(),
         overrides_error: g.overrides_error.clone(),
     })
@@ -423,10 +423,17 @@ async fn game_sbi(State(state): AppStateRef, viewer: Viewer, Path(id): Path<Stri
     let Some(game) = lib.game(&id) else {
         return not_found("game");
     };
-    match state.sbi(&lib, game).await {
-        Some(crate::library::SbiFile::File(path)) => serve_path(path, req, "application/octet-stream").await,
+    match state.sbi(game).await {
+        Some(crate::state::Sbi::Own(crate::library::SbiFile::File(path))) => {
+            serve_path(path, req, "application/octet-stream").await
+        }
+        Some(crate::state::Sbi::Redump(data)) => (
+            [(header::CONTENT_TYPE, "application/octet-stream")],
+            data.as_ref().clone(),
+        )
+            .into_response(),
         // In a zip: a few KiB, decompressed.
-        Some(zipped) => match tokio::task::spawn_blocking(move || zipped.read()).await {
+        Some(crate::state::Sbi::Own(zipped)) => match tokio::task::spawn_blocking(move || zipped.read()).await {
             Ok(Ok(data)) => ([(header::CONTENT_TYPE, "application/octet-stream")], data).into_response(),
             Ok(Err(e)) => {
                 tracing::warn!(error = %e, "reading a zipped SBI file failed");
@@ -487,6 +494,15 @@ async fn serve_virtual(state: &AppState, f: crate::library::GameFile, range: Opt
         )
             .into_response();
     };
+    // A zipped image not indexed yet: built here, before taking the shared
+    // lock of the open images (other players' reads go on meanwhile).
+    if let Some(crate::images::Virtual::Zip(entry)) = &f.virt {
+        let (zip, entry) = (f.path.clone(), entry.clone());
+        if let Ok(Err(e)) = tokio::task::spawn_blocking(move || crate::zipimage::ensure_index(&zip, &entry)).await {
+            tracing::warn!(error = format!("{e:#}"), "indexing a zipped image failed");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    }
     let images = state.images.clone();
     let len = (end - start + 1) as usize;
     let read = tokio::task::spawn_blocking(move || {
@@ -756,7 +772,11 @@ async fn rescan(State(state): AppStateRef, _: Admin) -> StatusCode {
     state.rescan().await;
     if state.config.fetch_metadata {
         let s = state.clone();
-        tokio::spawn(async move { s.refresh_dats(false).await });
+        tokio::spawn(async move {
+            if s.refresh_dats(false).await {
+                s.rescan().await;
+            }
+        });
     }
     StatusCode::NO_CONTENT
 }

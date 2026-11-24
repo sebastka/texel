@@ -365,6 +365,20 @@ enum Handle {
 #[derive(Default)]
 pub struct Cache {
     open: HashMap<PathBuf, Handle>,
+    /// Zipped images without a seek index are read from their stream's
+    /// start, not indexed first: the library scan's few reads near a disc's
+    /// start (see `zipimage`).
+    pub no_indexing: bool,
+}
+
+impl Cache {
+    /// For the library scan: see `no_indexing`.
+    pub fn scanning() -> Self {
+        Self {
+            no_indexing: true,
+            ..Self::default()
+        }
+    }
 }
 
 /// Containers kept open.
@@ -391,7 +405,7 @@ impl Cache {
                     block: Vec::new(),
                     block_key: None,
                 }),
-                Virtual::Zip(_) => Handle::Zip(crate::zipimage::ZipHandle::open(path)?),
+                Virtual::Zip(_) => Handle::Zip(crate::zipimage::ZipHandle::open(path, !self.no_indexing)?),
             };
             self.open.insert(path.to_owned(), handle);
         }

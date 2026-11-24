@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use anyhow::Context;
 use serde::Serialize;
@@ -29,6 +29,8 @@ pub struct AppState {
     /// Open CHD/PBP containers, for serving their tracks.
     pub images: Arc<std::sync::Mutex<crate::images::Cache>>,
     pub ready: AtomicBool,
+    /// Wakes the builder of zipped images' seek indexes (after a scan).
+    zip_indexes: tokio::sync::Notify,
     /// Netplay rooms, in memory.
     pub rooms: crate::netplay::Rooms,
     /// Sign-in and sessions.
@@ -126,6 +128,7 @@ impl AppState {
             igdb,
             images: Arc::default(),
             ready: AtomicBool::new(false),
+            zip_indexes: tokio::sync::Notify::new(),
             rooms: crate::netplay::Rooms::default(),
             auth,
             scan_lock: Mutex::new(()),
@@ -137,7 +140,9 @@ impl AppState {
         let roots = self.config.library_roots();
         let started = std::time::Instant::now();
         let index_dir = self.config.state.join("cache").join("zip-index");
-        match tokio::task::spawn_blocking(move || crate::library::scan(&roots, &index_dir)).await {
+        // Redump's CUE sheets, for BIN files without one.
+        let dats = self.dats.read().await.clone();
+        match tokio::task::spawn_blocking(move || crate::library::scan(&roots, &index_dir, &dats)).await {
             Ok(lib) => {
                 let count = |c| {
                     (
@@ -151,12 +156,12 @@ impl AppState {
                     games = ps1.1,
                     ps2_bios = ps2.0,
                     ps2_games = ps2.1,
-                    sbi = lib.sbi.len(),
                     ms = started.elapsed().as_millis() as u64,
                     "library scanned"
                 );
                 *self.library.write().await = Arc::new(lib);
                 self.ready.store(true, Ordering::Relaxed);
+                self.zip_indexes.notify_one();
             }
             Err(e) => tracing::error!(error = %e, "library scan failed"),
         }
@@ -181,16 +186,36 @@ impl AppState {
             read(src.serials_file).await,
             read(src.bios_file).await,
         );
+        let sbi = match src.sbi {
+            Some((_, file)) => tokio::fs::read(dir.join(file)).await.ok(),
+            None => None,
+        };
+        let cues = tokio::fs::read(dir.join(src.cues_file)).await.ok();
         let dats = tokio::task::spawn_blocking(move || {
             let games = games.map(|x| dat::parse_xml(&x)).transpose().unwrap_or_else(|e| {
                 tracing::warn!(error = %e, "invalid cached Redump DAT");
                 None
             });
-            Dats::new(
+            // XML; redump.org's were clrmamepro (a cache from before).
+            let bios = bios.map(|s| dat::parse_xml(&s).unwrap_or_else(|_| dat::parse_clrmamepro(&s)));
+            let mut dats = Dats::new(
                 games.unwrap_or_default(),
                 serials.map(|s| dat::parse_clrmamepro(&s)).unwrap_or_default(),
-                bios.map(|s| dat::parse_clrmamepro(&s)).unwrap_or_default(),
-            )
+                bios.unwrap_or_default(),
+            );
+            if let Some(zip) = sbi {
+                match dat::unzip_sbis(&zip) {
+                    Ok(sbi) => dats.sbi = sbi,
+                    Err(e) => tracing::warn!(error = %e, "invalid cached Redump SBI files"),
+                }
+            }
+            if let Some(zip) = cues {
+                match dat::unzip_cues(&zip) {
+                    Ok(cues) => dats.cues = cues,
+                    Err(e) => tracing::warn!(error = %e, "invalid cached Redump CUE sheets"),
+                }
+            }
+            dats
         })
         .await
         .unwrap_or_default();
@@ -198,111 +223,130 @@ impl AppState {
             console = console.name(),
             games = dats.games.len(),
             bios = dats.bios.len(),
+            sbi = dats.sbi.len(),
+            cues = dats.cues.len(),
             "DATs loaded"
         );
         dats
     }
 
-    /// Downloads DATs that are missing or stale, then reloads the indexes.
-    pub async fn refresh_dats(&self, force: bool) {
+    /// Brings the cached Redump files (game and BIOS DATs, CUE sheets, SBI
+    /// files) and libretro's DATs up to date, then reloads the indexes. A
+    /// file is downloaded only when it is missing or its published version
+    /// changed: Redump names each file after its version (the download's
+    /// file name), libretro's are told by their ETag; a HEAD request asks.
+    /// `force`: download them all. Returns whether any changed.
+    pub async fn refresh_dats(&self, force: bool) -> bool {
         let dir = dat_dir(&self.config);
-        let max_age = Duration::from_secs(self.config.dat_max_age_days * 86_400);
-        let stale = |name: &str| {
-            let meta = std::fs::metadata(dir.join(name)).ok();
-            let age = meta
-                .and_then(|m| m.modified().ok())
-                .and_then(|t| SystemTime::now().duration_since(t).ok());
-            force || age.is_none_or(|a| a > max_age)
-        };
+        let versions_path = dir.join("versions.json");
+        let mut versions: HashMap<String, String> = tokio::fs::read(&versions_path)
+            .await
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default();
+        let unzip = |b: &[u8]| Ok(dat::unzip_dat(b)?.into_bytes());
+        let as_is = |b: &[u8]| Ok(b.to_vec());
         let mut changed = false;
         for console in [Console::Ps1, Console::Ps2] {
             let src = dat::sources(console);
-            if stale(src.games_file) {
-                changed |= self
-                    .download(src.games_file, src.games_url, |b| {
-                        let text = dat::unzip_dat(b)?;
-                        Ok(text.into_bytes())
-                    })
-                    .await;
+            let mut files: Vec<(&str, &str, &Process)> = vec![
+                (src.games_file, src.games_url, &unzip),
+                (src.serials_file, src.serials_url, &as_is),
+                (src.bios_file, src.bios_url, &as_is),
+                (src.cues_file, src.cues_url, &as_is),
+            ];
+            if let Some((url, file)) = src.sbi {
+                files.push((file, url, &as_is));
             }
-            if stale(src.serials_file) {
-                changed |= self
-                    .download(src.serials_file, src.serials_url, |b| Ok(b.to_vec()))
-                    .await;
-            }
-            // Pinned by hash: downloaded once.
-            if !dir.join(src.bios_file).exists() {
-                changed |= self
-                    .download(src.bios_file, src.bios_url, |b| {
-                        let sum = hex::encode(sha2::Sha256::digest(b));
-                        anyhow::ensure!(sum == src.bios_sha256, "unexpected SHA-256 {sum}");
-                        Ok(b.to_vec())
-                    })
-                    .await;
+            for (file, url, process) in files {
+                let have = dir.join(file).is_file().then(|| versions.get(file)).flatten();
+                if !force && let Some(have) = have {
+                    match self.published_version(url).await {
+                        Some(now) if &now == have => continue,
+                        Some(_) => {}
+                        // Unreachable: the copy we have will do.
+                        None => continue,
+                    }
+                }
+                if let Some(version) = self.download(file, url, process).await {
+                    versions.insert(file.to_owned(), version);
+                    changed = true;
+                }
             }
         }
         if changed {
+            if let Ok(json) = serde_json::to_vec_pretty(&versions)
+                && let Err(e) = write_atomic(&versions_path, &json).await
+            {
+                tracing::warn!(error = %e, "saving the DATs' versions failed");
+            }
             self.load_cached_dats().await;
         }
+        changed
     }
 
-    async fn download(&self, name: &str, url: &str, process: impl Fn(&[u8]) -> anyhow::Result<Vec<u8>>) -> bool {
-        tracing::info!(url, "downloading DAT");
+    /// A download's version, from a HEAD request: the file name it is
+    /// served as (Redump's carries its date), else its ETag.
+    async fn published_version(&self, url: &str) -> Option<String> {
+        let resp = self.http.head(url).send().await.ok()?.error_for_status().ok()?;
+        version_of(resp.headers())
+    }
+
+    /// Downloads `url` into the DAT cache as `name`, through `process`:
+    /// its version (see `published_version`), or None if it failed.
+    async fn download(&self, name: &str, url: &str, process: &Process) -> Option<String> {
+        tracing::info!(url, "downloading");
         let result = async {
             let resp = self.http.get(url).send().await?.error_for_status()?;
+            let version = version_of(resp.headers()).unwrap_or_default();
             let bytes = resp.bytes().await?;
             let data = process(&bytes)?;
             write_atomic(&dat_dir(&self.config).join(name), &data).await?;
-            anyhow::Ok(())
+            anyhow::Ok(version)
         }
         .await;
         match result {
-            Ok(()) => true,
+            Ok(version) => Some(version),
             Err(e) => {
-                tracing::warn!(url, error = %e, "DAT download failed");
-                false
+                tracing::warn!(url, error = %e, "download failed");
+                None
             }
         }
     }
 
-    /// The SBI file of a LibCrypt-protected PS1 disc: its own, next to its
-    /// image; else the shared one named after its Redump name, once its
+    /// The SBI file of a LibCrypt-protected PS1 disc: its own (next to its
+    /// image, or in its zip); else Redump's for its Redump name, once its
     /// hashes identify it. Before that (not hashed yet, or a dump Redump
     /// does not list), only its serial is known, which revisions share and
     /// they may need different files (Spyro - Year of the Dragon (Europe),
-    /// Rev 0 and Rev 1): a shared file is then used only when every file of
-    /// that serial's discs is the same.
-    pub async fn sbi(&self, lib: &Library, game: &Game) -> Option<crate::library::SbiFile> {
+    /// Rev 0 and Rev 1): Redump's is then used only when every one of that
+    /// serial's discs has the same.
+    pub async fn sbi(&self, game: &Game) -> Option<Sbi> {
         if let Some(own) = &game.sbi {
-            return Some(own.clone());
+            return Some(Sbi::Own(own.clone()));
         }
-        if game.console != Console::Ps1 || lib.sbi.is_empty() {
+        if game.console != Console::Ps1 {
+            return None;
+        }
+        let all = self.dats.read().await.clone();
+        let redump = &all.get(game.console).sbi;
+        if redump.is_empty() {
             return None;
         }
         let identity = self.identify(game).await;
         if identity.verified == Some(true) {
-            return identity.name.and_then(|name| lib.sbi.get(&name).cloned());
+            return identity
+                .name
+                .and_then(|name| redump.get(&name).cloned())
+                .map(Sbi::Redump);
         }
         let serial = game.serial.as_deref()?;
-        let all = self.dats.read().await.clone();
-        let mut files: Vec<&crate::library::SbiFile> = all
+        let mut files = all
             .get(game.console)
             .serial_names(serial)
-            .filter_map(|name| lib.sbi.get(name))
-            .collect();
-        files.sort();
-        files.dedup();
-        let read = |f: &crate::library::SbiFile| {
-            let f = f.clone();
-            tokio::task::spawn_blocking(move || f.read())
-        };
-        let first = read(files.first()?).await.ok()?.ok()?;
-        for other in &files[1..] {
-            if read(other).await.ok()?.ok()? != first {
-                return None;
-            }
-        }
-        Some(files[0].clone())
+            .filter_map(|name| redump.get(name));
+        let first = files.next()?;
+        files.all(|f| f == first).then(|| Sbi::Redump(first.clone()))
     }
 
     pub async fn identify(&self, game: &Game) -> Identity {
@@ -441,6 +485,75 @@ pub fn split_name(name: &str) -> (String, Vec<String>) {
         .map(str::to_owned)
         .collect();
     (name[..title_end].to_owned(), tags)
+}
+
+/// Builds the seek indexes of the zipped images the last scan found without
+/// one, one at a time, after each scan (`AppState::rescan` wakes it). A
+/// player reading an image before its turn builds it then (`zipimage`).
+pub async fn index_zips(state: Arc<AppState>) {
+    // The indexes that could not be built (a damaged or unfinished zip):
+    // not tried again until the zip changes, which renames its index.
+    let mut failed: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    loop {
+        state.zip_indexes.notified().await;
+        let lib = state.library.read().await.clone();
+        let mut todo: Vec<(PathBuf, crate::zipimage::ZipEntry)> = lib
+            .games
+            .iter()
+            .flat_map(|g| &g.files)
+            .filter_map(|f| match &f.virt {
+                Some(crate::images::Virtual::Zip(e)) if e.index.as_ref().is_some_and(|i| !i.is_file()) => {
+                    Some((f.path.clone(), e.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        todo.sort_by(|a, b| a.0.cmp(&b.0));
+        todo.dedup_by(|a, b| a.1.index == b.1.index);
+        todo.retain(|(_, e)| e.index.as_ref().is_none_or(|i| !failed.contains(i)));
+        if todo.is_empty() {
+            continue;
+        }
+        tracing::info!(images = todo.len(), "building zipped images' seek indexes");
+        for (zip, entry) in todo {
+            let index = entry.index.clone();
+            match tokio::task::spawn_blocking(move || crate::zipimage::ensure_index(&zip, &entry).map_err(|e| (zip, e)))
+                .await
+            {
+                Ok(Ok(_)) => {}
+                Ok(Err((zip, e))) => {
+                    tracing::warn!(zip = %zip.display(), error = format!("{e:#}"), "indexing a zipped image failed");
+                    failed.extend(index);
+                }
+                Err(e) => tracing::warn!(error = %e, "indexing task failed"),
+            }
+        }
+        tracing::info!("zipped images' seek indexes built");
+    }
+}
+
+/// What a download goes through before it is cached (unzipped, or kept).
+type Process = dyn Fn(&[u8]) -> anyhow::Result<Vec<u8>> + Sync;
+
+/// Where a disc's SBI file comes from: its own, or Redump's set.
+pub enum Sbi {
+    Own(crate::library::SbiFile),
+    Redump(Arc<Vec<u8>>),
+}
+
+/// A download's version: the file name it is served as, else its ETag.
+fn version_of(headers: &reqwest::header::HeaderMap) -> Option<String> {
+    let disposition = headers
+        .get(reqwest::header::CONTENT_DISPOSITION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split("filename=").nth(1))
+        .map(|f| f.trim_matches('"').to_owned());
+    disposition.or_else(|| {
+        headers
+            .get(reqwest::header::ETAG)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned)
+    })
 }
 
 /// A stable file name for a cache key.
