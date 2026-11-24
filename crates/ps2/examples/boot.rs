@@ -431,6 +431,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     println!("VU1 queue {:?}", ps2.bus.vu1q.stats);
     println!("GIF quadwords by path {:?}", ps2.bus.gif.qwords);
+    let ipu = &ps2.bus.ipu;
+    println!(
+        "IPU commands (BCLR IDEC BDEC VDEC FDEC SETIQ SETVQ CSC PACK SETTH) {:?}, errors {}, busy {}, output {} quadwords",
+        &ipu.commands[..10],
+        ipu.errors,
+        ipu.busy(),
+        ipu.output.len()
+    );
     let mut gs_regs: BTreeMap<u32, u64> = BTreeMap::new();
     for &(off, v) in &ps2.bus.gs.privileged.writes {
         gs_regs.insert(off, v);

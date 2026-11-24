@@ -14,6 +14,7 @@ pub mod gs;
 pub mod intc;
 pub mod iop;
 pub mod iop_printf;
+pub mod ipu;
 pub mod memcard;
 pub mod sif;
 pub mod sio2;
@@ -59,7 +60,7 @@ pub struct Ps2 {
 
 /// Save states: this tag, the format's version, then the rest (`State`).
 const STATE_MAGIC: &[u8; 8] = b"TEXELPS2";
-const STATE_VERSION: u32 = 1;
+const STATE_VERSION: u32 = 2;
 
 #[derive(serde::Serialize)]
 struct StateRef<'a> {

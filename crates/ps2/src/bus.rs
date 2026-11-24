@@ -114,6 +114,8 @@ pub struct Bus {
     pub vif1: Vif,
     pub vu0: Vu,
     pub vu1: Vu,
+    /// The IPU (MPEG decoder), and DMA channels 3 and 4 to and from it.
+    pub ipu: crate::ipu::Ipu,
     /// VU1's work, queued until something needs what it owns (`vu1q`).
     #[serde(skip)]
     pub vu1q: crate::vu1q::Vu1Queue,
@@ -190,6 +192,7 @@ impl Bus {
             vif1: Vif::new(1),
             vu0: Vu::new(0),
             vu1: Vu::new(1),
+            ipu: Default::default(),
             vu1q: Default::default(),
             cmsar0: 0,
             iop: IopBus::new(bios),
@@ -228,6 +231,9 @@ impl Bus {
 
     /// Advances the timers and video timing by `cycles` EE cycles.
     pub fn advance(&mut self, cycles: u64) {
+        if self.ipu.busy() || !self.ipu.output.is_empty() || self.reg(IPU_TO) & CHCR_STR != 0 {
+            self.run_ipu();
+        }
         // What the EE's slice raised (GS, VIFs) goes to INT0 at once; the
         // vertical blanks raised below wait a few cycles (`Intc::fresh`).
         self.sync_irqs();
@@ -412,6 +418,12 @@ impl Bus {
                     _ => u128::from(self.gs.read32(off & !3) >> ((off & 3) * 8)),
                 }
             }
+            // The IPU's output FIFO.
+            0x1000_7000..0x1000_7010 if width == 16 => {
+                let q = self.ipu.read_fifo();
+                self.run_ipu();
+                q
+            }
             0x1000_0000..0x1001_0000 => match width {
                 16 => (0..4).fold(0u128, |acc, i| {
                     acc | (u128::from(self.hw_read32(pa + i * 4)) << (32 * i))
@@ -466,6 +478,15 @@ impl Bus {
                     }
                 }
             }
+            // The IPU's input FIFO.
+            0x1000_7010..0x1000_7020 => {
+                if width == 16 {
+                    self.ipu.write_fifo(value);
+                } else {
+                    self.ipu.write_fifo_word((pa >> 2) & 3, value as u32);
+                }
+                self.run_ipu();
+            }
             0x1000_0000..0x1001_0000 => match width {
                 16 | 8 => {
                     for i in 0..(width / 4) as u32 {
@@ -486,6 +507,16 @@ impl Bus {
             INTC_MASK => self.intc.mask,
             D_STAT => self.d_stat,
             SIO_ISR => 0,
+            IPU_CMD => self.ipu.read_cmd().0,
+            IPU_CMD_HI => u32::from(self.ipu.read_cmd().1) << 31,
+            IPU_CTRL => self.ipu.read_ctrl(),
+            IPU_BP => self.ipu.read_bp(),
+            IPU_TOP | IPU_TOP_HI => {
+                let mut ipu = std::mem::take(&mut self.ipu);
+                let (top, short) = ipu.read_top(&mut || self.ipu_pull());
+                self.ipu = ipu;
+                if pa == IPU_TOP { top } else { u32::from(short) << 31 }
+            }
             0x1000_F200..0x1000_F270 => self.iop.sif.ee_read(pa - 0x1000_F200),
             // MCH_RICM, and the register next to it: never busy.
             MCH_RICM | MCH_STATUS => 0,
@@ -506,6 +537,14 @@ impl Bus {
     fn hw_write32(&mut self, pa: u32, value: u32) {
         match pa {
             0x1000_0000..0x1000_2000 => self.timers.write(pa - 0x1000_0000, value),
+            IPU_CMD => {
+                self.ipu.write_cmd(value);
+                self.run_ipu();
+            }
+            IPU_CTRL => {
+                self.ipu.write_ctrl(value);
+                self.run_ipu();
+            }
             INTC_STAT => self.intc.write_stat(value),
             INTC_MASK => self.intc.write_mask(value),
             D_STAT => {
@@ -544,6 +583,8 @@ impl Bus {
                             // Moved as the SIF has room (pump_sif).
                             SIF1 => {}
                             0..=2 | 8 | 9 => self.run_dma(ch),
+                            // Moved as the IPU takes and gives (run_ipu).
+                            3 | 4 => self.run_ipu(),
                             // Not emulated yet: done at once.
                             _ => self.dma_complete(ch),
                         }
@@ -583,6 +624,15 @@ const SIF1_BASE: u32 = 0x1000_C400;
 const MADR: u32 = 0x10;
 const QWC: u32 = 0x20;
 const TADR: u32 = 0x30;
+
+const IPU_FROM: u32 = 0x1000_B000;
+const IPU_TO: u32 = 0x1000_B400;
+const IPU_CMD: u32 = 0x1000_2000;
+const IPU_CMD_HI: u32 = 0x1000_2004;
+const IPU_CTRL: u32 = 0x1000_2010;
+const IPU_BP: u32 = 0x1000_2020;
+const IPU_TOP: u32 = 0x1000_2030;
+const IPU_TOP_HI: u32 = 0x1000_2034;
 
 /// The channel whose CHCR is at `pa`.
 fn dma_channel(pa: u32) -> Option<u32> {
@@ -699,6 +749,65 @@ impl Bus {
             moved = true;
         }
         moved
+    }
+
+    /// Runs the IPU's command as far as its input goes, feeds its input FIFO
+    /// from DMA channel 4, drains its output to channel 3; its interrupt.
+    fn run_ipu(&mut self) {
+        let mut ipu = std::mem::take(&mut self.ipu);
+        ipu.run(&mut || self.ipu_pull());
+        while ipu.wants_input() {
+            match self.ipu_pull() {
+                Some(q) => ipu.write_fifo(q),
+                None => break,
+            }
+        }
+        self.ipu = ipu;
+        // Channel 3: the output into memory, in normal mode.
+        while self.reg(IPU_FROM) & CHCR_STR != 0 {
+            let qwc = self.reg(IPU_FROM + QWC) & 0xFFFF;
+            if qwc == 0 {
+                self.dma_complete(3);
+                break;
+            }
+            let Some(q) = self.ipu.output.pop_front() else { break };
+            let madr = self.reg(IPU_FROM + MADR);
+            self.write128(Self::dma_address(madr), q);
+            self.regs.insert(IPU_FROM + MADR, madr.wrapping_add(16));
+            self.regs.insert(IPU_FROM + QWC, qwc - 1);
+        }
+        if std::mem::take(&mut self.ipu.irq) {
+            self.intc.raise(Interrupt::Ipu);
+        }
+    }
+
+    /// Channel 4's next quadword for the IPU (normal or source chain mode),
+    /// if it runs and has one.
+    fn ipu_pull(&mut self) -> Option<u128> {
+        loop {
+            let chcr = self.reg(IPU_TO);
+            if chcr & CHCR_STR == 0 {
+                return None;
+            }
+            let chain = (chcr >> 2) & 3 == 1;
+            let qwc = self.reg(IPU_TO + QWC) & 0xFFFF;
+            if qwc == 0 {
+                if !chain || self.chain_end[4] {
+                    self.dma_complete(4);
+                    return None;
+                }
+                self.chain_tag(4);
+                continue;
+            }
+            let madr = self.reg(IPU_TO + MADR);
+            let q = self.read128(Self::dma_address(madr));
+            self.regs.insert(IPU_TO + MADR, madr.wrapping_add(16));
+            self.regs.insert(IPU_TO + QWC, qwc - 1);
+            if qwc == 1 && (!chain || self.chain_end[4]) {
+                self.dma_complete(4);
+            }
+            return Some(q);
+        }
     }
 
     /// Reads a channel's next source chain tag: sets MADR, QWC and TADR
