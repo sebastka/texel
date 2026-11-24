@@ -10,7 +10,7 @@ publish.workspace = true
 texel-disc.workspace = true
 texel-ps1.workspace = true
 # Save states, as the PlayStation's.
-postcard = { version = "1.1.3", default-features = false, features = ["use-std"] }
+postcard = { version = "1.2.0", default-features = false, features = ["use-std"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde-big-array = "0.5.1"
 
