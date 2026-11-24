@@ -38,12 +38,13 @@ impl Console {
     }
 }
 
-/// Where a console's BIOSes and games are.
+/// Where a console's BIOSes and games are: one directory or more each,
+/// merged (see `scan`).
 #[derive(Clone, Debug)]
 pub struct Root {
     pub console: Console,
-    pub bios: PathBuf,
-    pub games: PathBuf,
+    pub bios: Vec<PathBuf>,
+    pub games: Vec<PathBuf>,
 }
 
 #[derive(Clone, Debug)]
@@ -201,14 +202,44 @@ fn mtime(meta: &std::fs::Metadata) -> u64 {
 
 /// Scans the BIOS and game directories of each console. Blocking.
 /// `index_dir`: where zipped images' seek indexes are kept (see `zipimage`).
+///
+/// A console's directories are merged: a game's path (and so its id, its
+/// saves and its hash) is relative to its directory, whichever it is, so
+/// games can move between directories. A game found at the same relative
+/// path in two directories is taken from the first; a BIOS found twice
+/// (the same content) is listed once.
 pub fn scan(roots: &[Root], index_dir: &Path) -> Library {
     let mut lib = Library {
         bios: Vec::new(),
         games: Vec::new(),
     };
+    let mut bios_seen = HashSet::new();
+    let mut games_seen: std::collections::HashMap<String, PathBuf> = std::collections::HashMap::new();
     for root in roots {
-        lib.bios.extend(scan_bios(root.console, &root.bios));
-        lib.games.extend(scan_games(root.console, &root.games, index_dir));
+        for dir in &root.bios {
+            for b in scan_bios(root.console, dir) {
+                if bios_seen.insert(b.id.clone()) {
+                    lib.bios.push(b);
+                }
+            }
+        }
+        for dir in &root.games {
+            for g in scan_games(root.console, dir, index_dir) {
+                let place = g.files.first().map(|f| f.path.clone()).unwrap_or_default();
+                match games_seen.entry(g.id.clone()) {
+                    std::collections::hash_map::Entry::Occupied(first) => tracing::warn!(
+                        game = %g.rel,
+                        kept = %first.get().display(),
+                        ignored = %place.display(),
+                        "the same game path in two library directories: the first is kept"
+                    ),
+                    std::collections::hash_map::Entry::Vacant(e) => {
+                        e.insert(place);
+                        lib.games.push(g);
+                    }
+                }
+            }
+        }
     }
     lib.bios.sort_by(|a, b| a.file.cmp(&b.file));
     lib.games.sort_by(|a, b| a.rel.cmp(&b.rel));
@@ -692,6 +723,42 @@ fn make_game(console: Console, rel: String, cue: Option<String>, layout: Layout,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn directories_merge_the_first_kept() {
+        let base = std::env::temp_dir().join(format!("texel-dirs-{}", std::process::id()));
+        let (one, two) = (base.join("one"), base.join("two"));
+        for d in [&one, &two] {
+            std::fs::create_dir_all(d.join("Game")).unwrap();
+            std::fs::write(d.join("Game/game.iso"), vec![0u8; 2048 * 16]).unwrap();
+        }
+        std::fs::write(two.join("other.iso"), vec![0u8; 2048 * 16]).unwrap();
+        let root = Root {
+            console: Console::Ps1,
+            bios: Vec::new(),
+            games: vec![one.clone(), two.clone()],
+        };
+        let lib = scan(&[root], &base.join("index"));
+        let mut found: Vec<(&str, &Path)> = lib
+            .games
+            .iter()
+            .map(|g| (g.rel.as_str(), g.files[0].path.parent().unwrap()))
+            .collect();
+        found.sort();
+        assert_eq!(
+            found,
+            [
+                ("games/Game/game.iso", one.join("Game").as_path()),
+                ("games/other.iso", two.as_path())
+            ]
+        );
+        // The same ids as with one directory: paths relative to theirs.
+        assert_eq!(
+            lib.games.iter().find(|g| g.rel == "games/other.iso").unwrap().id,
+            short_id("games/other.iso")
+        );
+        std::fs::remove_dir_all(&base).unwrap();
+    }
 
     #[test]
     fn zipped_bios_candidates() {

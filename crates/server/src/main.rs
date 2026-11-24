@@ -31,30 +31,31 @@ pub struct Config {
     #[arg(long, env = "TEXEL_LISTEN", default_value = "0.0.0.0:8080")]
     pub listen: SocketAddr,
 
-    /// Library root (read-only), with one directory per console: `ps1/bios`,
-    /// `ps1/games`, `ps2/bios` and `ps2/games`, unless set apart below.
-    #[arg(long, env = "TEXEL_LIBRARY", default_value = "/library")]
-    pub library: PathBuf,
+    /// Library roots (read-only), each with one directory per console:
+    /// `ps1/bios`, `ps1/games`, `ps2/bios` and `ps2/games`, unless set apart
+    /// below. Several: repeat it, or separate them with `:`.
+    #[arg(long, env = "TEXEL_LIBRARY", default_value = "/library", value_delimiter = ':')]
+    pub library: Vec<PathBuf>,
 
-    /// PlayStation BIOS images (any layout of subdirectories) [default:
-    /// LIBRARY/ps1/bios].
-    #[arg(long, env = "TEXEL_PS1_BIOS")]
-    pub ps1_bios: Option<PathBuf>,
+    /// PlayStation BIOS images (any layout of subdirectories, zipped or not)
+    /// [default: LIBRARY/ps1/bios]. Several: as for `--library`.
+    #[arg(long, env = "TEXEL_PS1_BIOS", value_delimiter = ':')]
+    pub ps1_bios: Vec<PathBuf>,
 
     /// PlayStation games: CUE/BIN, ISO, CHD, PBP, zipped images [default:
-    /// LIBRARY/ps1/games].
-    #[arg(long, env = "TEXEL_PS1_GAMES")]
-    pub ps1_games: Option<PathBuf>,
+    /// LIBRARY/ps1/games]. Several: as for `--library`.
+    #[arg(long, env = "TEXEL_PS1_GAMES", value_delimiter = ':')]
+    pub ps1_games: Vec<PathBuf>,
 
-    /// PlayStation 2 BIOS images (any layout of subdirectories) [default:
-    /// LIBRARY/ps2/bios].
-    #[arg(long, env = "TEXEL_PS2_BIOS")]
-    pub ps2_bios: Option<PathBuf>,
+    /// PlayStation 2 BIOS images (any layout of subdirectories, zipped or
+    /// not) [default: LIBRARY/ps2/bios]. Several: as for `--library`.
+    #[arg(long, env = "TEXEL_PS2_BIOS", value_delimiter = ':')]
+    pub ps2_bios: Vec<PathBuf>,
 
     /// PlayStation 2 games: ISO, CHD, zipped images [default:
-    /// LIBRARY/ps2/games].
-    #[arg(long, env = "TEXEL_PS2_GAMES")]
-    pub ps2_games: Option<PathBuf>,
+    /// LIBRARY/ps2/games]. Several: as for `--library`.
+    #[arg(long, env = "TEXEL_PS2_GAMES", value_delimiter = ':')]
+    pub ps2_games: Vec<PathBuf>,
 
     /// Writable state: memory cards and the metadata cache.
     #[arg(long, env = "TEXEL_STATE", default_value = "/state")]
@@ -182,20 +183,18 @@ impl Config {
         })
     }
 
-    pub fn ps1_bios(&self) -> PathBuf {
-        self.ps1_bios.clone().unwrap_or_else(|| self.library.join("ps1/bios"))
-    }
-
-    pub fn ps1_games(&self) -> PathBuf {
-        self.ps1_games.clone().unwrap_or_else(|| self.library.join("ps1/games"))
-    }
-
-    pub fn ps2_bios(&self) -> PathBuf {
-        self.ps2_bios.clone().unwrap_or_else(|| self.library.join("ps2/bios"))
-    }
-
-    pub fn ps2_games(&self) -> PathBuf {
-        self.ps2_games.clone().unwrap_or_else(|| self.library.join("ps2/games"))
+    /// The directories given for one kind (`given`), else that
+    /// subdirectory of each library root. Empty paths (`a::b`) are skipped.
+    fn dirs(&self, given: &[PathBuf], sub: &str) -> Vec<PathBuf> {
+        let given: Vec<PathBuf> = given.iter().filter(|p| !p.as_os_str().is_empty()).cloned().collect();
+        if !given.is_empty() {
+            return given;
+        }
+        self.library
+            .iter()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(|l| l.join(sub))
+            .collect()
     }
 
     /// Each console's BIOS and game directories.
@@ -204,13 +203,13 @@ impl Config {
         vec![
             Root {
                 console: Console::Ps1,
-                bios: self.ps1_bios(),
-                games: self.ps1_games(),
+                bios: self.dirs(&self.ps1_bios, "ps1/bios"),
+                games: self.dirs(&self.ps1_games, "ps1/games"),
             },
             Root {
                 console: Console::Ps2,
-                bios: self.ps2_bios(),
-                games: self.ps2_games(),
+                bios: self.dirs(&self.ps2_bios, "ps2/bios"),
+                games: self.dirs(&self.ps2_games, "ps2/games"),
             },
         ]
     }
@@ -247,10 +246,16 @@ async fn main() -> anyhow::Result<()> {
     std::fs::create_dir_all(&cache).with_context(|| format!("creating {}", cache.display()))?;
 
     for root in config.library_roots() {
+        let list = |dirs: &[PathBuf]| {
+            dirs.iter()
+                .map(|d| d.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
         tracing::info!(
             console = root.console.name(),
-            bios = %root.bios.display(),
-            games = %root.games.display(),
+            bios = %list(&root.bios),
+            games = %list(&root.games),
             "library"
         );
     }

@@ -388,3 +388,10 @@ Disc images are often kept zipped. The server reads an image inside a zip withou
 - **zlib's interface.** Priming and stopping at block boundaries are in zlib's C interface only: `libz-rs-sys`, the same Rust implementation as `flate2`'s (`zlib-rs`). Its calls are unsafe, so `zipimage` allows unsafe code (D30), with its reasons.
 - **Not read:** Deflate64 (Windows' compression for very large files), and other methods; the scan says so and skips them. CHD stays the better format for discs: smaller, and random access by design.
 - **BIOSes in zips**, for both consoles: a BIOS is small (512 KiB, 4 MiB), so the scan decompresses the zips' entries of a BIOS's size whole and identifies them by content, as files; the server decompresses one again when a player asks for it. A zip may hold any number of them (a whole BIOS directory zipped scans as it does unzipped). The `SOURCE.md` that describes an OpenBIOS or OpenPS2BIOS image applies to the file next to it, not to one in a zip.
+
+## D52. Several library directories, merged
+
+A library may be spread over several directories (another volume, a second collection). `TEXEL_LIBRARY` and each console's BIOS and game settings take several directories (separated by `:`, as `PATH`, or the option repeated); a console's directories given on their own replace the ones its library roots would give, as before.
+
+- **Merged as one.** A game's path is relative to its directory (`games/…`, `ps2/games/…`), whichever directory it is in: its id, and so its saves, settings and verification hash, do not depend on where it lies. Games can move from one directory to another, and a directory can be added, without anything to migrate; with one directory, nothing changes.
+- **Duplicates.** A game found at the same relative path in two directories is taken from the first listed, and the scan warns. A BIOS is identified by its content: found twice, it is listed once.
