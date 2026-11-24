@@ -194,7 +194,9 @@ pub async fn image(
     // capitalisations ("WipEout 3 - Special Edition", Redump's "Wipeout 3").
     if let Some(index) = thumbnail_index(state, console, kind).await {
         for candidate in &names {
-            let Some(actual) = index.get(&candidate.to_lowercase()) else { continue };
+            let Some(actual) = index.get(&candidate.to_lowercase()) else {
+                continue;
+            };
             if actual == candidate {
                 continue;
             }
@@ -294,7 +296,10 @@ async fn list_thumbnails(state: &AppState, repo: &str, dir: &str) -> anyhow::Res
                 .error_for_status()?
                 .json()
                 .await?;
-            anyhow::ensure!(!value["truncated"].as_bool().unwrap_or(false), "{url}: listing truncated");
+            anyhow::ensure!(
+                !value["truncated"].as_bool().unwrap_or(false),
+                "{url}: listing truncated"
+            );
             anyhow::Ok(value)
         }
     };

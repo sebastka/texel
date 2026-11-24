@@ -67,7 +67,9 @@ impl Overrides {
         if let Some(t) = &o.thumbnails
             && o.thumbnails_name().is_none()
         {
-            return Err(format!("thumbnails: {t} is not an image name (a file name, without a directory)"));
+            return Err(format!(
+                "thumbnails: {t} is not an image name (a file name, without a directory)"
+            ));
         }
         for (name, url) in &o.links {
             if !(url.starts_with("https://") || url.starts_with("http://")) || url.contains(char::is_whitespace) {
