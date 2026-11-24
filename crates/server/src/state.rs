@@ -135,9 +135,25 @@ impl AppState {
         })
     }
 
+    /// Where the open-source BIOSes are downloaded (`openbios`).
+    pub fn open_bios_dir(&self) -> PathBuf {
+        self.config.state.join("cache").join("openbios")
+    }
+
     pub async fn rescan(&self) {
         let _guard = self.scan_lock.lock().await;
-        let roots = self.config.library_roots();
+        let mut roots = self.config.library_roots();
+        // The open-source BIOSes the server downloads (see `openbios`).
+        for root in &mut roots {
+            let sub = match root.console {
+                Console::Ps1 => "ps1",
+                Console::Ps2 => "ps2",
+            };
+            let dir = self.open_bios_dir().join(sub);
+            // There before the first download: no "no BIOS directory".
+            let _ = std::fs::create_dir_all(&dir);
+            root.bios.push(dir);
+        }
         let started = std::time::Instant::now();
         let index_dir = self.config.state.join("cache").join("zip-index");
         // Redump's CUE sheets, for BIN files without one.
