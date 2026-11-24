@@ -98,14 +98,22 @@ fn fresh(path: &std::path::Path, ttl: Duration) -> bool {
         .is_some_and(|age| age < ttl)
 }
 
-/// Whether a "missing" marker still holds: fresh, and written after the DATs
-/// last changed (`dats_changed`, written then). New DATs can rename a game,
-/// and free names it used to have that libretro-thumbnails still files its
-/// images under (`older_names`, which skips names another game has): its
-/// artwork is looked for again.
+/// What a "missing" marker holds: the version of the artwork lookup that
+/// wrote it. A lookup that tries more names gets a new one, and the markers
+/// of older ones lapse (an empty marker is from before the other cases; 2,
+/// before other punctuation).
+const MISSING: &[u8] = b"3\n";
+
+/// Whether a "missing" marker still holds: fresh, written by this version
+/// of the lookup (`MISSING`), and after the DATs last changed
+/// (`dats_changed`, written then). New DATs can rename a game, and free
+/// names it used to have that libretro-thumbnails still files its images
+/// under (`older_names`, which skips names another game has): its artwork
+/// is looked for again.
 fn still_missing(marker: &std::path::Path, dats_changed: &std::path::Path, ttl: Duration) -> bool {
     let modified = |p: &std::path::Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
     fresh(marker, ttl)
+        && std::fs::read(marker).is_ok_and(|v| v == MISSING)
         && match (modified(marker), modified(dats_changed)) {
             (Some(marker), Some(dats)) => marker >= dats,
             _ => true,
@@ -190,11 +198,19 @@ pub async fn image(
             Err(()) => return None,
         }
     }
-    // The same names, in another case: libretro-thumbnails keeps some older
-    // capitalisations ("WipEout 3 - Special Edition", Redump's "Wipeout 3").
+    // The same names, in another case or punctuation: libretro-thumbnails
+    // keeps some older ones ("WipEout 3 - Special Edition", Redump's "Wipeout
+    // 3"; "Mission Pack 1", Redump's "Mission Pack #1"). Only a name that
+    // matches one file, or one in another case only.
     if let Some(index) = thumbnail_index(state, console, kind).await {
         for candidate in &names {
-            let Some(actual) = index.get(&candidate.to_lowercase()) else {
+            let Some(actual) = index
+                .get(&loose_name(candidate))
+                .and_then(|files| match files.as_slice() {
+                    [one] => Some(one),
+                    many => many.iter().find(|f| f.to_lowercase() == candidate.to_lowercase()),
+                })
+            else {
                 continue;
             };
             if actual == candidate {
@@ -210,7 +226,7 @@ pub async fn image(
             }
         }
     }
-    let _ = write_atomic(&missing, b"").await;
+    let _ = write_atomic(&missing, MISSING).await;
     None
 }
 
@@ -249,15 +265,25 @@ async fn fetch_thumbnail(
     result.map_err(|e| tracing::warn!(url, error = %e, "artwork download failed"))
 }
 
+/// A name as `loose_name` compares it: letters and digits, in lower case,
+/// in words.
+fn loose_name(name: &str) -> String {
+    name.to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// The file names (without `.png`) of a kind of libretro-thumbnails image,
-/// by lower case: lower case → actual name. Listed with GitHub's API (two
+/// by `loose_name`: loose name → actual names. Listed with GitHub's API (two
 /// requests: the repository's top directory, then this one), cached a week
 /// in the state directory.
 async fn thumbnail_index(
     state: &AppState,
     console: Console,
     kind: ImageKind,
-) -> Option<std::collections::HashMap<String, String>> {
+) -> Option<std::collections::HashMap<String, Vec<String>>> {
     let (thumbnails, sub) = thumbnails(console);
     let repo = thumbnails
         .strip_prefix("https://raw.githubusercontent.com/")?
@@ -279,7 +305,11 @@ async fn thumbnail_index(
         }
     }
     let names: Vec<String> = serde_json::from_slice(&tokio::fs::read(&path).await.ok()?).ok()?;
-    Some(names.into_iter().map(|n| (n.to_lowercase(), n)).collect())
+    let mut index: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+    for n in names {
+        index.entry(loose_name(&n)).or_default().push(n);
+    }
+    Some(index)
 }
 
 async fn list_thumbnails(state: &AppState, repo: &str, dir: &str) -> anyhow::Result<Vec<String>> {
@@ -1355,13 +1385,25 @@ mod wikipedia {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn loose_names() {
+        use super::loose_name;
+        assert_eq!(
+            loose_name("Grand Theft Auto - Mission Pack #1 - London 1969 (Europe) (En,Fr,De,It) (Rev 1)"),
+            loose_name("Grand Theft Auto - Mission Pack 1 - London 1969 (Europe) (En,Fr,De,It) (Rev 1)")
+        );
+        assert_eq!(loose_name("WipEout 3 (USA)"), "wipeout 3 usa");
+        assert_ne!(loose_name("Wipeout 3 (USA)"), loose_name("Wipeout 3 (USA) (Demo)"));
+    }
+
+    #[test]
     fn missing_markers_lapse_with_new_dats() {
         use std::time::{Duration, SystemTime};
         let dir = std::env::temp_dir().join(format!("texel-missing-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let (marker, dats) = (dir.join("x.missing"), dir.join("versions.json"));
         let at = |path: &std::path::Path, ago: u64| {
-            let f = std::fs::File::create(path).unwrap();
+            std::fs::write(path, super::MISSING).unwrap();
+            let f = std::fs::File::options().write(true).open(path).unwrap();
             f.set_modified(SystemTime::now() - Duration::from_secs(ago)).unwrap();
         };
         let week = Duration::from_secs(7 * 86_400);
@@ -1376,6 +1418,11 @@ mod tests {
         std::fs::remove_file(&dats).unwrap();
         assert!(super::still_missing(&marker, &dats, week));
         at(&marker, 8 * 86_400);
+        assert!(!super::still_missing(&marker, &dats, week));
+        // Written by an older lookup: looked for again.
+        at(&marker, 3600);
+        assert!(super::still_missing(&marker, &dats, week));
+        std::fs::write(&marker, b"").unwrap();
         assert!(!super::still_missing(&marker, &dats, week));
         std::fs::remove_dir_all(&dir).unwrap();
     }
