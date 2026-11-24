@@ -397,11 +397,19 @@ A library may be spread over several directories (another volume, a second colle
 - **Merged as one.** A game's path is relative to its directory (`games/…`, `ps2/games/…`), whichever directory it is in: its id, and so its saves, settings and verification hash, do not depend on where it lies. Games can move from one directory to another, and a directory can be added, without anything to migrate; with one directory, nothing changes.
 - **Duplicates.** A game found at the same relative path in two directories is taken from the first listed, and the scan warns. A BIOS is identified by its content: found twice, it is listed once.
 
-## D53. Shared SBI files, by Redump name
+## D53. Redump's SBI files, by Redump name
 
-Redump publishes the SBI files of every LibCrypt-protected disc (D19) as one set. A copy next to each protected image works, but the set kept whole in a directory of its own (`TEXEL_PS1_SBI`, several directories as in D52) covers every protected disc at once, and a newer set replaces it as is. The files keep Redump's names (`Disney's Tarzan (Europe).sbi`), so a disc finds its file by its Redump name.
+Redump publishes the SBI files of every LibCrypt-protected disc (D19) as one set. A copy next to each protected image works, but the set covers every protected disc at once. It was first kept in a directory of the library (`TEXEL_PS1_SBI`); the server now downloads it with Redump's DATs (D54) and keeps it in memory (235 files, about 100 KiB). The files keep Redump's names (`Disney's Tarzan (Europe).sbi`), so a disc finds its file by its Redump name.
 
 - **Not by serial.** A serial is shared by a disc's revisions and variants, and their SBI files may differ: Spyro - Year of the Dragon (Europe) Rev 0 and Rev 1 are both SCES-02835, with different files, so one of them would get the other's and stop at its protection check. Some protected discs have no serial in libretro's table (betas, a demo, some French, Spanish and Scandinavian releases), and others several, or odd ones (`SCES-02105/P`).
 - **Lookup.** A disc's own file, next to its image, comes first (it may be the only copy, or one the set lacks). Otherwise, a disc whose hashes identify it gets the file of its Redump name, if any. A disc not identified yet (not hashed, or a dump Redump does not list) has only its serial: the file of that serial's discs is used only when they all have the same one (the EDC and non-EDC variants of CTR do), and none otherwise; once hashed, it gets its own.
-- **Zipped.** Redump hands each SBI file out in a zip of its own: the directory's zips are read too, each `.sbi` in them named after itself, and decompressed (a few KiB) when asked for. A zipped disc may also carry its own, next to its CUE sheet and BINs: the one named like its CUE sheet or image, or the zip's only one when it holds one disc; a file next to the zip still comes first.
-- **When.** The directory is indexed with each library scan; the lookup is done when the game's page or the player asks, since a disc's identity changes as it gets hashed.
+- **Zipped discs.** A zipped disc may carry its own, next to its CUE sheet and BINs: the one named like its CUE sheet or image, or the zip's only one when it holds one disc (decompressed when asked for); a file next to the zip still comes first.
+- **When.** The lookup is done when the game's page or the player asks, since a disc's identity changes as it gets hashed.
+
+## D54. Redump's files from redump.info, downloaded when they change
+
+The server keeps Redump's files for each console in its state directory (`cache/dats`): the game DAT, the BIOS DAT, the CUE sheets, and for the PS1 the SBI files (D53), from redump.info's downloads, with libretro's DAT for serial numbers. They were downloaded from redump.org when older than a week (`TEXEL_DAT_MAX_AGE_DAYS`), the BIOS DATs once, pinned by their SHA-256 as they had not changed since 2016; redump.info has new ones (2026), in XML.
+
+- **When they change.** At each start (in the background) and with the periodic rescans, a HEAD request per file asks for its version: Redump serves each download under a name carrying its version (`Sony - PlayStation - Datfile (10986) (2026-11-24 13-19-14).zip`), libretro's files have an ETag. A file is downloaded only when it is missing or its version is not the one in `versions.json`, next to them; unreachable, the copy at hand is kept. `TEXEL_DAT_MAX_AGE_DAYS` is gone.
+- **Formats.** The game DAT is unzipped (as before); the BIOS DAT is XML now, `machine` entries read as `game` ones (a cached clrmamepro one still reads until replaced); the CUE sheets and SBI files are kept as Redump zips them. The SBI files are read into memory with the DATs.
+- **CUE sheets** are kept for later: nothing uses them yet.

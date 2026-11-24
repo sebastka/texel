@@ -52,18 +52,6 @@ pub struct Config {
     )]
     pub ps1_games: Vec<PathBuf>,
 
-    /// Redump's SBI files of LibCrypt-protected PlayStation discs
-    /// (read-only), named after the discs (`Ape Escape (France).sbi`): used
-    /// for discs without one next to their image. Optional; several
-    /// directories: as for `--ps1-bios`.
-    #[arg(
-        long,
-        env = "TEXEL_PS1_SBI",
-        value_delimiter = ':',
-        default_value = "/library/ps1/sbi"
-    )]
-    pub ps1_sbi: Vec<PathBuf>,
-
     /// PlayStation 2 BIOS images (read-only; any layout of subdirectories,
     /// zipped or not). Several directories: as for `--ps1-bios`.
     #[arg(
@@ -99,10 +87,6 @@ pub struct Config {
     /// Hash game files in the background to verify them against Redump.
     #[arg(long, env = "TEXEL_VERIFY", default_value_t = true, action = clap::ArgAction::Set)]
     pub verify: bool,
-
-    /// Refresh the game DATs when older than this many days.
-    #[arg(long, env = "TEXEL_DAT_MAX_AGE_DAYS", default_value_t = 7)]
-    pub dat_max_age_days: u64,
 
     /// Rescan the library this often, in minutes (0: only at start and on
     /// request).
@@ -220,13 +204,11 @@ impl Config {
                 console: Console::Ps1,
                 bios: dirs(&self.ps1_bios),
                 games: dirs(&self.ps1_games),
-                sbi: dirs(&self.ps1_sbi),
             },
             Root {
                 console: Console::Ps2,
                 bios: dirs(&self.ps2_bios),
                 games: dirs(&self.ps2_games),
-                sbi: Vec::new(),
             },
         ]
     }
@@ -273,7 +255,6 @@ async fn main() -> anyhow::Result<()> {
             console = root.console.name(),
             bios = %list(&root.bios),
             games = %list(&root.games),
-            sbi = %list(&root.sbi),
             "library"
         );
     }

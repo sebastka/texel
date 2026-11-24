@@ -27,7 +27,7 @@ Boots the BIOS shell and commercial games (tested: Rayman, Gran Turismo) at full
 
 ## Library layout
 
-The server reads its library (read-only) from five kinds of directories, each set by its own variable (`TEXEL_PS1_BIOS`, `TEXEL_PS1_GAMES`, `TEXEL_PS1_SBI`, `TEXEL_PS2_BIOS`, `TEXEL_PS2_GAMES`, see Configuration). By default they are under `/library`, where the container mounts it:
+The server reads its library (read-only) from four kinds of directories, each set by its own variable (`TEXEL_PS1_BIOS`, `TEXEL_PS1_GAMES`, `TEXEL_PS2_BIOS`, `TEXEL_PS2_GAMES`, see Configuration). By default they are under `/library`, where the container mounts it:
 
 ```
 library/
@@ -36,9 +36,6 @@ library/
 │   │   ├── original/scph1002.bin   # Sony console BIOSes, 512 KiB
 │   │   ├── psxonpsp/psxonpsp660.bin
 │   │   └── openbios/openbios.bin
-│   ├── sbi/                        # optional: Redump's SBI files of LibCrypt-protected discs
-│   │   ├── Disney's Tarzan (Europe).sbi   # named after the disc's Redump name
-│   │   └── Ape Escape (France).zip        # or zipped, as Redump hands them out
 │   └── games/
 │       ├── SLES-00049/
 │       │   ├── disc.cue            # CUE/BIN, any number of tracks
@@ -65,7 +62,7 @@ CHD and PBP images are decompressed by the server, which presents their tracks a
 
 BIOS images are identified by their content, wherever they are under `bios/`, zipped or not: by their version string and Redump's BIOS DAT. Two region-free BIOSes are known too: the PSP firmware 6.60 PS1 emulator BIOS (`psxonpsp660.bin`, which Redump does not list; the default for games of regions without a BIOS of their own), and [OpenBIOS](https://github.com/pcsx-redux/nugget/tree/main/openbios), PCSX-Redux's open-source replacement (MIT), which needs no dump from a console. OpenBIOS images carry no version; when a `SOURCE.md` next to one lists its SHA-256 (as a fetch script may write it), the server shows its build number, date and PCSX-Redux commit from there. [docs/ps1-bios.md](docs/ps1-bios.md) describes the BIOS versions, which ones to use, and their checksums.
 
-Some European discs (1999 and later) are protected by LibCrypt, which checks subchannel data that disc images do not keep: without it, they stop at a loading or copyright screen, or misbehave later. Redump publishes that data for each protected disc as an SBI file (on the disc's page, "SBI subchannels"), and all of them as a set. Keep the set in the SBI directory (`TEXEL_PS1_SBI`), with Redump's file names (`Disney's Tarzan (Europe).sbi`): a disc gets the file of its Redump name once its hashes identify it (the background verification, after the first scan). Until then, or for a dump Redump does not list, the disc only has its serial, which revisions share and they may need different files (Spyro - Year of the Dragon (Europe), Rev 0 and Rev 1): a file is then used only when all the files of that serial's discs are the same. An SBI file next to an image, named like it (`disc.chd` → `disc.sbi`, `Game (Europe).cue` → `Game (Europe).sbi`), comes first. The game's page says when a disc has one.
+Some European discs (1999 and later) are protected by LibCrypt, which checks subchannel data that disc images do not keep: without it, they stop at a loading or copyright screen, or misbehave later. Redump publishes that data for each protected disc as an SBI file, and all of them as a set, which the server downloads with Redump's DATs: a disc gets the file of its Redump name once its hashes identify it (the background verification, after the first scan). Until then, or for a dump Redump does not list, the disc only has its serial, which revisions share and they may need different files (Spyro - Year of the Dragon (Europe), Rev 0 and Rev 1): a file is then used only when all the files of that serial's discs are the same. An SBI file next to an image, named like it (`disc.chd` → `disc.sbi`, `Game (Europe).cue` → `Game (Europe).sbi`), or in a zipped game next to its CUE sheet, comes first. The game's page says when a disc has one.
 
 When the search for a game's details finds the wrong game or nothing (a title several games share, like "Bomberman"), a YAML file next to its image, named like it (`disc.chd` → `disc.yaml`), says where to look. Every key is optional:
 
@@ -87,8 +84,10 @@ Games are identified by the serial in their `SYSTEM.CNF` (through libretro's Red
 
 | Source | Used for |
 |---|---|
-| [Redump](http://redump.org/) game DATs | Canonical names, regions, languages; SHA-1 verification |
-| [Redump](http://redump.org/) BIOS DATs | BIOS models (pinned by SHA-256: they no longer change) |
+| [Redump](https://redump.info/downloads) game DATs | Canonical names, regions, languages; SHA-1 verification |
+| [Redump](https://redump.info/downloads) BIOS DATs | BIOS models |
+| [Redump](https://redump.info/downloads) SBI files | Subchannel data of LibCrypt-protected PS1 discs |
+| [Redump](https://redump.info/downloads) CUE sheets | Kept with the DATs (not used yet) |
 | [libretro-database](https://github.com/libretro/libretro-database) | Serial → Redump name |
 | libretro-thumbnails ([PS1](https://github.com/libretro-thumbnails/Sony_-_PlayStation), [PS2](https://github.com/libretro-thumbnails/Sony_-_PlayStation_2)) | Box art, title screens, in-game snapshots |
 | [Wikipedia](https://en.wikipedia.org/) | Game descriptions (CC BY-SA, credited on the game page) |
@@ -117,7 +116,7 @@ pnpm run wasm                   # build the core to WebAssembly
 pnpm run build                  # build the web app
 cd ..
 export TEXEL_DATABASE_URL=mysql://texel:change-me@127.0.0.1:13306/texel
-export TEXEL_PS1_BIOS=/path/to/ps1/bios TEXEL_PS1_GAMES=/path/to/ps1/games TEXEL_PS1_SBI=/path/to/ps1/sbi
+export TEXEL_PS1_BIOS=/path/to/ps1/bios TEXEL_PS1_GAMES=/path/to/ps1/games
 export TEXEL_PS2_BIOS=/path/to/ps2/bios TEXEL_PS2_GAMES=/path/to/ps2/games
 cargo run --release -p texel-server -- --state ./state --web frontend/dist
 ```
@@ -154,7 +153,6 @@ Everyone but administrators is a guest: guests play, keep saves, open and join r
 | `TEXEL_LISTEN` | `0.0.0.0:8080` | Listen address |
 | `TEXEL_PS1_BIOS` | `/library/ps1/bios` | PlayStation BIOS images (directories, separated by `:`) |
 | `TEXEL_PS1_GAMES` | `/library/ps1/games` | PlayStation games (directories, separated by `:`) |
-| `TEXEL_PS1_SBI` | `/library/ps1/sbi` | Redump's SBI files of LibCrypt-protected discs, named after them, zipped or not (directories, separated by `:`; optional) |
 | `TEXEL_PS2_BIOS` | `/library/ps2/bios` | PlayStation 2 BIOS images (directories, separated by `:`) |
 | `TEXEL_PS2_GAMES` | `/library/ps2/games` | PlayStation 2 games (directories, separated by `:`; the emulator is in progress) |
 | `TEXEL_DATABASE_URL` | | Required: `mysql://user:password@host:3306/database` (MariaDB or MySQL; add `?ssl-mode=required` for TLS) |
@@ -162,7 +160,6 @@ Everyone but administrators is a guest: guests play, keep saves, open and join r
 | `TEXEL_WEB` | `/usr/share/texel/web` | Built web app |
 | `TEXEL_FETCH_METADATA` | `true` | Fetch DATs, artwork and game details |
 | `TEXEL_VERIFY` | `true` | Hash games in the background to verify them against Redump |
-| `TEXEL_DAT_MAX_AGE_DAYS` | `7` | Refresh the game DATs when older |
 | `TEXEL_RESCAN_MINUTES` | `30` | Rescan the library periodically (0: off) |
 | `TEXEL_IGDB_CLIENT_ID`, `TEXEL_IGDB_CLIENT_SECRET` | | [Twitch application](https://api-docs.igdb.com/#account-creation) credentials for IGDB |
 | `TEXEL_PUBLIC_URL` | | The address users reach Texel at (`https://texel.example.com`): OpenID Connect's redirect, secure cookies, the same-origin check. Without it, the request's host, over http |

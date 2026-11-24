@@ -1,5 +1,6 @@
-//! DAT files, for each console: Redump's game (XML) and BIOS (clrmamepro)
-//! DATs, and libretro's Redump-derived DAT, which adds serial numbers.
+//! DAT files, for each console: Redump's game and BIOS DATs (XML), its CUE
+//! sheets and (PS1) SBI files, from redump.info, and libretro's
+//! Redump-derived DAT, which adds serial numbers.
 
 use std::collections::HashMap;
 use std::io::Read;
@@ -8,38 +9,46 @@ use anyhow::Context;
 
 use crate::library::Console;
 
-/// Where a console's DATs come from, and the files they are cached in.
+/// Where a console's files come from, and the files they are cached in.
 pub struct Sources {
+    /// Redump's game DAT (a zip holding it; cached unzipped).
     pub games_url: &'static str,
     pub games_file: &'static str,
     pub serials_url: &'static str,
     pub serials_file: &'static str,
+    /// Redump's BIOS DAT (XML).
     pub bios_url: &'static str,
     pub bios_file: &'static str,
-    /// Redump's BIOS DATs no longer change: pinned.
-    pub bios_sha256: &'static str,
+    /// Redump's CUE sheets (a zip, kept as it is).
+    pub cues_url: &'static str,
+    pub cues_file: &'static str,
+    /// Redump's SBI files (a zip, kept as it is): PS1 discs only.
+    pub sbi: Option<(&'static str, &'static str)>,
 }
 
 pub fn sources(console: Console) -> &'static Sources {
     match console {
         Console::Ps1 => &Sources {
-            games_url: "http://redump.org/datfile/psx/",
+            games_url: "https://redump.info/datfile/PSX",
             games_file: "redump-psx.dat",
             serials_url: "https://raw.githubusercontent.com/libretro/libretro-database/master/metadat/redump/Sony%20-%20PlayStation.dat",
             serials_file: "libretro-psx.dat",
-            bios_url: "http://redump.org/datfile/psx-bios/",
+            bios_url: "https://redump.info/bios/PSX",
             bios_file: "redump-psx-bios.dat",
-            // Unchanged since 2016-10-21.
-            bios_sha256: "8a7c3d6819b636a0d642d975a0156094ea5ff12d4777f70c45792a2286ac3de0",
+            cues_url: "https://redump.info/cues/PSX",
+            cues_file: "redump-psx-cues.zip",
+            sbi: Some(("https://redump.info/sbi/PSX", "redump-psx-sbi.zip")),
         },
         Console::Ps2 => &Sources {
-            games_url: "http://redump.org/datfile/ps2/",
+            games_url: "https://redump.info/datfile/PS2",
             games_file: "redump-ps2.dat",
             serials_url: "https://raw.githubusercontent.com/libretro/libretro-database/master/metadat/redump/Sony%20-%20PlayStation%202.dat",
             serials_file: "libretro-ps2.dat",
-            bios_url: "http://redump.org/datfile/ps2-bios/",
+            bios_url: "https://redump.info/bios/PS2",
             bios_file: "redump-ps2-bios.dat",
-            bios_sha256: "7d9ca6fd4e238e3fcbe9564fd57f4f30b4c400355de02ac189166ccaabdd03f4",
+            cues_url: "https://redump.info/cues/PS2",
+            cues_file: "redump-ps2-cues.zip",
+            sbi: None,
         },
     }
 }
@@ -95,6 +104,8 @@ pub struct Dats {
     serials: HashMap<String, Vec<SerialEntry>>,
     /// BIOS SHA-1 → description, e.g. "SCPH-1002/DTL-H1002 (Version 2.0 05/10/95 E)".
     pub bios: HashMap<String, String>,
+    /// Redump's SBI files: Redump name → content (a few hundred bytes each).
+    pub sbi: HashMap<String, std::sync::Arc<Vec<u8>>>,
 }
 
 struct SerialEntry {
@@ -202,7 +213,28 @@ pub fn unzip_dat(bytes: &[u8]) -> anyhow::Result<String> {
     anyhow::bail!("no .dat in the zip")
 }
 
-/// Parses a Logiqx XML DAT (Redump's game DATs).
+/// The SBI files of Redump's zip: the name without `.sbi` → content.
+pub fn unzip_sbis(bytes: &[u8]) -> anyhow::Result<HashMap<String, std::sync::Arc<Vec<u8>>>> {
+    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).context("reading the zip")?;
+    let mut out = HashMap::new();
+    for i in 0..zip.len() {
+        let mut file = zip.by_index(i)?;
+        let full = file.name()?.into_owned();
+        let name = full.rsplit('/').next().unwrap_or(&full);
+        if let Some((stem, ext)) = name.rsplit_once('.')
+            && ext.eq_ignore_ascii_case("sbi")
+        {
+            let stem = stem.to_owned();
+            let mut data = Vec::new();
+            file.read_to_end(&mut data)?;
+            out.insert(stem, std::sync::Arc::new(data));
+        }
+    }
+    Ok(out)
+}
+
+/// Parses a Logiqx XML DAT (Redump's game and BIOS DATs: `game` or
+/// `machine` entries).
 pub fn parse_xml(xml: &str) -> anyhow::Result<Vec<DatGame>> {
     use quick_xml::XmlVersion;
     use quick_xml::events::Event;
@@ -212,7 +244,7 @@ pub fn parse_xml(xml: &str) -> anyhow::Result<Vec<DatGame>> {
     let mut in_description = false;
     loop {
         match reader.read_event().context("parsing the XML DAT")? {
-            Event::Start(e) | Event::Empty(e) if e.name().as_ref() == "game" => {
+            Event::Start(e) | Event::Empty(e) if e.name().as_ref() == "game" || e.name().as_ref() == "machine" => {
                 let mut g = DatGame::default();
                 for a in e.attributes().flatten() {
                     if a.key.as_ref() == "name" {
@@ -243,7 +275,7 @@ pub fn parse_xml(xml: &str) -> anyhow::Result<Vec<DatGame>> {
                     g.roms.push(rom);
                 }
             }
-            Event::End(e) if e.name().as_ref() == "game" => {
+            Event::End(e) if e.name().as_ref() == "game" || e.name().as_ref() == "machine" => {
                 if let Some(g) = current.take() {
                     games.push(g);
                 }
@@ -450,5 +482,33 @@ game (
         assert!(dats.identify(None, &[1]).is_none());
         assert!(dats.by_hashes(&["bb".into(), "aa".into()]).is_some());
         assert!(dats.bios["20b98f3d80f11cbf5a7bfd0779b0e63760ecc62c"].starts_with("SCPH-1002"));
+    }
+
+    #[test]
+    fn redump_bios_xml_and_sbi_zip() {
+        // redump.info's BIOS DATs: Logiqx XML, `machine` entries.
+        let xml = r#"<?xml version="1.0" encoding="utf-8"?>
+<datafile>
+	<header><name>Sony - PlayStation - BIOS Images</name></header>
+	<machine name="ps-10j">
+		<description>SCPH-1000/DTL-H1000 (Version 1.0 J)</description>
+		<rom name="ps-10j.bin" size="524288" crc="3b601fc8" sha1="343883A7B555646DA8CEE54AADD2795B6E7DD070" />
+	</machine>
+</datafile>"#;
+        let dats = Dats::new(Vec::new(), Vec::new(), parse_xml(xml).unwrap());
+        assert_eq!(
+            dats.bios["343883a7b555646da8cee54aadd2795b6e7dd070"],
+            "SCPH-1000/DTL-H1000 (Version 1.0 J)"
+        );
+        // Its SBI files: one zip, named after the discs.
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        for (name, data) in [("Ape Escape (France).sbi", &b"one"[..]), ("readme.txt", &b"no"[..])] {
+            zip.start_file(name, zip::write::SimpleFileOptions::default()).unwrap();
+            std::io::Write::write_all(&mut zip, data).unwrap();
+        }
+        let bytes = zip.finish().unwrap().into_inner();
+        let sbi = unzip_sbis(&bytes).unwrap();
+        assert_eq!(sbi.len(), 1);
+        assert_eq!(sbi["Ape Escape (France)"].as_slice(), b"one");
     }
 }
