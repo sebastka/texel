@@ -5,7 +5,7 @@
   "engines": {
     "node": ">=26"
   },
-  "packageManager": "pnpm@12.21.0",
+  "packageManager": "pnpm@12.22.0",
   "scripts": {
     "wasm": "cargo build --profile wasm --locked -p texel-web -p texel-web-ps2 --target wasm32-unknown-unknown && wasm-bindgen --target web --out-dir src/wasm ../target/wasm32-unknown-unknown/wasm/texel_web.wasm && wasm-bindgen --target web --out-dir src/wasm ../target/wasm32-unknown-unknown/wasm/texel_web_ps2.wasm && wasm-opt -O3 --enable-bulk-memory --enable-nontrapping-float-to-int --enable-sign-ext --enable-mutable-globals -o src/wasm/texel_web_bg.wasm src/wasm/texel_web_bg.wasm && wasm-opt -O3 --enable-bulk-memory --enable-nontrapping-float-to-int --enable-sign-ext --enable-mutable-globals -o src/wasm/texel_web_ps2_bg.wasm src/wasm/texel_web_ps2_bg.wasm",
     "dev": "vite",
