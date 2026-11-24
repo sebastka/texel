@@ -54,6 +54,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ps2.load_state(&std::fs::read(&path)?)?;
         println!("Loaded {path}");
     }
+    // VU1THREAD=1: VU1 in a thread of its own (see `vu1q`).
+    if std::env::var("VU1THREAD").is_ok() {
+        let b = &mut ps2.bus;
+        b.vu1q
+            .set_backend(Some(Box::new(texel_ps2::vu1q::Thread::spawn())), &b.vu1, &b.gif);
+    }
     // TRACE=N: the first N instructions' addresses, with the stack pointer
     // and Status, when they change.
     if let Some(n) = std::env::var("TRACE").ok().and_then(|v| v.parse::<u64>().ok()) {
@@ -143,6 +149,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let iop_out = ps2.iop_printf.as_ref().map_or(&ps2.bus.iop.out, |p| &p.out);
         print_lines(&mut out, "IOP | ", iop_out, &mut iop_printed)?;
     }
+    // How long the run took, and a hash of the state it reached (equal on
+    // two runs that went the same way).
+    let ran = started.elapsed().as_secs_f64();
+    ps2.settle();
+    let hash = ps2.save_state().iter().fold(0xCBF2_9CE4_8422_2325u64, |h, &b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01B3)
+    });
+    println!("Ran in {ran:.2} s; state {hash:016x}");
     if let Ok(path) = std::env::var("SAVE") {
         let state = ps2.save_state();
         std::fs::write(&path, &state)?;
@@ -411,6 +425,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ps2.bus.vu0.steps,
         ps2.bus.vu0.runaways
     );
+    println!("VU1 queue {:?}", ps2.bus.vu1q.stats);
+    println!("GIF quadwords by path {:?}", ps2.bus.gif.qwords);
     let mut gs_regs: BTreeMap<u32, u64> = BTreeMap::new();
     for &(off, v) in &ps2.bus.gs.privileged.writes {
         gs_regs.insert(off, v);

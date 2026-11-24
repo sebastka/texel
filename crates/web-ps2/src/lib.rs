@@ -102,11 +102,27 @@ impl Ps2Emulator {
         Ok(())
     }
 
+    /// Runs VU1 in another worker from now on: `send(batch)` hands it a
+    /// batch of operations (a Uint8Array), `wait()` waits for those sent
+    /// to have run and returns what they recorded (see `vu1-pipe.ts`).
+    #[wasm_bindgen(js_name = setVu1Worker)]
+    pub fn set_vu1_worker(&mut self, send: js_sys::Function, wait: js_sys::Function) {
+        self.ps2.settle();
+        let b = &mut self.ps2.bus;
+        b.vu1q.take_backend();
+        b.vu1q.set_backend(Some(Box::new(JsVu1 { send, wait })), &b.vu1, &b.gif);
+    }
+
     /// What the VUs' compiler did, for diagnostics.
     #[wasm_bindgen(js_name = vuCompilerStats)]
     pub fn vu_compiler_stats(&self) -> String {
         let stats = |vu: &texel_ps2::vu::Vu| vu.jit.as_ref().map_or("off".to_owned(), |j| format!("{:?}", j.stats));
-        format!("VU0 {}; VU1 {}", stats(&self.ps2.bus.vu0), stats(&self.ps2.bus.vu1))
+        format!(
+            "VU0 {}; VU1 {}; VU1 queue {:?}",
+            stats(&self.ps2.bus.vu0),
+            stats(&self.ps2.bus.vu1),
+            self.ps2.bus.vu1q.stats
+        )
     }
 
     /// What the compiler did, for diagnostics.
@@ -121,7 +137,9 @@ impl Ps2Emulator {
     /// A hash of the EE's registers and memory and of the GS memory: equal
     /// on two runs when they went the same way.
     #[wasm_bindgen(js_name = stateHash)]
-    pub fn state_hash(&self) -> String {
+    pub fn state_hash(&mut self) -> String {
+        // VU1's work done, wherever it runs.
+        self.ps2.settle();
         // FNV-1a, 64 bits.
         let mut h: u64 = 0xCBF2_9CE4_8422_2325;
         let mut eat = |bytes: &[u8]| {
@@ -180,9 +198,12 @@ impl Ps2Emulator {
     /// cards): a promise of its bytes (the GS memory is read back from the
     /// GPU when it draws there).
     #[wasm_bindgen(js_name = saveState)]
-    pub fn save_state(&self) -> js_sys::Promise {
+    pub fn save_state(&mut self) -> js_sys::Promise {
+        // VU1's queued work first (its drawing too, to the GPU).
+        self.ps2.settle();
         #[cfg(target_arch = "wasm32")]
-        if let Some(gpu) = &self.gpu {
+        if let Some(gpu) = &mut self.gpu {
+            gpu.submit(&self.ps2.bus.gs.take_commands());
             let core = self.ps2.save_core();
             let read = gpu.read_state();
             return wasm_bindgen_futures::future_to_promise(async move {
@@ -246,7 +267,10 @@ impl Ps2Emulator {
         let rendering = self.ps2.bus.gs.rendering;
         let disc = self.ps2.bus.iop.cdvd.disc.take();
         let cards = std::mem::take(&mut self.ps2.bus.iop.sio2.cards);
+        let vu1 = self.ps2.bus.vu1q.take_backend();
         self.ps2 = Ps2::new(&self.bios);
+        let b = &mut self.ps2.bus;
+        b.vu1q.set_backend(vu1, &b.vu1, &b.gif);
         self.ps2.bus.iop.sio2.cards = cards;
         // The same disc, booted again.
         if let Some(d) = disc {
@@ -374,5 +398,78 @@ impl Ps2Emulator {
             Some(i) => format!("PlayStation 2 BIOS {} ({}, {})", i.version, i.date, i.region.as_str()),
             None => String::new(),
         }
+    }
+}
+
+/// VU1 in another worker, through the functions given to `setVu1Worker`.
+struct JsVu1 {
+    send: js_sys::Function,
+    wait: js_sys::Function,
+}
+
+impl texel_ps2::vu1q::Vu1Backend for JsVu1 {
+    fn send(&mut self, batch: Vec<u8>) {
+        let batch = js_sys::Uint8Array::from(&batch[..]);
+        self.send
+            .call1(&JsValue::NULL, &batch)
+            .expect("VU1's worker took no batch");
+    }
+
+    fn wait(&mut self) -> Vec<u8> {
+        let records = self.wait.call0(&JsValue::NULL).expect("VU1's worker gave no records");
+        js_sys::Uint8Array::new(&records).to_vec()
+    }
+}
+
+/// VU1 for another worker (see `Ps2Emulator::setVu1Worker`): runs the
+/// batches of operations it is given, returning what they recorded.
+#[wasm_bindgen]
+pub struct Vu1Worker {
+    engine: texel_ps2::vu1q::Vu1Engine,
+}
+
+#[wasm_bindgen]
+impl Vu1Worker {
+    #[wasm_bindgen(constructor)]
+    pub fn new() -> Vu1Worker {
+        Self {
+            engine: Default::default(),
+        }
+    }
+
+    /// Compiles VU1's microprograms to WebAssembly (`true`), or interprets
+    /// them, as `Ps2Emulator::setVuCompiler`.
+    #[wasm_bindgen(js_name = setCompiler)]
+    pub fn set_compiler(&mut self, on: bool) -> Result<(), JsError> {
+        self.engine.vu.jit = None;
+        #[cfg(target_arch = "wasm32")]
+        if on {
+            let backend = jit::WebBackend::new().map_err(|e| JsError::new(&format!("{e:?}")))?;
+            self.engine.vu.jit = Some(Box::new(texel_ps2::vu_jit::VuJit::new(Box::new(backend))));
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        let _ = on;
+        Ok(())
+    }
+
+    /// Runs a batch: what it recorded.
+    pub fn process(&mut self, batch: &[u8]) -> Vec<u8> {
+        self.engine.process(batch)
+    }
+
+    /// What the compiler did, for diagnostics.
+    #[wasm_bindgen(js_name = compilerStats)]
+    pub fn compiler_stats(&self) -> String {
+        self.engine
+            .vu
+            .jit
+            .as_ref()
+            .map_or("off".to_owned(), |j| format!("{:?}", j.stats))
+    }
+}
+
+impl Default for Vu1Worker {
+    fn default() -> Self {
+        Self::new()
     }
 }

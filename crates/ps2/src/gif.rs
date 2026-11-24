@@ -26,6 +26,9 @@ pub struct Gif {
     q: u32,
     /// Packets processed, for diagnostics.
     pub packets: [u64; 3],
+    /// Quadwords received, by path, for diagnostics.
+    #[serde(skip)]
+    pub qwords: [u64; 3],
     /// When set (diagnostics): the writes to FRAME_1 and XYOFFSET_1, with
     /// their path and how many commands the GS had recorded before.
     #[serde(skip)]
@@ -38,6 +41,11 @@ pub struct Gif {
     pub find: Option<(u32, u32)>,
     #[serde(skip)]
     pub found: Vec<usize>,
+    /// In a `Vu1Engine`: the quadwords received, recorded rather than
+    /// sent to the GS (their tags are still read, for where an XGKICK's
+    /// packet ends).
+    #[serde(skip)]
+    pub(crate) capture: Option<crate::vu1q::Stream>,
 }
 
 impl Gif {
@@ -49,22 +57,17 @@ impl Gif {
     /// One quadword on a path (0, 1, 2 for paths 1, 2, 3).
     pub fn write(&mut self, path: usize, qword: u128, gs: &mut Gs) {
         self.path = path;
+        self.qwords[path] += 1;
+        if let Some(c) = self.capture.as_mut() {
+            c.path(path, qword);
+            Self::skip(&mut self.paths[path], qword);
+            return;
+        }
         let p = &mut self.paths[path];
         if p.nloop == 0 {
-            // A tag.
-            let lo = qword as u64;
-            p.nloop = (lo & 0x7FFF) as u32;
-            p.eop = lo & 0x8000 != 0;
-            p.format = ((lo >> 58) & 3) as u32;
-            p.nreg = match ((lo >> 60) & 15) as u32 {
-                0 => 16,
-                n => n,
-            };
-            p.regs = (qword >> 64) as u64;
-            p.index = 0;
             self.packets[path] += 1;
-            if lo & (1 << 46) != 0 {
-                gs.write_reg(reg::PRIM, (lo >> 47) & 0x7FF);
+            if let Some(prim) = Self::tag(p, qword) {
+                gs.write_reg(reg::PRIM, prim);
             }
             return;
         }
@@ -96,6 +99,47 @@ impl Gif {
                 gs.write_reg(reg::HWREG, (qword >> 64) as u64);
             }
         }
+    }
+
+    /// A tag: the packet's loops, format and registers; the PRIM it sets,
+    /// if any.
+    fn tag(p: &mut Path, qword: u128) -> Option<u64> {
+        let lo = qword as u64;
+        p.nloop = (lo & 0x7FFF) as u32;
+        p.eop = lo & 0x8000 != 0;
+        p.format = ((lo >> 58) & 3) as u32;
+        p.nreg = match ((lo >> 60) & 15) as u32 {
+            0 => 16,
+            n => n,
+        };
+        p.regs = (qword >> 64) as u64;
+        p.index = 0;
+        (lo & (1 << 46) != 0).then_some((lo >> 47) & 0x7FF)
+    }
+
+    /// Where a quadword leaves its path, as `write` would, writing nothing.
+    fn skip(p: &mut Path, qword: u128) {
+        if p.nloop == 0 {
+            Self::tag(p, qword);
+            return;
+        }
+        match p.format {
+            0 => Self::advance(p),
+            1 => {
+                for _ in 0..2 {
+                    if p.nloop == 0 {
+                        break;
+                    }
+                    Self::advance(p);
+                }
+            }
+            _ => p.nloop -= 1,
+        }
+    }
+
+    /// An XGKICK's packet has ended: path 1 starts afresh.
+    pub fn end_kick(&mut self) {
+        self.paths[0] = Path::default();
     }
 
     fn advance(p: &mut Path) {
@@ -169,7 +213,10 @@ impl Gif {
                 break;
             }
         }
-        self.paths[0] = Path::default();
+        if let Some(c) = self.capture.as_mut() {
+            c.kick_end();
+        }
+        self.end_kick();
         a.wrapping_sub(addr)
     }
 }
