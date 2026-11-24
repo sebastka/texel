@@ -43,6 +43,10 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["std", "fmt", "ansi", "env-filter", "json"] }
 zip = { version = "9.8.1", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
+# posix_fadvise (pagecache.rs).
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2.191"
+
 [dev-dependencies]
 # The memory card size the server accepts for PS2 games.
 texel-ps2.workspace = true
