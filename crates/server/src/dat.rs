@@ -143,6 +143,16 @@ impl Dats {
         self.by_name.get(name).map(|&i| &self.games[i])
     }
 
+    /// The Redump names libretro gives a serial (several: revisions,
+    /// variants).
+    pub fn serial_names(&self, serial: &str) -> impl Iterator<Item = &str> {
+        self.serials
+            .get(&serial.to_ascii_uppercase())
+            .into_iter()
+            .flatten()
+            .map(|e| e.name.as_str())
+    }
+
     /// Identifies a disc from its serial and file sizes. Returns a Redump
     /// name.
     pub fn identify(&self, serial: Option<&str>, sizes: &[u64]) -> Option<String> {
@@ -325,10 +335,19 @@ fn tokenize(text: &str) -> Vec<Token> {
                 chars.next();
             }
             _ => {
+                // Parentheses inside a word are part of it: the ROM names
+                // `ps-22j(v).bin` and `ps-41a(w).bin` are unquoted. Blocks'
+                // own parentheses stand apart, after whitespace.
                 let mut s = String::new();
+                let mut depth = 0usize;
                 while let Some(&c) = chars.peek() {
-                    if c.is_whitespace() || c == '(' || c == ')' {
+                    if c.is_whitespace() || (c == ')' && depth == 0) {
                         break;
+                    }
+                    match c {
+                        '(' => depth += 1,
+                        ')' => depth -= 1,
+                        _ => {}
                     }
                     s.push(c);
                     chars.next();
@@ -371,6 +390,26 @@ fn parse_block(tokens: &[Token], mut i: usize) -> (Vec<(String, Value)>, usize) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parentheses_in_unquoted_names() {
+        // Redump's PS1 BIOS DAT names two ROMs so.
+        let games = parse_clrmamepro(
+            r#"game (
+	name "ps-41a(w)"
+	description "SCPH-7000W (Version 4.1 11/14/97 A)"
+	rom ( name ps-41a(w).bin size 524288 crc b7c43dad md5 b84be139db3ee6cbd075630aa20a6553 sha1 1b0dbdb23da9dc0776aac58d0755dc80fea20975 )
+)
+game (
+	name "ps-41e"
+	rom ( name ps-41e.bin size 524288 sha1 8d5de56a79954f29e9006929ba3fed9b6a418c1d )
+)"#,
+        );
+        assert_eq!(games.len(), 2);
+        assert_eq!(games[0].roms[0].name, "ps-41a(w).bin");
+        assert_eq!(games[0].roms[0].sha1, "1b0dbdb23da9dc0776aac58d0755dc80fea20975");
+        assert_eq!(games[1].roms[0].sha1, "8d5de56a79954f29e9006929ba3fed9b6a418c1d");
+    }
 
     #[test]
     fn clrmamepro_and_identification() {

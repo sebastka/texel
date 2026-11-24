@@ -31,30 +31,58 @@ pub struct Config {
     #[arg(long, env = "TEXEL_LISTEN", default_value = "0.0.0.0:8080")]
     pub listen: SocketAddr,
 
-    /// Library root (read-only), with one directory per console: `ps1/bios`,
-    /// `ps1/games`, `ps2/bios` and `ps2/games`, unless set apart below.
-    #[arg(long, env = "TEXEL_LIBRARY", default_value = "/library")]
-    pub library: PathBuf,
+    /// PlayStation BIOS images (read-only; any layout of subdirectories,
+    /// zipped or not). Several directories: separated by `:`, or the option
+    /// repeated.
+    #[arg(
+        long,
+        env = "TEXEL_PS1_BIOS",
+        value_delimiter = ':',
+        default_value = "/library/ps1/bios"
+    )]
+    pub ps1_bios: Vec<PathBuf>,
 
-    /// PlayStation BIOS images (any layout of subdirectories) [default:
-    /// LIBRARY/ps1/bios].
-    #[arg(long, env = "TEXEL_PS1_BIOS")]
-    pub ps1_bios: Option<PathBuf>,
+    /// PlayStation games (read-only): CUE/BIN, ISO, CHD, PBP, zipped images.
+    /// Several directories: as for `--ps1-bios`.
+    #[arg(
+        long,
+        env = "TEXEL_PS1_GAMES",
+        value_delimiter = ':',
+        default_value = "/library/ps1/games"
+    )]
+    pub ps1_games: Vec<PathBuf>,
 
-    /// PlayStation games: CUE/BIN, ISO, CHD, PBP, zipped images [default:
-    /// LIBRARY/ps1/games].
-    #[arg(long, env = "TEXEL_PS1_GAMES")]
-    pub ps1_games: Option<PathBuf>,
+    /// Redump's SBI files of LibCrypt-protected PlayStation discs
+    /// (read-only), named after the discs (`Ape Escape (France).sbi`): used
+    /// for discs without one next to their image. Optional; several
+    /// directories: as for `--ps1-bios`.
+    #[arg(
+        long,
+        env = "TEXEL_PS1_SBI",
+        value_delimiter = ':',
+        default_value = "/library/ps1/sbi"
+    )]
+    pub ps1_sbi: Vec<PathBuf>,
 
-    /// PlayStation 2 BIOS images (any layout of subdirectories) [default:
-    /// LIBRARY/ps2/bios].
-    #[arg(long, env = "TEXEL_PS2_BIOS")]
-    pub ps2_bios: Option<PathBuf>,
+    /// PlayStation 2 BIOS images (read-only; any layout of subdirectories,
+    /// zipped or not). Several directories: as for `--ps1-bios`.
+    #[arg(
+        long,
+        env = "TEXEL_PS2_BIOS",
+        value_delimiter = ':',
+        default_value = "/library/ps2/bios"
+    )]
+    pub ps2_bios: Vec<PathBuf>,
 
-    /// PlayStation 2 games: ISO, CHD, zipped images [default:
-    /// LIBRARY/ps2/games].
-    #[arg(long, env = "TEXEL_PS2_GAMES")]
-    pub ps2_games: Option<PathBuf>,
+    /// PlayStation 2 games (read-only): ISO, CHD, zipped images. Several
+    /// directories: as for `--ps1-bios`.
+    #[arg(
+        long,
+        env = "TEXEL_PS2_GAMES",
+        value_delimiter = ':',
+        default_value = "/library/ps2/games"
+    )]
+    pub ps2_games: Vec<PathBuf>,
 
     /// Writable state: memory cards and the metadata cache.
     #[arg(long, env = "TEXEL_STATE", default_value = "/state")]
@@ -182,35 +210,23 @@ impl Config {
         })
     }
 
-    pub fn ps1_bios(&self) -> PathBuf {
-        self.ps1_bios.clone().unwrap_or_else(|| self.library.join("ps1/bios"))
-    }
-
-    pub fn ps1_games(&self) -> PathBuf {
-        self.ps1_games.clone().unwrap_or_else(|| self.library.join("ps1/games"))
-    }
-
-    pub fn ps2_bios(&self) -> PathBuf {
-        self.ps2_bios.clone().unwrap_or_else(|| self.library.join("ps2/bios"))
-    }
-
-    pub fn ps2_games(&self) -> PathBuf {
-        self.ps2_games.clone().unwrap_or_else(|| self.library.join("ps2/games"))
-    }
-
-    /// Each console's BIOS and game directories.
+    /// Each console's BIOS and game directories (empty paths, as in
+    /// `a::b`, skipped).
     pub fn library_roots(&self) -> Vec<library::Root> {
         use library::{Console, Root};
+        let dirs = |given: &[PathBuf]| given.iter().filter(|p| !p.as_os_str().is_empty()).cloned().collect();
         vec![
             Root {
                 console: Console::Ps1,
-                bios: self.ps1_bios(),
-                games: self.ps1_games(),
+                bios: dirs(&self.ps1_bios),
+                games: dirs(&self.ps1_games),
+                sbi: dirs(&self.ps1_sbi),
             },
             Root {
                 console: Console::Ps2,
-                bios: self.ps2_bios(),
-                games: self.ps2_games(),
+                bios: dirs(&self.ps2_bios),
+                games: dirs(&self.ps2_games),
+                sbi: Vec::new(),
             },
         ]
     }
@@ -247,10 +263,17 @@ async fn main() -> anyhow::Result<()> {
     std::fs::create_dir_all(&cache).with_context(|| format!("creating {}", cache.display()))?;
 
     for root in config.library_roots() {
+        let list = |dirs: &[PathBuf]| {
+            dirs.iter()
+                .map(|d| d.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
         tracing::info!(
             console = root.console.name(),
-            bios = %root.bios.display(),
-            games = %root.games.display(),
+            bios = %list(&root.bios),
+            games = %list(&root.games),
+            sbi = %list(&root.sbi),
             "library"
         );
     }

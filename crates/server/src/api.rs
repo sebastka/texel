@@ -407,7 +407,7 @@ async fn game_detail(State(state): AppStateRef, viewer: Viewer, Path(id): Path<S
         details,
         last_bios,
         last_cards,
-        sbi: g.sbi.is_some(),
+        sbi: state.sbi(&lib, g).await.is_some(),
         links: g.overrides.as_ref().map(|o| o.links.clone()).unwrap_or_default(),
         overrides_error: g.overrides_error.clone(),
     })
@@ -420,8 +420,23 @@ async fn game_sbi(State(state): AppStateRef, viewer: Viewer, Path(id): Path<Stri
         return forbidden();
     }
     let lib = state.library.read().await.clone();
-    match lib.game(&id).and_then(|g| g.sbi.clone()) {
-        Some(path) => serve_path(path, req, "application/octet-stream").await,
+    let Some(game) = lib.game(&id) else {
+        return not_found("game");
+    };
+    match state.sbi(&lib, game).await {
+        Some(crate::library::SbiFile::File(path)) => serve_path(path, req, "application/octet-stream").await,
+        // In a zip: a few KiB, decompressed.
+        Some(zipped) => match tokio::task::spawn_blocking(move || zipped.read()).await {
+            Ok(Ok(data)) => ([(header::CONTENT_TYPE, "application/octet-stream")], data).into_response(),
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, "reading a zipped SBI file failed");
+                StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "reading a zipped SBI file failed");
+                StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            }
+        },
         None => not_found("SBI file"),
     }
 }

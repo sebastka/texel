@@ -151,6 +151,7 @@ impl AppState {
                     games = ps1.1,
                     ps2_bios = ps2.0,
                     ps2_games = ps2.1,
+                    sbi = lib.sbi.len(),
                     ms = started.elapsed().as_millis() as u64,
                     "library scanned"
                 );
@@ -262,6 +263,46 @@ impl AppState {
                 false
             }
         }
+    }
+
+    /// The SBI file of a LibCrypt-protected PS1 disc: its own, next to its
+    /// image; else the shared one named after its Redump name, once its
+    /// hashes identify it. Before that (not hashed yet, or a dump Redump
+    /// does not list), only its serial is known, which revisions share and
+    /// they may need different files (Spyro - Year of the Dragon (Europe),
+    /// Rev 0 and Rev 1): a shared file is then used only when every file of
+    /// that serial's discs is the same.
+    pub async fn sbi(&self, lib: &Library, game: &Game) -> Option<crate::library::SbiFile> {
+        if let Some(own) = &game.sbi {
+            return Some(own.clone());
+        }
+        if game.console != Console::Ps1 || lib.sbi.is_empty() {
+            return None;
+        }
+        let identity = self.identify(game).await;
+        if identity.verified == Some(true) {
+            return identity.name.and_then(|name| lib.sbi.get(&name).cloned());
+        }
+        let serial = game.serial.as_deref()?;
+        let all = self.dats.read().await.clone();
+        let mut files: Vec<&crate::library::SbiFile> = all
+            .get(game.console)
+            .serial_names(serial)
+            .filter_map(|name| lib.sbi.get(name))
+            .collect();
+        files.sort();
+        files.dedup();
+        let read = |f: &crate::library::SbiFile| {
+            let f = f.clone();
+            tokio::task::spawn_blocking(move || f.read())
+        };
+        let first = read(files.first()?).await.ok()?.ok()?;
+        for other in &files[1..] {
+            if read(other).await.ok()?.ok()? != first {
+                return None;
+            }
+        }
+        Some(files[0].clone())
     }
 
     pub async fn identify(&self, game: &Game) -> Identity {

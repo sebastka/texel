@@ -53,8 +53,7 @@ COPY --from=rust --chmod=0755 /texel /usr/local/bin/texel
 COPY --from=web /src/frontend/dist /usr/share/texel/web
 
 USER 65532:65532
-ENV TEXEL_LIBRARY=/library \
-    TEXEL_STATE=/state \
+ENV TEXEL_STATE=/state \
     TEXEL_WEB=/usr/share/texel/web
 VOLUME ["/state"]
 EXPOSE 8080
