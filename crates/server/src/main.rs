@@ -11,6 +11,7 @@ mod infobox;
 mod library;
 mod metadata;
 mod netplay;
+mod openbios;
 mod overrides;
 mod state;
 mod verify;
@@ -83,6 +84,13 @@ pub struct Config {
     /// Fetch metadata (DATs, artwork, IGDB) from third-party websites.
     #[arg(long, env = "TEXEL_FETCH_METADATA", default_value_t = true, action = clap::ArgAction::Set)]
     pub fetch_metadata: bool,
+
+    /// Download the open-source BIOSes (OpenBIOS for the PlayStation,
+    /// OpenPS2BIOS for the PlayStation 2) when a newer one is published,
+    /// checked at start: games then start without a BIOS dumped from a
+    /// console.
+    #[arg(long, env = "TEXEL_FETCH_OPEN_BIOS", default_value_t = true, action = clap::ArgAction::Set)]
+    pub fetch_open_bios: bool,
 
     /// Hash game files in the background to verify them against Redump.
     #[arg(long, env = "TEXEL_VERIFY", default_value_t = true, action = clap::ArgAction::Set)]
@@ -284,8 +292,13 @@ async fn main() -> anyhow::Result<()> {
 /// The first scan, DAT refreshes, verification and periodic rescans.
 async fn background(state: Arc<state::AppState>) {
     state.rescan().await;
-    // New DATs bring CUE sheets for BIN files found without one: again.
-    if state.config.fetch_metadata && state.refresh_dats(false).await {
+    // New DATs bring CUE sheets for BIN files found without one, a new
+    // open-source BIOS a BIOS: scanned again.
+    let mut again = state.config.fetch_metadata && state.refresh_dats(false).await;
+    if state.config.fetch_open_bios {
+        again |= openbios::refresh(&state.http, &state.open_bios_dir()).await;
+    }
+    if again {
         state.rescan().await;
     }
     let mut last_scan = tokio::time::Instant::now();
