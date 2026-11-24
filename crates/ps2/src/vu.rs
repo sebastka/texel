@@ -225,6 +225,13 @@ impl Vu {
         })
     }
 
+    /// Lane `k` (0: x) of data quadword `qaddr`.
+    #[inline]
+    pub fn write_lane(&mut self, qaddr: u32, k: usize, v: u32) {
+        let at = ((qaddr % self.qwords()) * 16) as usize + 4 * k;
+        self.data[at..at + 4].copy_from_slice(&v.to_le_bytes());
+    }
+
     pub fn write_q(&mut self, qaddr: u32, v: [u32; 4], mask: u32) {
         let at = ((qaddr % self.qwords()) * 16) as usize;
         for (k, w) in v.iter().enumerate() {

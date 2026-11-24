@@ -78,9 +78,9 @@ fn loads_stores_and_the_interpreter() {
         i(0x1F, 29, 8, 16),
         // A load to r0: the interpreter's.
         i(0x23, 29, 0, 4),
-        // MULT and an MMI: the interpreter's.
+        // MULT and PMADDH: the interpreter's.
         r(4, 5, 6, 0, 0x18),
-        (0x1C << 26) | r(4, 5, 6, 0, 0x08),
+        (0x1C << 26) | r(4, 5, 6, 0x10, 0x09),
     ];
     let c = compiled(words);
     // The loads and stores compile (with the interpreter for slow paths).
@@ -132,6 +132,51 @@ fn vu0_macro_instructions() {
         (total, native) = (total + c.words, native + c.native);
     }
     assert_eq!((total, native), (words.len() as u32, words.len() as u32 - 3));
+}
+
+#[test]
+fn mmi_instructions() {
+    let mmi = |funct: u32, sa: u32| (0x1C << 26) | r(4, 5, 6, sa, funct);
+    let mut words = Vec::new();
+    for sa in [
+        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18,
+        0x19, 0x1A, 0x1B,
+    ] {
+        words.push(mmi(0x08, sa));
+    }
+    for sa in [0x02, 0x03, 0x06, 0x07, 0x0A, 0x12, 0x14, 0x15, 0x16, 0x18, 0x19, 0x1A] {
+        words.push(mmi(0x28, sa));
+    }
+    for sa in [0x0E, 0x12, 0x13] {
+        words.push(mmi(0x09, sa));
+        words.push(mmi(0x29, sa));
+    }
+    for funct in [0x34, 0x36, 0x37, 0x3C, 0x3E, 0x3F] {
+        words.push(mmi(funct, 7));
+    }
+    let n = words.len() as u32;
+    // PADDSW, PMADDH, PMFHL: the interpreter's.
+    words.extend([mmi(0x08, 0x10), mmi(0x09, 0x10), mmi(0x30, 0)]);
+    let c = compiled(words);
+    assert_eq!((c.words, c.native), (n + 3, n));
+}
+
+#[test]
+fn fpu_instructions() {
+    let single = |funct: u32| (0x11 << 26) | (0x10 << 21) | (2 << 16) | (1 << 11) | (3 << 6) | funct;
+    let mut words: Vec<u32> = [
+        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x16, 0x18, 0x19, 0x1A, 0x1C, 0x1D, 0x1E, 0x1F, 0x24, 0x30,
+        0x32, 0x34, 0x36,
+    ]
+    .map(single)
+    .to_vec();
+    // CVT.S.W.
+    words.push((0x11 << 26) | (0x14 << 21) | (1 << 11) | (3 << 6) | 0x20);
+    let n = words.len() as u32;
+    // MAX, MIN: the interpreter's.
+    words.extend([single(0x28), single(0x29)]);
+    let c = compiled(words);
+    assert_eq!((c.words, c.native), (n + 2, n));
 }
 
 #[test]

@@ -84,9 +84,46 @@ impl Vif {
 
     /// Feeds words to the VIF.
     pub fn write(&mut self, words: &[u32], vu: &mut Vu, gif: &mut Gif, gs: &mut Gs) {
-        for &w in words {
-            self.word(w, vu, gif, gs);
+        let mut i = 0;
+        while i < words.len() {
+            // UNPACK's data, vectors at a time, from the words themselves.
+            if matches!(self.pending, Pending::Unpack(_)) && self.bytes.is_empty() {
+                let n = self.unpack_words(&words[i..], vu);
+                if n > 0 {
+                    i += n;
+                    continue;
+                }
+            }
+            self.word(words[i], vu, gif, gs);
+            i += 1;
         }
+    }
+
+    /// UNPACK, with no bits left over from earlier words: unpacks the
+    /// vectors `words` hold whole, as `unpack_word` would word by word, and
+    /// returns the words used (the rest of the last one kept in `bytes`
+    /// for the next vector, or padding after the last vector).
+    fn unpack_words(&mut self, words: &[u32], vu: &mut Vu) -> usize {
+        let (elements, bits) = self.format();
+        // V4-5, rare (and the undefined 4-bit formats): word by word.
+        if !matches!(bits, 8 | 16 | 32) {
+            return 0;
+        }
+        let signed = self.code & (1 << 14) == 0;
+        let at = match bits {
+            32 => self.unpack_run::<32>(words, elements, signed, vu),
+            16 => self.unpack_run::<16>(words, elements, signed, vu),
+            _ => self.unpack_run::<8>(words, elements, signed, vu),
+        };
+        let byte = |b: usize| (words[b / 4] >> (8 * (b % 4))) as u8;
+        let used = at.div_ceil(4);
+        if self.vectors_left() == 0 {
+            // The rest of the last word is padding.
+            self.pending = Pending::None;
+        } else {
+            self.bytes.extend((at..used * 4).map(byte));
+        }
+        used
     }
 
     fn word(&mut self, w: u32, vu: &mut Vu, gif: &mut Gif, gs: &mut Gs) {
@@ -287,6 +324,47 @@ impl Vif {
         }
     }
 
+    /// `unpack_words`' vectors, of `BITS`-bit elements: the bytes used.
+    fn unpack_run<const BITS: u32>(&mut self, words: &[u32], elements: u32, signed: bool, vu: &mut Vu) -> usize {
+        let size = (elements * BITS / 8) as usize;
+        let get = |at: usize, k: usize| -> u32 {
+            match BITS {
+                32 => words[at / 4 + k],
+                16 => {
+                    let b = at + 2 * k;
+                    let v = (words[b / 4] >> (8 * (b % 4))) as u16;
+                    if signed { v as i16 as i32 as u32 } else { u32::from(v) }
+                }
+                _ => {
+                    let b = at + k;
+                    let v = (words[b / 4] >> (8 * (b % 4))) as u8;
+                    if signed { v as i8 as i32 as u32 } else { u32::from(v) }
+                }
+            }
+        };
+        let total = words.len() * 4;
+        let mut at = 0;
+        while self.vectors_left() > 0 {
+            if !self.needs_data() {
+                self.write_vector([None; 4], vu);
+                continue;
+            }
+            if at + size > total {
+                break;
+            }
+            let values: [Option<u32>; 4] = match elements {
+                // A scalar fills the four lanes; V2 and V3 leave the rest.
+                1 => [Some(get(at, 0)); 4],
+                2 => [Some(get(at, 0)), Some(get(at, 1)), None, None],
+                3 => [Some(get(at, 0)), Some(get(at, 1)), Some(get(at, 2)), None],
+                _ => [Some(get(at, 0)), Some(get(at, 1)), Some(get(at, 2)), Some(get(at, 3))],
+            };
+            self.write_vector(values, vu);
+            at += size;
+        }
+        at
+    }
+
     /// Filling writes: vectors with no input, from the row and column
     /// registers through the mask.
     fn unpack_fill(&mut self, vu: &mut Vu) {
@@ -309,6 +387,19 @@ impl Vif {
             self.addr + self.written
         };
         let masked = (self.code >> 24) & 0x10 != 0;
+        if !masked && self.mode == 0 {
+            // The lanes given, as they are.
+            for (k, v) in data.iter().enumerate() {
+                if let Some(v) = v {
+                    vu.write_lane(dest, k, *v);
+                }
+            }
+            self.written += 1;
+            if let Pending::Unpack(n) = self.pending {
+                self.pending = Pending::Unpack(n - 1);
+            }
+            return;
+        }
         let row = cycle.min(3);
         let mut out = vu.read_q(dest);
         for k in 0..4 {
@@ -351,6 +442,70 @@ mod tests {
         let mut gif = Gif::default();
         let mut gs = Gs::default();
         vif.write(words, vu, &mut gif, &mut gs);
+    }
+
+    /// UNPACKs fed in chunks (vectors at a time, `unpack_words`) do what
+    /// they do word by word (`word`): random formats, cycles, modes, masks.
+    #[test]
+    fn unpacking_in_bulk_is_unpacking_word_by_word() {
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut rand = move |n: u32| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % u64::from(n)) as u32
+        };
+        for round in 0..200 {
+            let (mut slow, mut fast) = (Vif::new(1), Vif::new(1));
+            let (mut slow_vu, mut fast_vu) = (Vu::new(1), Vu::new(1));
+            let (mut gif, mut gs) = (Gif::default(), Gs::default());
+            // The stream, made against the word-by-word VIF.
+            let mut stream = Vec::new();
+            let mut push = |w: u32, vif: &mut Vif, vu: &mut Vu, stream: &mut Vec<u32>| {
+                vif.word(w, vu, &mut gif, &mut gs);
+                stream.push(w);
+            };
+            for _ in 0..30 {
+                let cmd = match rand(6) {
+                    0 => 0x0100_0000 | (rand(4) + 1) << 8 | (rand(4) + 1),
+                    1 => 0x0500_0000 | rand(3),
+                    2 => 0x2000_0000,
+                    3 => 0x3000_0000 | rand(2) << 24,
+                    _ => {
+                        let unpack = 0x60 | rand(32);
+                        // With or without USN (bit 14) and FLG (bit 15).
+                        (unpack << 24) | (rand(20) + 1) << 16 | rand(0x1_0000)
+                    }
+                };
+                push(cmd, &mut slow, &mut slow_vu, &mut stream);
+                // Its data, random, until it takes commands again.
+                while slow.pending != Pending::None {
+                    push(rand(u32::MAX), &mut slow, &mut slow_vu, &mut stream);
+                }
+            }
+            // The same stream in random chunks.
+            let mut at = 0;
+            while at < stream.len() {
+                let n = (rand(12) as usize + 1).min(stream.len() - at);
+                feed(&mut fast, &mut fast_vu, &stream[at..at + n]);
+                at += n;
+            }
+            if let Some(q) =
+                (0..slow_vu.data.len() / 16).find(|&q| slow_vu.read_q(q as u32) != fast_vu.read_q(q as u32))
+            {
+                panic!(
+                    "round {round}: quadword {q} differs: {:08x?} word by word, {:08x?} in bulk; stream {:08x?}",
+                    slow_vu.read_q(q as u32),
+                    fast_vu.read_q(q as u32),
+                    &stream[..stream.len().min(80)]
+                );
+            }
+            assert_eq!(
+                postcard::to_allocvec(&slow).unwrap(),
+                postcard::to_allocvec(&fast).unwrap(),
+                "round {round}: VIF state differs"
+            );
+        }
     }
 
     #[test]

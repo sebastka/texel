@@ -22,6 +22,102 @@ use crate::vu_jit::{MACRO_I32_LOCALS, MACRO_V128_LOCALS, V128_TYPE, macro_upper}
 /// Instructions in a block, at most (its delay slot not counted).
 pub const MAX_LEN: usize = 64;
 
+/// Float opcodes the shared encoder does not name.
+const F32_CONST: u8 = 0x43;
+const F32_EQ: u8 = 0x5B;
+const F32_LT: u8 = 0x5D;
+const F32_LE: u8 = 0x5F;
+const F32_ABS: u8 = 0x8B;
+const F32_SQRT: u8 = 0x91;
+const F32_ADD: u8 = 0x92;
+const F32_SUB: u8 = 0x93;
+const F32_MUL: u8 = 0x94;
+const F32_DIV: u8 = 0x95;
+const F32_CONVERT_I32_S: u8 = 0xB2;
+const I32_REINTERPRET_F32: u8 = 0xBC;
+const F32_REINTERPRET_I32: u8 = 0xBE;
+
+/// SIMD opcodes (after the 0xFD prefix).
+mod simd {
+    pub const LOAD: u32 = 0x00;
+    pub const STORE: u32 = 0x0B;
+    pub const SHUFFLE: u32 = 0x0D;
+    pub const I8X16_EQ: u32 = 0x23;
+    pub const I8X16_GT_S: u32 = 0x27;
+    pub const I16X8_EQ: u32 = 0x2D;
+    pub const I16X8_GT_S: u32 = 0x31;
+    pub const I32X4_EQ: u32 = 0x37;
+    pub const I32X4_GT_S: u32 = 0x3B;
+    pub const NOT: u32 = 0x4D;
+    pub const AND: u32 = 0x4E;
+    pub const OR: u32 = 0x50;
+    pub const XOR: u32 = 0x51;
+    pub const I8X16_ADD: u32 = 0x6E;
+    pub const I8X16_ADD_SAT_S: u32 = 0x6F;
+    pub const I8X16_ADD_SAT_U: u32 = 0x70;
+    pub const I8X16_SUB: u32 = 0x71;
+    pub const I8X16_SUB_SAT_S: u32 = 0x72;
+    pub const I8X16_SUB_SAT_U: u32 = 0x73;
+    pub const I16X8_SHL: u32 = 0x8B;
+    pub const I16X8_SHR_S: u32 = 0x8C;
+    pub const I16X8_SHR_U: u32 = 0x8D;
+    pub const I16X8_ADD: u32 = 0x8E;
+    pub const I16X8_ADD_SAT_S: u32 = 0x8F;
+    pub const I16X8_ADD_SAT_U: u32 = 0x90;
+    pub const I16X8_SUB: u32 = 0x91;
+    pub const I16X8_SUB_SAT_S: u32 = 0x92;
+    pub const I16X8_SUB_SAT_U: u32 = 0x93;
+    pub const I16X8_MIN_S: u32 = 0x96;
+    pub const I16X8_MAX_S: u32 = 0x98;
+    pub const I32X4_SHL: u32 = 0xAB;
+    pub const I32X4_SHR_S: u32 = 0xAC;
+    pub const I32X4_SHR_U: u32 = 0xAD;
+    pub const I32X4_ADD: u32 = 0xAE;
+    pub const I32X4_SUB: u32 = 0xB1;
+    pub const I32X4_MIN_S: u32 = 0xB6;
+    pub const I32X4_MAX_S: u32 = 0xB8;
+}
+
+/// An `i8x16.shuffle` of rt (first) and rs: lane k of the result (of
+/// `size` bytes) is lane `lane` of rt (`src` 0) or rs (1).
+fn lanes<const N: usize>(size: usize, map: [(u8, u8); N]) -> [u8; 16] {
+    lanes_of(size, &map)
+}
+
+/// PEXTL*, PEXTU*: the lower (or upper) lanes of rt and rs, alternating,
+/// rt's first.
+fn interleave(size: usize, upper: bool) -> [u8; 16] {
+    let n = 16 / size;
+    let base = if upper { n / 2 } else { 0 };
+    let map: Vec<(u8, u8)> = (0..n).map(|k| ((k % 2) as u8, (base + k / 2) as u8)).collect();
+    lanes_of(size, &map)
+}
+
+/// PPAC*: rt's even lanes, then rs's.
+fn pack(size: usize) -> [u8; 16] {
+    let n = 16 / size;
+    let map: Vec<(u8, u8)> = (0..n)
+        .map(|k| {
+            if k < n / 2 {
+                (0, (2 * k) as u8)
+            } else {
+                (1, (2 * (k - n / 2)) as u8)
+            }
+        })
+        .collect();
+    lanes_of(size, &map)
+}
+
+fn lanes_of(size: usize, map: &[(u8, u8)]) -> [u8; 16] {
+    let mut out = [0u8; 16];
+    for (k, &(src, lane)) in map.iter().enumerate() {
+        for b in 0..size {
+            out[k * size + b] = src * 16 + lane * size as u8 + b as u8;
+        }
+    }
+    out
+}
+
 /// The function's parameters and locals.
 const EE: u32 = 0;
 const BUS: u32 = 1;
@@ -35,6 +131,10 @@ const TMP: u32 = 8;
 /// VU0's address, for its macro instructions (whose code uses locals up to
 /// 18: see `vu_jit::macro_upper`).
 const VU0: u32 = 9;
+/// An f32: the FPU's divisor (after the VU's locals, see `Gen::locals`).
+const COND_F: u32 = 19;
+const F32: u8 = 0x7D;
+const _: () = assert!(COND_F == 3 + MACRO_I32_LOCALS + MACRO_V128_LOCALS);
 
 /// Where the state compiled blocks read directly is, in the emulator's
 /// memory (addresses, which only mean something in WebAssembly): the TLB's
@@ -206,7 +306,8 @@ struct Gen {
     layout: Layout,
     /// Instructions compiled (not left to the interpreter).
     natives: u32,
-    /// Whether it has VU0 macro instructions (which need their locals).
+    /// Whether it has VU0 macro or FPU instructions (which need their
+    /// locals).
     vu0: bool,
 }
 
@@ -284,10 +385,307 @@ impl Gen {
         self.code.if_().i32_const(index as i32 + 1).op(op::RETURN).op(op::END);
     }
 
+    /// The bits on the stack (i32) as the PS2 has them: the largest
+    /// exponent is ±max, denormals are ±0 (`fpu::value`, and `fpu::result`
+    /// on a result's bits).
+    fn ps2_float(&mut self) {
+        self.code
+            .local_tee(TMP)
+            .i32_const(0x7F80_0000)
+            .op(op::I32_AND)
+            .local_set(PA);
+        // ±max
+        self.code
+            .local_get(TMP)
+            .i32_const(i32::MIN)
+            .op(op::I32_AND)
+            .i32_const(0x7F7F_FFFF)
+            .op(op::I32_OR);
+        // ±0 if the exponent is 0, else the bits
+        self.code
+            .local_get(TMP)
+            .i32_const(i32::MIN)
+            .op(op::I32_AND)
+            .local_get(TMP)
+            .local_get(PA)
+            .op(op::I32_EQZ)
+            .op(op::SELECT);
+        self.code
+            .local_get(PA)
+            .i32_const(0x7F80_0000)
+            .op(op::I32_EQ)
+            .op(op::SELECT);
+    }
+
+    /// Pushes an FPU register (or ACC, at `offset`) as an f32, the PS2's way.
+    fn fpu_operand(&mut self, offset: u32) {
+        self.code.local_get(EE).mem(op::I32_LOAD, 2, offset);
+        self.ps2_float();
+        self.code.op(F32_REINTERPRET_I32);
+    }
+
+    /// Stores the f32 on the stack, clamped the PS2's way, at `offset`.
+    fn fpu_result(&mut self, offset: u32) {
+        self.code.op(I32_REINTERPRET_F32);
+        self.ps2_float();
+        self.code.local_set(VA);
+        self.code.local_get(EE).local_get(VA).mem(op::I32_STORE, 2, offset);
+    }
+
+    /// COP1's single-precision instructions, as `Ee::fpu_single` does them
+    /// (its f32 arithmetic is these WebAssembly instructions); false for
+    /// MAX and MIN (whose ±0 Rust's may order otherwise) and the rest.
+    fn fpu_single(&mut self, i: u32) -> bool {
+        let ft = (i >> 16) & 31;
+        let fs = (i >> 11) & 31;
+        let fd = (i >> 6) & 31;
+        let acc = (offset_of!(Ee, fpu) + offset_of!(super::super::fpu::Fpu, acc)) as u32;
+        let fcr31 = (offset_of!(Ee, fpu) + offset_of!(super::super::fpu::Fpu, fcr31)) as u32;
+        const C: i32 = 1 << 23;
+        let funct = i & 0x3F;
+        match funct {
+            // ADD, SUB, MUL; ADDA, SUBA, MULA.
+            0x00..=0x02 | 0x18..=0x1A => {
+                self.fpu_operand(fpr(fs));
+                self.fpu_operand(fpr(ft));
+                self.code.op([F32_ADD, F32_SUB, F32_MUL][(funct & 3) as usize]);
+                self.fpu_result(if funct < 0x18 { fpr(fd) } else { acc });
+            }
+            // DIV: by zero, ±max with the operands' signs.
+            0x03 => {
+                self.fpu_operand(fpr(ft));
+                self.code.local_set(COND_F);
+                self.code
+                    .local_get(COND_F)
+                    .op(F32_CONST)
+                    .bytes
+                    .extend_from_slice(&0f32.to_le_bytes());
+                self.code.op(F32_EQ).if_();
+                self.code
+                    .local_get(EE)
+                    .local_get(EE)
+                    .mem(op::I32_LOAD, 2, fpr(fs))
+                    .local_get(EE)
+                    .mem(op::I32_LOAD, 2, fpr(ft))
+                    .op(op::I32_XOR)
+                    .i32_const(i32::MIN)
+                    .op(op::I32_AND)
+                    .i32_const(0x7F7F_FFFF)
+                    .op(op::I32_OR)
+                    .mem(op::I32_STORE, 2, fpr(fd));
+                self.code.op(op::ELSE);
+                self.fpu_operand(fpr(fs));
+                self.code.local_get(COND_F).op(F32_DIV);
+                self.fpu_result(fpr(fd));
+                self.code.op(op::END);
+            }
+            // SQRT: of |ft|.
+            0x04 => {
+                self.fpu_operand(fpr(ft));
+                self.code.op(F32_ABS).op(F32_SQRT);
+                self.fpu_result(fpr(fd));
+            }
+            // ABS, MOV, NEG: the bits.
+            0x05..=0x07 => {
+                self.code.local_get(EE).local_get(EE).mem(op::I32_LOAD, 2, fpr(fs));
+                match funct {
+                    0x05 => {
+                        self.code.i32_const(0x7FFF_FFFF).op(op::I32_AND);
+                    }
+                    0x07 => {
+                        self.code.i32_const(i32::MIN).op(op::I32_XOR);
+                    }
+                    _ => {}
+                }
+                self.code.mem(op::I32_STORE, 2, fpr(fd));
+            }
+            // RSQRT: fs / sqrt(|ft|), max if that is 0.
+            0x16 => {
+                self.fpu_operand(fpr(ft));
+                self.code.op(F32_ABS).op(F32_SQRT).local_set(COND_F);
+                self.code
+                    .local_get(COND_F)
+                    .op(F32_CONST)
+                    .bytes
+                    .extend_from_slice(&0f32.to_le_bytes());
+                self.code.op(F32_EQ).if_();
+                self.code
+                    .local_get(EE)
+                    .i32_const(0x7F7F_FFFF)
+                    .mem(op::I32_STORE, 2, fpr(fd));
+                self.code.op(op::ELSE);
+                self.fpu_operand(fpr(fs));
+                self.code.local_get(COND_F).op(F32_DIV);
+                self.fpu_result(fpr(fd));
+                self.code.op(op::END);
+            }
+            // MADD, MSUB (to fd); MADDA, MSUBA (to ACC): ACC ± fs×ft.
+            0x1C..=0x1F => {
+                self.fpu_operand(acc);
+                self.fpu_operand(fpr(fs));
+                self.fpu_operand(fpr(ft));
+                self.code.op(F32_MUL);
+                self.code.op(if funct & 1 == 0 { F32_ADD } else { F32_SUB });
+                self.fpu_result(if funct < 0x1E { fpr(fd) } else { acc });
+            }
+            // CVT.W.S: truncating, saturating.
+            0x24 => {
+                self.code.local_get(EE);
+                self.fpu_operand(fpr(fs));
+                self.code.op(0xFC).op(0x00); // i32.trunc_sat_f32_s
+                self.code.mem(op::I32_STORE, 2, fpr(fd));
+            }
+            // C.F; C.EQ, C.LT, C.LE.
+            0x30 | 0x32 | 0x34 | 0x36 => {
+                self.code.local_get(EE).local_get(EE).mem(op::I32_LOAD, 2, fcr31);
+                self.code.i32_const(!C).op(op::I32_AND);
+                if funct != 0x30 {
+                    self.fpu_operand(fpr(fs));
+                    self.fpu_operand(fpr(ft));
+                    self.code.op(match funct {
+                        0x32 => F32_EQ,
+                        0x34 => F32_LT,
+                        _ => F32_LE,
+                    });
+                    self.code.i32_const(23).op(op::I32_SHL).op(op::I32_OR);
+                }
+                self.code.mem(op::I32_STORE, 2, fcr31);
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    /// CVT.S.W: fs's integer, as a float.
+    fn cvt_s_w(&mut self, i: u32) {
+        let fs = (i >> 11) & 31;
+        let fd = (i >> 6) & 31;
+        self.code
+            .local_get(EE)
+            .mem(op::I32_LOAD, 2, fpr(fs))
+            .op(F32_CONVERT_I32_S);
+        self.fpu_result(fpr(fd));
+    }
+
+    /// A SIMD instruction (after the 0xFD prefix).
+    fn simd(&mut self, opcode: u32) {
+        self.code.op(0xFD);
+        wasm::uleb(&mut self.code.bytes, u64::from(opcode));
+    }
+
+    /// Pushes register `r`'s 128 bits.
+    fn get128(&mut self, r: u32) {
+        self.code.local_get(EE);
+        self.simd(simd::LOAD);
+        wasm::uleb(&mut self.code.bytes, 4);
+        wasm::uleb(&mut self.code.bytes, u64::from(gpr(r)));
+    }
+
+    /// Compiles the MMI instructions with an exact SIMD equivalent (lanes
+    /// added, compared, interleaved, packed, shifted...); false for the
+    /// others (the 32-bit saturating ones, PABS, HI and LO's).
+    fn mmi(&mut self, i: u32) -> bool {
+        let rs = (i >> 21) & 31;
+        let rt = (i >> 16) & 31;
+        let rd = (i >> 11) & 31;
+        let sa = (i >> 6) & 31;
+        // What rd gets: from rs and rt (an operation, or a shuffle of rt's
+        // and rs's lanes), or rt shifted by sa.
+        enum Op {
+            Binary(u32),
+            Nor,
+            Shuffle([u8; 16]),
+            Shift(u32),
+        }
+        use Op::{Binary, Shift, Shuffle};
+        let op = match (i & 0x3F, sa) {
+            (0x08, 0x00) => Binary(simd::I32X4_ADD),
+            (0x08, 0x01) => Binary(simd::I32X4_SUB),
+            (0x08, 0x02) => Binary(simd::I32X4_GT_S),
+            (0x08, 0x03) => Binary(simd::I32X4_MAX_S),
+            (0x08, 0x04) => Binary(simd::I16X8_ADD),
+            (0x08, 0x05) => Binary(simd::I16X8_SUB),
+            (0x08, 0x06) => Binary(simd::I16X8_GT_S),
+            (0x08, 0x07) => Binary(simd::I16X8_MAX_S),
+            (0x08, 0x08) => Binary(simd::I8X16_ADD),
+            (0x08, 0x09) => Binary(simd::I8X16_SUB),
+            (0x08, 0x0A) => Binary(simd::I8X16_GT_S),
+            (0x08, 0x12) => Shuffle(interleave(4, false)),
+            (0x08, 0x13) => Shuffle(pack(4)),
+            (0x08, 0x14) => Binary(simd::I16X8_ADD_SAT_S),
+            (0x08, 0x15) => Binary(simd::I16X8_SUB_SAT_S),
+            (0x08, 0x16) => Shuffle(interleave(2, false)),
+            (0x08, 0x17) => Shuffle(pack(2)),
+            (0x08, 0x18) => Binary(simd::I8X16_ADD_SAT_S),
+            (0x08, 0x19) => Binary(simd::I8X16_SUB_SAT_S),
+            (0x08, 0x1A) => Shuffle(interleave(1, false)),
+            (0x08, 0x1B) => Shuffle(pack(1)),
+            (0x28, 0x02) => Binary(simd::I32X4_EQ),
+            (0x28, 0x03) => Binary(simd::I32X4_MIN_S),
+            (0x28, 0x06) => Binary(simd::I16X8_EQ),
+            (0x28, 0x07) => Binary(simd::I16X8_MIN_S),
+            (0x28, 0x0A) => Binary(simd::I8X16_EQ),
+            (0x28, 0x12) => Shuffle(interleave(4, true)),
+            (0x28, 0x14) => Binary(simd::I16X8_ADD_SAT_U),
+            (0x28, 0x15) => Binary(simd::I16X8_SUB_SAT_U),
+            (0x28, 0x16) => Shuffle(interleave(2, true)),
+            (0x28, 0x18) => Binary(simd::I8X16_ADD_SAT_U),
+            (0x28, 0x19) => Binary(simd::I8X16_SUB_SAT_U),
+            (0x28, 0x1A) => Shuffle(interleave(1, true)),
+            // PCPYLD: rt's lower doubleword, then rs's.
+            (0x09, 0x0E) => Shuffle(lanes(8, [(0, 0), (1, 0)])),
+            (0x09, 0x12) => Binary(simd::AND),
+            (0x09, 0x13) => Binary(simd::XOR),
+            // PCPYUD: rs's upper doubleword, then rt's.
+            (0x29, 0x0E) => Shuffle(lanes(8, [(1, 1), (0, 1)])),
+            (0x29, 0x12) => Binary(simd::OR),
+            (0x29, 0x13) => Op::Nor,
+            (0x34, _) => Shift(simd::I16X8_SHL),
+            (0x36, _) => Shift(simd::I16X8_SHR_U),
+            (0x37, _) => Shift(simd::I16X8_SHR_S),
+            (0x3C, _) => Shift(simd::I32X4_SHL),
+            (0x3E, _) => Shift(simd::I32X4_SHR_U),
+            (0x3F, _) => Shift(simd::I32X4_SHR_S),
+            _ => return false,
+        };
+        if rd == 0 {
+            return true;
+        }
+        self.code.local_get(EE);
+        match op {
+            Binary(o) => {
+                self.get128(rs);
+                self.get128(rt);
+                self.simd(o);
+            }
+            Op::Nor => {
+                self.get128(rs);
+                self.get128(rt);
+                self.simd(simd::OR);
+                self.simd(simd::NOT);
+            }
+            Shuffle(bytes) => {
+                self.get128(rt);
+                self.get128(rs);
+                self.simd(simd::SHUFFLE);
+                self.code.bytes.extend_from_slice(&bytes);
+            }
+            Shift(o) => {
+                self.get128(rt);
+                self.code.i32_const(sa as i32);
+                self.simd(o);
+            }
+        }
+        self.simd(simd::STORE);
+        wasm::uleb(&mut self.code.bytes, 4);
+        wasm::uleb(&mut self.code.bytes, u64::from(gpr(rd)));
+        true
+    }
+
     /// Compiles `i` if it is an integer instruction, else runs it through
     /// the interpreter.
     fn instruction(&mut self, i: u32, pc: u32, index: u32, slot: bool) {
-        if self.memory(i, pc, index, slot) || self.native(i) {
+        if self.memory(i, pc, index, slot) || self.native(i) || (i >> 26 == 0x1C && self.mmi(i)) {
             self.natives += 1;
         } else {
             self.exec(i, pc, index, slot);
@@ -649,6 +1047,14 @@ impl Gen {
             }),
             // CACHE, PREF.
             0x2F | 0x33 => {}
+            0x11 if rs == 0x10 => {
+                self.vu0 = true;
+                return self.fpu_single(i);
+            }
+            0x11 if rs == 0x14 && i & 0x3F == 0x20 => {
+                self.vu0 = true;
+                self.cvt_s_w(i);
+            }
             // MFC1, MTC1.
             0x11 if rs == 0x00 => self.set(rt, |g| {
                 g.code.local_get(EE).mem(op::I64_LOAD32_S, 2, fpr(rd));
@@ -913,7 +1319,7 @@ pub fn compile(src: &Source, exec: u32, layout: Layout) -> Option<Compiled> {
             },
         ],
         &if g.vu0 {
-            vec![(MACRO_I32_LOCALS, I32), (MACRO_V128_LOCALS, V128_TYPE)]
+            vec![(MACRO_I32_LOCALS, I32), (MACRO_V128_LOCALS, V128_TYPE), (1, F32)]
         } else {
             vec![(6, I32)]
         },
