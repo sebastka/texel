@@ -447,7 +447,7 @@ VU1 ran each program to its end when started, inside the EE's time: about a quar
 Artwork comes from libretro-thumbnails, by Redump name, but the repository keeps many images under the names discs had when they were added, which Redump has changed since: a language tag added (`World Cup 98 (USA)`, now `… (En,Fr,De,Es,Nl,Sv,Da)`), a region list grown (`(USA)`, now `(USA, Canada)`), a capitalisation changed (`WipEout 3`, now `Wipeout 3`). A name that does not find an image is tried again in these forms, in order:
 
 - **Older names**: without the language tag, with only the first region, both; only those no other game of Redump's DAT has, so that another release's box art is never taken.
-- **Another case**: GitHub serves the files case-sensitively, so the names are looked up in a list of the repository's file names (two requests to GitHub's API per kind of image: the top directory, then that one), cached a week in the state directory.
+- **Another case or punctuation** (`Mission Pack 1` for Redump's `Mission Pack #1`): GitHub serves the files case-sensitively, so the names are looked up in a list of the repository's file names (two requests to GitHub's API per kind of image: the top directory, then that one), cached a week in the state directory, compared by their letters and digits only; a name that matches several files takes the one differing only in case, or none.
 - **The game's YAML file**: `thumbnails:` names the images outright, for renames these cannot guess; a game Texel cannot identify then gets its images too.
 
-An image found under none of them is remembered as missing, and tried again after a week or when the DATs change.
+An image found under none of them is remembered as missing, and tried again after a week, when the DATs change, or when the lookup tries more names (the marker holds the version of the lookup that wrote it).
