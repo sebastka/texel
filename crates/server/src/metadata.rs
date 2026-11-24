@@ -133,7 +133,15 @@ fn encode_path_segment(s: &str) -> String {
 }
 
 /// The cached artwork of a game (by Redump name), downloading it if needed.
-pub async fn image(state: &AppState, console: Console, name: &str, kind: ImageKind) -> Option<PathBuf> {
+/// `pinned`: the libretro-thumbnails name the game's YAML file gives
+/// (`thumbnails:`), used instead of any name derived from the Redump one.
+pub async fn image(
+    state: &AppState,
+    console: Console,
+    name: &str,
+    pinned: Option<&str>,
+    kind: ImageKind,
+) -> Option<PathBuf> {
     let (thumbnails, sub) = thumbnails(console);
     let dir = state
         .config
@@ -142,7 +150,10 @@ pub async fn image(state: &AppState, console: Console, name: &str, kind: ImageKi
         .join("images")
         .join(sub)
         .join(kind.dir());
-    let key = cache_key(name);
+    let key = match pinned {
+        Some(p) => cache_key(&format!("{name}\n{p}")),
+        None => cache_key(name),
+    };
     let path = dir.join(format!("{key}.png"));
     if path.exists() {
         return Some(path);
@@ -152,55 +163,157 @@ pub async fn image(state: &AppState, console: Console, name: &str, kind: ImageKi
     if !state.config.fetch_metadata || still_missing(&missing, &dats_changed, NEGATIVE_TTL) {
         return None;
     }
-    // The DAT name, then names libretro-thumbnails may still use for this
-    // disc, from before Redump renamed it: only those no other game has.
-    let dats = state.dats.read().await.clone();
-    let mut names = vec![name.to_owned()];
-    names.extend(
-        older_names(name)
-            .into_iter()
-            .filter(|n| dats.get(console).game(n).is_none()),
-    );
-    for candidate in names.iter().map(|n| thumbnail_name(n)) {
-        let url = format!("{thumbnails}/{}/{}.png", kind.dir(), encode_path_segment(&candidate));
-        let result = async {
-            let mut url = url.clone();
-            // libretro-thumbnails stores some images as git symbolic links,
-            // which GitHub serves as their target's name: follow one.
-            for _ in 0..2 {
-                let resp = state.http.get(&url).send().await?;
-                if resp.status() == reqwest::StatusCode::NOT_FOUND {
-                    return anyhow::Ok(None);
-                }
-                let bytes = resp.error_for_status()?.bytes().await?;
-                if bytes.starts_with(b"\x89PNG") {
-                    return Ok(Some(bytes));
-                }
-                match std::str::from_utf8(&bytes).map(str::trim) {
-                    Ok(target) if target.len() < 512 && target.ends_with(".png") && !target.contains(['/', '\\']) => {
-                        url = format!("{thumbnails}/{}/{}", kind.dir(), encode_path_segment(target));
-                    }
-                    // Not an image: remembered as missing, not fetched again and again.
-                    _ => return Ok(None),
-                }
-            }
-            Ok(None)
+    // The YAML file's name; or the DAT name, then names libretro-thumbnails
+    // may still use for this disc, from before Redump renamed it: only those
+    // no other game has.
+    let names: Vec<String> = match pinned {
+        Some(p) => vec![thumbnail_name(p)],
+        None => {
+            let dats = state.dats.read().await.clone();
+            std::iter::once(name.to_owned())
+                .chain(
+                    older_names(name)
+                        .into_iter()
+                        .filter(|n| dats.get(console).game(n).is_none()),
+                )
+                .map(|n| thumbnail_name(&n))
+                .collect()
         }
-        .await;
-        match result {
+    };
+    for candidate in &names {
+        match fetch_thumbnail(state, thumbnails, kind, candidate).await {
             Ok(Some(bytes)) => {
                 write_atomic(&path, &bytes).await.ok()?;
                 return Some(path);
             }
             Ok(None) => {}
-            Err(e) => {
-                tracing::warn!(url, error = %e, "artwork download failed");
-                return None;
+            Err(()) => return None,
+        }
+    }
+    // The same names, in another case: libretro-thumbnails keeps some older
+    // capitalisations ("WipEout 3 - Special Edition", Redump's "Wipeout 3").
+    if let Some(index) = thumbnail_index(state, console, kind).await {
+        for candidate in &names {
+            let Some(actual) = index.get(&candidate.to_lowercase()) else { continue };
+            if actual == candidate {
+                continue;
+            }
+            match fetch_thumbnail(state, thumbnails, kind, actual).await {
+                Ok(Some(bytes)) => {
+                    write_atomic(&path, &bytes).await.ok()?;
+                    return Some(path);
+                }
+                Ok(None) => {}
+                Err(()) => return None,
             }
         }
     }
     let _ = write_atomic(&missing, b"").await;
     None
+}
+
+/// One image of libretro-thumbnails, by file name (without `.png`):
+/// `Ok(None)` when there is none, `Err` when it cannot be told (logged).
+async fn fetch_thumbnail(
+    state: &AppState,
+    thumbnails: &str,
+    kind: ImageKind,
+    file: &str,
+) -> Result<Option<Vec<u8>>, ()> {
+    let mut url = format!("{thumbnails}/{}/{}.png", kind.dir(), encode_path_segment(file));
+    let result = async {
+        // libretro-thumbnails stores some images as git symbolic links,
+        // which GitHub serves as their target's name: follow one.
+        for _ in 0..2 {
+            let resp = state.http.get(&url).send().await?;
+            if resp.status() == reqwest::StatusCode::NOT_FOUND {
+                return anyhow::Ok(None);
+            }
+            let bytes = resp.error_for_status()?.bytes().await?;
+            if bytes.starts_with(b"\x89PNG") {
+                return Ok(Some(bytes.to_vec()));
+            }
+            match std::str::from_utf8(&bytes).map(str::trim) {
+                Ok(target) if target.len() < 512 && target.ends_with(".png") && !target.contains(['/', '\\']) => {
+                    url = format!("{thumbnails}/{}/{}", kind.dir(), encode_path_segment(target));
+                }
+                // Not an image: remembered as missing, not fetched again and again.
+                _ => return Ok(None),
+            }
+        }
+        Ok(None)
+    }
+    .await;
+    result.map_err(|e| tracing::warn!(url, error = %e, "artwork download failed"))
+}
+
+/// The file names (without `.png`) of a kind of libretro-thumbnails image,
+/// by lower case: lower case → actual name. Listed with GitHub's API (two
+/// requests: the repository's top directory, then this one), cached a week
+/// in the state directory.
+async fn thumbnail_index(
+    state: &AppState,
+    console: Console,
+    kind: ImageKind,
+) -> Option<std::collections::HashMap<String, String>> {
+    let (thumbnails, sub) = thumbnails(console);
+    let repo = thumbnails
+        .strip_prefix("https://raw.githubusercontent.com/")?
+        .strip_suffix("/master")?;
+    let path = state
+        .config
+        .state
+        .join("cache")
+        .join("images")
+        .join(sub)
+        .join(format!("{}.names.json", kind.dir()));
+    if state.config.fetch_metadata && !fresh(&path, NEGATIVE_TTL) {
+        match list_thumbnails(state, repo, kind.dir()).await {
+            Ok(names) => {
+                let _ = write_atomic(&path, &serde_json::to_vec(&names).unwrap_or_default()).await;
+            }
+            // An older list, if any, is still used.
+            Err(e) => tracing::warn!(repo, dir = kind.dir(), error = %e, "listing libretro-thumbnails failed"),
+        }
+    }
+    let names: Vec<String> = serde_json::from_slice(&tokio::fs::read(&path).await.ok()?).ok()?;
+    Some(names.into_iter().map(|n| (n.to_lowercase(), n)).collect())
+}
+
+async fn list_thumbnails(state: &AppState, repo: &str, dir: &str) -> anyhow::Result<Vec<String>> {
+    use anyhow::Context as _;
+    let tree = |sha: String| {
+        let url = format!("https://api.github.com/repos/{repo}/git/trees/{sha}");
+        async move {
+            let value: serde_json::Value = state
+                .http
+                .get(&url)
+                .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            anyhow::ensure!(!value["truncated"].as_bool().unwrap_or(false), "{url}: listing truncated");
+            anyhow::Ok(value)
+        }
+    };
+    let root = tree("master".to_owned()).await?;
+    let sha = root["tree"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|e| e["path"] == dir && e["type"] == "tree")
+        .and_then(|e| e["sha"].as_str())
+        .with_context(|| format!("no {dir} directory"))?
+        .to_owned();
+    let listing = tree(sha).await?;
+    Ok(listing["tree"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e["path"].as_str()?.strip_suffix(".png").map(str::to_owned))
+        .collect())
 }
 
 /// Names a disc may have had in older Redump DATs, which libretro-thumbnails

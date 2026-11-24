@@ -15,8 +15,10 @@
 //! Every key is optional. `wikipedia` (an English article's title, or an
 //! article's URL in any language) and `wikidata` (an item, or its URL)
 //! replace the search; `igdb` (a game's slug or URL) is used when IGDB is
-//! configured. `links` are shown on the game's page: sites without an open
-//! API (Eurogamer, IGN...) are not read.
+//! configured. `thumbnails` is the name libretro-thumbnails files the game's
+//! images under, when the Redump name and its variants do not find them.
+//! `links` are shown on the game's page: sites without an open API
+//! (Eurogamer, IGN...) are not read.
 
 use std::collections::BTreeMap;
 
@@ -28,6 +30,9 @@ pub struct Overrides {
     pub wikipedia: Option<String>,
     pub wikidata: Option<String>,
     pub igdb: Option<String>,
+    /// The name libretro-thumbnails files the game's images under, when it
+    /// is not the Redump name, nor an older or differently capitalised one.
+    pub thumbnails: Option<String>,
     #[serde(default)]
     pub links: BTreeMap<String, String>,
 }
@@ -58,6 +63,11 @@ impl Overrides {
             && o.igdb_slug().is_none()
         {
             return Err(format!("igdb: {i} is not an IGDB game's slug or URL"));
+        }
+        if let Some(t) = &o.thumbnails
+            && o.thumbnails_name().is_none()
+        {
+            return Err(format!("thumbnails: {t} is not an image name (a file name, without a directory)"));
         }
         for (name, url) in &o.links {
             if !(url.starts_with("https://") || url.starts_with("http://")) || url.contains(char::is_whitespace) {
@@ -105,6 +115,14 @@ impl Overrides {
                 .bytes()
                 .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-'))
         .then(|| slug.to_owned())
+    }
+
+    /// The libretro-thumbnails name: "WipEout 3 - Special Edition (Europe)
+    /// (En,Fr,De,Es,It)" (a trailing `.png` is dropped).
+    pub fn thumbnails_name(&self) -> Option<String> {
+        let t = self.thumbnails.as_deref()?.trim();
+        let t = t.strip_suffix(".png").unwrap_or(t).trim_end();
+        (!t.is_empty() && !t.contains(['/', '\\']) && !t.chars().any(char::is_control)).then(|| t.to_owned())
     }
 
     /// Whether the details come from the pages given, not from a search.
@@ -169,6 +187,19 @@ mod tests {
             o.wikipedia_page(),
             Some(("en".into(), "Tarzan (1999 video game)".into()))
         );
+    }
+
+    #[test]
+    fn thumbnails_names() {
+        let o = Overrides::parse("thumbnails: WipEout 3 - Special Edition (Europe) (En,Fr,De,Es,It)\n").unwrap();
+        assert_eq!(
+            o.thumbnails_name().as_deref(),
+            Some("WipEout 3 - Special Edition (Europe) (En,Fr,De,Es,It)")
+        );
+        let o = Overrides::parse("thumbnails: \"Rayman (USA).png\"\n").unwrap();
+        assert_eq!(o.thumbnails_name().as_deref(), Some("Rayman (USA)"));
+        assert!(!o.pins_wiki(), "images only: the details are still searched");
+        assert!(Overrides::parse("thumbnails: Named_Boxarts/Rayman (USA)\n").is_err());
     }
 
     #[test]

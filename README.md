@@ -71,12 +71,13 @@ When the search for a game's details finds the wrong game or nothing (a title se
 wikipedia: Bomberman Party Edition    # an English article's title, or an article's URL in any language
 wikidata: Q2909728                    # a Wikidata item, or its URL
 igdb: bomberman-party-edition         # an IGDB slug or URL (when IGDB is configured)
+thumbnails: Bomberman (Europe)        # the name libretro-thumbnails files its images under, if not found
 links:                                # other pages, shown on the game's page
   Eurogamer: https://www.eurogamer.net/...
   IGN: https://www.ign.com/...
 ```
 
-`wikipedia` and `wikidata` replace the search; `links` are only shown, as sites like Eurogamer and IGN have no open API to read. A file with a mistake (an unknown key, a malformed address) is ignored, and the game's page says why. Editing the file takes effect on the next library scan (Rescan).
+`wikipedia` and `wikidata` replace the search; `links` are only shown, as sites like Eurogamer and IGN have no open API to read. Artwork comes from [libretro-thumbnails](https://github.com/libretro-thumbnails), by Redump name; as it keeps some images under older names, the server also tries the name without its language tag, with only its first region (`(USA, Canada)` → `(USA)`), and in another case (`Wipeout` → `WipEout`, from a list of its file names it fetches once a week). `thumbnails` names the images to use when none of those finds them (a file name of the libretro-thumbnails repository, without `.png`). A file with a mistake (an unknown key, a malformed address) is ignored, and the game's page says why. Editing the file takes effect on the next library scan (Rescan).
 
 Games are identified by the serial in their `SYSTEM.CNF` (through libretro's Redump-derived DAT), or by their track sizes, and verified track by track against Redump's SHA-1 hashes in the background.
 
