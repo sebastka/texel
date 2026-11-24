@@ -45,11 +45,13 @@ pub struct ZipEntry {
     pub index: Option<PathBuf>,
 }
 
-/// What a zip holds: its disc images (name, entry), and its CUE sheets
-/// (name, text). Names are without the directories inside the zip.
+/// What a zip holds: its disc images (name, entry), its CUE sheets (name,
+/// text), and its SBI files (name, the entry's full name). Names are
+/// without the directories inside the zip.
 pub struct Listing {
     pub images: Vec<(String, ZipEntry)>,
     pub cues: Vec<(String, String)>,
+    pub sbis: Vec<(String, String)>,
 }
 
 /// Lists a zip's images and CUE sheets, building the seek index of each
@@ -65,9 +67,10 @@ pub fn list(path: &Path, index_dir: &Path) -> anyhow::Result<Listing> {
     let mut listing = Listing {
         images: Vec::new(),
         cues: Vec::new(),
+        sbis: Vec::new(),
     };
     for i in 0..archive.len() {
-        let (name, method, data_start, compressed, size, crc) = {
+        let (full, name, method, data_start, compressed, size, crc) = {
             let f = archive.by_index_raw(i)?;
             if f.is_dir() {
                 continue;
@@ -75,7 +78,15 @@ pub fn list(path: &Path, index_dir: &Path) -> anyhow::Result<Listing> {
             let full = f.name()?.into_owned();
             let name = full.rsplit('/').next().unwrap_or(&full).to_owned();
             let start = f.data_start().context("an entry without its data's offset")?;
-            (name, f.compression(), start, f.compressed_size(), f.size(), f.crc32())
+            (
+                full.clone(),
+                name,
+                f.compression(),
+                start,
+                f.compressed_size(),
+                f.size(),
+                f.crc32(),
+            )
         };
         let ext = name
             .rsplit_once('.')
@@ -88,6 +99,7 @@ pub fn list(path: &Path, index_dir: &Path) -> anyhow::Result<Listing> {
                 archive.by_index(i)?.read_to_string(&mut text)?;
                 listing.cues.push((name, text));
             }
+            "sbi" => listing.sbis.push((name, full)),
             "iso" | "bin" | "img" => {
                 let index = match method {
                     zip::CompressionMethod::Stored => None,

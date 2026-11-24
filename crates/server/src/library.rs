@@ -139,7 +139,7 @@ pub struct Game {
     /// Why the disc could not be read, if it could not.
     pub error: Option<String>,
     /// The SBI file of a disc protected by LibCrypt: its subchannel data.
-    pub sbi: Option<PathBuf>,
+    pub sbi: Option<SbiFile>,
     /// Pointers to the game's details, from its YAML file (see overrides.rs).
     pub overrides: Option<crate::overrides::Overrides>,
     /// Why that file was not used, when it is wrong.
@@ -168,7 +168,48 @@ pub struct Library {
     /// The shared SBI files: Redump name (the file name without `.sbi`) →
     /// file; the first directory's wins. A disc's own, next to its image,
     /// is `Game::sbi`.
-    pub sbi: std::collections::HashMap<String, PathBuf>,
+    pub sbi: std::collections::HashMap<String, SbiFile>,
+}
+
+/// An SBI file: a file, or an entry in a zip (Redump hands them out
+/// zipped, and a zipped disc may carry its own).
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SbiFile {
+    File(PathBuf),
+    Zipped { zip: PathBuf, entry: String },
+}
+
+impl SbiFile {
+    /// Its content (a few KiB). Blocking.
+    pub fn read(&self) -> anyhow::Result<Vec<u8>> {
+        match self {
+            Self::File(path) => Ok(std::fs::read(path)?),
+            Self::Zipped { zip, entry } => {
+                let mut archive = zip::ZipArchive::new(std::fs::File::open(zip)?)?;
+                let mut f = archive.by_name(entry)?;
+                let mut data = Vec::new();
+                f.read_to_end(&mut data)?;
+                Ok(data)
+            }
+        }
+    }
+}
+
+/// The SBI files in a zip: (the name without `.sbi`, the entry's name).
+fn zipped_sbis(path: &Path) -> anyhow::Result<Vec<(String, String)>> {
+    let mut archive = zip::ZipArchive::new(std::fs::File::open(path)?)?;
+    let mut out = Vec::new();
+    for i in 0..archive.len() {
+        let f = archive.by_index_raw(i)?;
+        let full = f.name()?.into_owned();
+        let name = full.rsplit('/').next().unwrap_or(&full);
+        if let Some((stem, ext)) = name.rsplit_once('.')
+            && ext.eq_ignore_ascii_case("sbi")
+        {
+            out.push((stem.to_owned(), full.clone()));
+        }
+    }
+    Ok(out)
 }
 
 impl Library {
@@ -228,7 +269,21 @@ pub fn scan(roots: &[Root], index_dir: &Path) -> Library {
                     && path.is_file()
                     && let Some(name) = path.file_stem().and_then(|s| s.to_str())
                 {
-                    lib.sbi.entry(name.to_owned()).or_insert(path);
+                    lib.sbi.entry(name.to_owned()).or_insert(SbiFile::File(path));
+                } else if extension(&path) == "zip" {
+                    // Zipped, as Redump hands them out: named by the entry.
+                    match zipped_sbis(&path) {
+                        Ok(found) => {
+                            for (name, entry) in found {
+                                let file = SbiFile::Zipped {
+                                    zip: path.clone(),
+                                    entry,
+                                };
+                                lib.sbi.entry(name).or_insert(file);
+                            }
+                        }
+                        Err(e) => tracing::warn!(file = %path.display(), error = %e, "unreadable zip, ignored"),
+                    }
                 }
             }
         }
@@ -649,7 +704,23 @@ fn scan_games(console: Console, dir: &Path, index_dir: &Path) -> Vec<Game> {
         let multi = found.len() > 1;
         for (name, cue, layout, game_files) in found {
             let game_rel = if multi { format!("{rel}#{name}") } else { rel.clone() };
-            games.push(make_game(console, game_rel, cue, layout, game_files));
+            let mut game = make_game(console, game_rel, cue, layout, game_files);
+            // Its own SBI file in the zip: named like its CUE sheet or
+            // image, or the zip's only one when it holds one disc. One next
+            // to the zip still comes first (below).
+            let stem = |n: &str| n.rsplit_once('.').map_or(n, |(s, _)| s).to_ascii_lowercase();
+            let own = listing
+                .sbis
+                .iter()
+                .find(|(s, _)| stem(s) == stem(&name))
+                .or_else(|| (!multi && listing.sbis.len() == 1).then(|| &listing.sbis[0]));
+            if let Some((_, entry)) = own {
+                game.sbi = Some(SbiFile::Zipped {
+                    zip: path.clone(),
+                    entry: entry.clone(),
+                });
+            }
+            games.push(game);
         }
     }
     // A protected disc's subchannel data, named like its image:
@@ -663,7 +734,7 @@ fn scan_games(console: Console, dir: &Path, index_dir: &Path) -> Vec<Game> {
         );
         let sbi = image.with_extension("sbi");
         if sbi.is_file() {
-            game.sbi = Some(sbi);
+            game.sbi = Some(SbiFile::File(sbi));
         }
         // Pointers to its details, when they are not found automatically.
         let yaml = image.with_extension("yaml");
@@ -774,6 +845,55 @@ mod tests {
             lib.games.iter().find(|g| g.rel == "games/other.iso").unwrap().id,
             short_id("games/other.iso")
         );
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn zipped_sbi_files() {
+        use std::io::Write;
+        let base = std::env::temp_dir().join(format!("texel-zipsbi-{}", std::process::id()));
+        let (games, shared) = (base.join("games"), base.join("sbi"));
+        std::fs::create_dir_all(&games).unwrap();
+        std::fs::create_dir_all(&shared).unwrap();
+        let zip_of = |path: &Path, files: &[(&str, &[u8])]| {
+            let mut zip = zip::ZipWriter::new(std::fs::File::create(path).unwrap());
+            for (name, data) in files {
+                zip.start_file(*name, zip::write::SimpleFileOptions::default()).unwrap();
+                zip.write_all(data).unwrap();
+            }
+            zip.finish().unwrap();
+        };
+        // As Redump hands them out: one zip per disc.
+        zip_of(
+            &shared.join("Ape Escape (France).zip"),
+            &[("Ape Escape (France).sbi", b"shared")],
+        );
+        // A zipped disc with its own: a CUE sheet, its BIN, its SBI.
+        let bin = vec![0u8; 2352 * 16];
+        zip_of(
+            &games.join("Game (Europe).zip"),
+            &[
+                (
+                    "Game (Europe).cue",
+                    b"FILE \"Game (Europe).bin\" BINARY\n  TRACK 01 MODE2/2352\n    INDEX 01 00:00:00\n",
+                ),
+                ("Game (Europe).bin", &bin),
+                ("Game (Europe).sbi", b"own"),
+            ],
+        );
+        let root = Root {
+            console: Console::Ps1,
+            bios: Vec::new(),
+            games: vec![games.clone()],
+            sbi: vec![shared.clone()],
+        };
+        let lib = scan(&[root], &base.join("index"));
+        let shared_sbi = lib.sbi.get("Ape Escape (France)").expect("the shared zipped SBI");
+        assert_eq!(shared_sbi.read().unwrap(), b"shared");
+        assert_eq!(lib.games.len(), 1);
+        let own = lib.games[0].sbi.as_ref().expect("the zipped game's own SBI");
+        assert!(matches!(own, SbiFile::Zipped { entry, .. } if entry == "Game (Europe).sbi"));
+        assert_eq!(own.read().unwrap(), b"own");
         std::fs::remove_dir_all(&base).unwrap();
     }
 

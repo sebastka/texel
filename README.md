@@ -37,7 +37,8 @@ library/
 │   │   ├── psxonpsp/psxonpsp660.bin
 │   │   └── openbios/openbios.bin
 │   ├── sbi/                        # optional: Redump's SBI files of LibCrypt-protected discs
-│   │   └── Disney's Tarzan (Europe).sbi   # named after the disc's Redump name
+│   │   ├── Disney's Tarzan (Europe).sbi   # named after the disc's Redump name
+│   │   └── Ape Escape (France).zip        # or zipped, as Redump hands them out
 │   └── games/
 │       ├── SLES-00049/
 │       │   ├── disc.cue            # CUE/BIN, any number of tracks
@@ -153,7 +154,7 @@ Everyone but administrators is a guest: guests play, keep saves, open and join r
 | `TEXEL_LISTEN` | `0.0.0.0:8080` | Listen address |
 | `TEXEL_PS1_BIOS` | `/library/ps1/bios` | PlayStation BIOS images (directories, separated by `:`) |
 | `TEXEL_PS1_GAMES` | `/library/ps1/games` | PlayStation games (directories, separated by `:`) |
-| `TEXEL_PS1_SBI` | `/library/ps1/sbi` | Redump's SBI files of LibCrypt-protected discs, named after them (directories, separated by `:`; optional) |
+| `TEXEL_PS1_SBI` | `/library/ps1/sbi` | Redump's SBI files of LibCrypt-protected discs, named after them, zipped or not (directories, separated by `:`; optional) |
 | `TEXEL_PS2_BIOS` | `/library/ps2/bios` | PlayStation 2 BIOS images (directories, separated by `:`) |
 | `TEXEL_PS2_GAMES` | `/library/ps2/games` | PlayStation 2 games (directories, separated by `:`; the emulator is in progress) |
 | `TEXEL_DATABASE_URL` | | Required: `mysql://user:password@host:3306/database` (MariaDB or MySQL; add `?ssl-mode=required` for TLS) |

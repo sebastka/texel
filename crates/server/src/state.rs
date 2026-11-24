@@ -272,7 +272,7 @@ impl AppState {
     /// they may need different files (Spyro - Year of the Dragon (Europe),
     /// Rev 0 and Rev 1): a shared file is then used only when every file of
     /// that serial's discs is the same.
-    pub async fn sbi(&self, lib: &Library, game: &Game) -> Option<PathBuf> {
+    pub async fn sbi(&self, lib: &Library, game: &Game) -> Option<crate::library::SbiFile> {
         if let Some(own) = &game.sbi {
             return Some(own.clone());
         }
@@ -285,16 +285,20 @@ impl AppState {
         }
         let serial = game.serial.as_deref()?;
         let all = self.dats.read().await.clone();
-        let mut files: Vec<&PathBuf> = all
+        let mut files: Vec<&crate::library::SbiFile> = all
             .get(game.console)
             .serial_names(serial)
             .filter_map(|name| lib.sbi.get(name))
             .collect();
         files.sort();
         files.dedup();
-        let first = tokio::fs::read(files.first()?).await.ok()?;
+        let read = |f: &crate::library::SbiFile| {
+            let f = f.clone();
+            tokio::task::spawn_blocking(move || f.read())
+        };
+        let first = read(files.first()?).await.ok()?.ok()?;
         for other in &files[1..] {
-            if tokio::fs::read(other).await.ok()? != first {
+            if read(other).await.ok()?.ok()? != first {
                 return None;
             }
         }

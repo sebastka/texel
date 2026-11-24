@@ -424,7 +424,19 @@ async fn game_sbi(State(state): AppStateRef, viewer: Viewer, Path(id): Path<Stri
         return not_found("game");
     };
     match state.sbi(&lib, game).await {
-        Some(path) => serve_path(path, req, "application/octet-stream").await,
+        Some(crate::library::SbiFile::File(path)) => serve_path(path, req, "application/octet-stream").await,
+        // In a zip: a few KiB, decompressed.
+        Some(zipped) => match tokio::task::spawn_blocking(move || zipped.read()).await {
+            Ok(Ok(data)) => ([(header::CONTENT_TYPE, "application/octet-stream")], data).into_response(),
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, "reading a zipped SBI file failed");
+                StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "reading a zipped SBI file failed");
+                StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            }
+        },
         None => not_found("SBI file"),
     }
 }
