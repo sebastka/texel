@@ -245,6 +245,7 @@ pub fn scan(roots: &[Root], index_dir: &Path, dats: &crate::dat::AllDats) -> Lib
                 }
             }
         }
+        let first_game = lib.games.len();
         for dir in &root.games {
             for g in scan_games(root.console, dir, index_dir, dats.get(root.console)) {
                 let place = g.files.first().map(|f| f.path.clone()).unwrap_or_default();
@@ -260,6 +261,17 @@ pub fn scan(roots: &[Root], index_dir: &Path, dats: &crate::dat::AllDats) -> Lib
                         lib.games.push(g);
                     }
                 }
+            }
+        }
+        // A game without a YAML file of its own: one named after its serial
+        // (`SLES-01893.yaml`), anywhere in its console's game directories.
+        let by_serial = serial_yamls(&root.games);
+        for g in &mut lib.games[first_game..] {
+            if g.overrides.is_none()
+                && g.overrides_error.is_none()
+                && let Some(yaml) = g.serial.as_ref().and_then(|s| by_serial.get(s))
+            {
+                read_overrides(g, yaml);
             }
         }
     }
@@ -438,6 +450,57 @@ fn openps2bios_source(path: &Path, rom: &[u8]) -> Option<Option<String>> {
         .find_map(|l| l.strip_prefix("- Commit: "))
         .map(|c| c.trim().to_owned());
     Some(commit)
+}
+
+/// Reads a game's pointers to its details (see `overrides`).
+fn read_overrides(game: &mut Game, yaml: &Path) {
+    let Ok(text) = std::fs::read_to_string(yaml) else {
+        return;
+    };
+    match crate::overrides::Overrides::parse(&text) {
+        Ok(o) => game.overrides = Some(o),
+        Err(e) => {
+            tracing::warn!(file = %yaml.display(), error = %e, "ignoring a game's YAML file");
+            game.overrides_error = Some(e);
+        }
+    }
+}
+
+/// The YAML files named after a serial (`SLES-01893.yaml`, or as the disc
+/// writes it, `SLES_018.93.yaml`; any case) under `dirs`: serial → file.
+/// Two for one serial: the first by path, with a warning.
+fn serial_yamls(dirs: &[PathBuf]) -> std::collections::HashMap<String, PathBuf> {
+    let mut files = Vec::new();
+    for dir in dirs {
+        walk(dir, &mut files, 0);
+    }
+    files.sort();
+    let mut out: std::collections::HashMap<String, PathBuf> = std::collections::HashMap::new();
+    for path in files {
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let Some((stem, ext)) = name.rsplit_once('.') else {
+            continue;
+        };
+        if !ext.eq_ignore_ascii_case("yaml") {
+            continue;
+        }
+        let Some(serial) = texel_disc::serial_from_boot_path(stem) else {
+            continue;
+        };
+        match out.entry(serial) {
+            std::collections::hash_map::Entry::Occupied(first) => tracing::warn!(
+                kept = %first.get().display(),
+                ignored = %path.display(),
+                "two YAML files for one serial: the first is kept"
+            ),
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(path);
+            }
+        }
+    }
+    out
 }
 
 /// Directory levels followed, which also stops symbolic link cycles.
@@ -755,16 +818,11 @@ fn scan_games(console: Console, dir: &Path, index_dir: &Path, dats: &crate::dat:
         if sbi.is_file() {
             game.sbi = Some(SbiFile::File(sbi));
         }
-        // Pointers to its details, when they are not found automatically.
+        // Pointers to its details, when they are not found automatically
+        // (else by its serial: `scan`).
         let yaml = image.with_extension("yaml");
-        if let Ok(text) = std::fs::read_to_string(&yaml) {
-            match crate::overrides::Overrides::parse(&text) {
-                Ok(o) => game.overrides = Some(o),
-                Err(e) => {
-                    tracing::warn!(file = %yaml.display(), error = %e, "ignoring a game's YAML file");
-                    game.overrides_error = Some(e);
-                }
-            }
+        if yaml.is_file() {
+            read_overrides(game, &yaml);
         }
     }
     games
@@ -951,6 +1009,27 @@ mod tests {
         let names: Vec<&str> = g.files.iter().map(|f| f.name.as_str()).collect();
         assert_eq!(names, ["a.bin", "b.bin"]);
         assert!(g.cue.as_deref().is_some_and(|c| c.contains("FILE \"b.bin\" BINARY")));
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn yaml_files_named_after_serials() {
+        let base = std::env::temp_dir().join(format!("texel-serialyaml-{}", std::process::id()));
+        let (one, two) = (base.join("one"), base.join("two"));
+        std::fs::create_dir_all(one.join("notes/deep")).unwrap();
+        std::fs::create_dir_all(&two).unwrap();
+        std::fs::write(one.join("notes/deep/SLES-01893.yaml"), "wikidata: Q1\n").unwrap();
+        // As the disc writes it, any case.
+        std::fs::write(two.join("scus_944.26.YAML"), "wikidata: Q2\n").unwrap();
+        // The same serial again, later by path: not kept.
+        std::fs::write(two.join("SLES-01893.yaml"), "wikidata: Q3\n").unwrap();
+        // Not serials.
+        std::fs::write(two.join("disc.yaml"), "").unwrap();
+        std::fs::write(two.join("SLES-01893.txt"), "").unwrap();
+        let found = serial_yamls(&[one.clone(), two.clone()]);
+        assert_eq!(found.len(), 2);
+        assert_eq!(found["SLES-01893"], one.join("notes/deep/SLES-01893.yaml"));
+        assert_eq!(found["SCUS-94426"], two.join("scus_944.26.YAML"));
         std::fs::remove_dir_all(&base).unwrap();
     }
 

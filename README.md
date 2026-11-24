@@ -46,7 +46,7 @@ library/
 │       │   └── disc.sbi            # or a protected disc's SBI file next to its image
 │       ├── SLES-01893/
 │       │   ├── disc.chd
-│       │   └── disc.yaml           # optional: where to find the game's details
+│       │   └── disc.yaml           # optional: where to find the game's details (or SLES-01893.yaml, anywhere)
 │       ├── Some Game.iso           # or a single ISO / BIN
 │       ├── Another Game.chd        # MAME CHD (`chdman createcd`, in the dev shell)
 │       ├── A Zipped Game.zip       # an ISO, or a CUE sheet and its BINs, zipped (stored or deflated)
@@ -64,7 +64,7 @@ BIOS images are identified by their content, wherever they are under `bios/`, zi
 
 Some European discs (1999 and later) are protected by LibCrypt, which checks subchannel data that disc images do not keep: without it, they stop at a loading or copyright screen, or misbehave later. Redump publishes that data for each protected disc as an SBI file, and all of them as a set, which the server downloads with Redump's DATs: a disc gets the file of its Redump name once its hashes identify it (the background verification, after the first scan). Until then, or for a dump Redump does not list, the disc only has its serial, which revisions share and they may need different files (Spyro - Year of the Dragon (Europe), Rev 0 and Rev 1): a file is then used only when all the files of that serial's discs are the same. An SBI file next to an image, named like it (`disc.chd` → `disc.sbi`, `Game (Europe).cue` → `Game (Europe).sbi`), or in a zipped game next to its CUE sheet, comes first. The game's page says when a disc has one.
 
-When the search for a game's details finds the wrong game or nothing (a title several games share, like "Bomberman"), a YAML file next to its image, named like it (`disc.chd` → `disc.yaml`), says where to look. Every key is optional:
+When the search for a game's details finds the wrong game or nothing (a title several games share, like "Bomberman"), a YAML file says where to look: next to its image, named like it (`disc.chd` → `disc.yaml`), or named after its serial (`SLES-01893.yaml`, as the game's page shows it, any case; or `SLES_018.93.yaml`, as the disc writes it) anywhere in its console's game directories, for a library whose files are not yours to add to (a zipped game, a download folder). A file next to the image comes first; two named after one serial, the first by path. Every key is optional:
 
 ```yaml
 # Redump's "Bomberman (Europe)" is Bomberman Party Edition.
