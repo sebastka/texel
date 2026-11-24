@@ -1,6 +1,7 @@
 //! A game's own pointers to its details, for when the automatic lookup
 //! fails (a title shared by several games, say): a YAML file next to its
-//! image, named like it (`disc.chd` → `disc.yaml`):
+//! image, named like it (`disc.chd` → `disc.yaml`), or named after its
+//! serial (`SLES-01893.yaml`) anywhere in its console's game directories:
 //!
 //! ```yaml
 //! # Bomberman (Europe) is Bomberman Party Edition.
