@@ -98,6 +98,20 @@ fn fresh(path: &std::path::Path, ttl: Duration) -> bool {
         .is_some_and(|age| age < ttl)
 }
 
+/// Whether a "missing" marker still holds: fresh, and written after the DATs
+/// last changed (`dats_changed`, written then). New DATs can rename a game,
+/// and free names it used to have that libretro-thumbnails still files its
+/// images under (`older_names`, which skips names another game has): its
+/// artwork is looked for again.
+fn still_missing(marker: &std::path::Path, dats_changed: &std::path::Path, ttl: Duration) -> bool {
+    let modified = |p: &std::path::Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+    fresh(marker, ttl)
+        && match (modified(marker), modified(dats_changed)) {
+            (Some(marker), Some(dats)) => marker >= dats,
+            _ => true,
+        }
+}
+
 /// libretro-thumbnails names files after the DAT name, with these
 /// characters replaced by underscores.
 fn thumbnail_name(name: &str) -> String {
@@ -134,7 +148,8 @@ pub async fn image(state: &AppState, console: Console, name: &str, kind: ImageKi
         return Some(path);
     }
     let missing = dir.join(format!("{key}.missing"));
-    if !state.config.fetch_metadata || fresh(&missing, NEGATIVE_TTL) {
+    let dats_changed = crate::state::dat_dir(&state.config).join("versions.json");
+    if !state.config.fetch_metadata || still_missing(&missing, &dats_changed, NEGATIVE_TTL) {
         return None;
     }
     // The DAT name, then names libretro-thumbnails may still use for this
@@ -1221,6 +1236,32 @@ mod wikipedia {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn missing_markers_lapse_with_new_dats() {
+        use std::time::{Duration, SystemTime};
+        let dir = std::env::temp_dir().join(format!("texel-missing-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (marker, dats) = (dir.join("x.missing"), dir.join("versions.json"));
+        let at = |path: &std::path::Path, ago: u64| {
+            let f = std::fs::File::create(path).unwrap();
+            f.set_modified(SystemTime::now() - Duration::from_secs(ago)).unwrap();
+        };
+        let week = Duration::from_secs(7 * 86_400);
+        // Two days old, the DATs older: holds.
+        at(&marker, 2 * 86_400);
+        at(&dats, 3 * 86_400);
+        assert!(super::still_missing(&marker, &dats, week));
+        // The DATs changed since: looked for again.
+        at(&dats, 3600);
+        assert!(!super::still_missing(&marker, &dats, week));
+        // No DATs' date: as before, by age only.
+        std::fs::remove_file(&dats).unwrap();
+        assert!(super::still_missing(&marker, &dats, week));
+        at(&marker, 8 * 86_400);
+        assert!(!super::still_missing(&marker, &dats, week));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     use super::*;
 
     #[test]
