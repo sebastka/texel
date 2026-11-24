@@ -490,7 +490,9 @@ mod tests {
                 feed(&mut fast, &mut fast_vu, &stream[at..at + n]);
                 at += n;
             }
-            if let Some(q) = (0..slow_vu.data.len() / 16).find(|&q| slow_vu.read_q(q as u32) != fast_vu.read_q(q as u32)) {
+            if let Some(q) =
+                (0..slow_vu.data.len() / 16).find(|&q| slow_vu.read_q(q as u32) != fast_vu.read_q(q as u32))
+            {
                 panic!(
                     "round {round}: quadword {q} differs: {:08x?} word by word, {:08x?} in bulk; stream {:08x?}",
                     slow_vu.read_q(q as u32),

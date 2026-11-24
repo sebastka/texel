@@ -97,7 +97,13 @@ fn interleave(size: usize, upper: bool) -> [u8; 16] {
 fn pack(size: usize) -> [u8; 16] {
     let n = 16 / size;
     let map: Vec<(u8, u8)> = (0..n)
-        .map(|k| if k < n / 2 { (0, (2 * k) as u8) } else { (1, (2 * (k - n / 2)) as u8) })
+        .map(|k| {
+            if k < n / 2 {
+                (0, (2 * k) as u8)
+            } else {
+                (1, (2 * (k - n / 2)) as u8)
+            }
+        })
         .collect();
     lanes_of(size, &map)
 }
@@ -449,7 +455,11 @@ impl Gen {
             0x03 => {
                 self.fpu_operand(fpr(ft));
                 self.code.local_set(COND_F);
-                self.code.local_get(COND_F).op(F32_CONST).bytes.extend_from_slice(&0f32.to_le_bytes());
+                self.code
+                    .local_get(COND_F)
+                    .op(F32_CONST)
+                    .bytes
+                    .extend_from_slice(&0f32.to_le_bytes());
                 self.code.op(F32_EQ).if_();
                 self.code
                     .local_get(EE)
@@ -493,7 +503,11 @@ impl Gen {
             0x16 => {
                 self.fpu_operand(fpr(ft));
                 self.code.op(F32_ABS).op(F32_SQRT).local_set(COND_F);
-                self.code.local_get(COND_F).op(F32_CONST).bytes.extend_from_slice(&0f32.to_le_bytes());
+                self.code
+                    .local_get(COND_F)
+                    .op(F32_CONST)
+                    .bytes
+                    .extend_from_slice(&0f32.to_le_bytes());
                 self.code.op(F32_EQ).if_();
                 self.code
                     .local_get(EE)
@@ -546,7 +560,10 @@ impl Gen {
     fn cvt_s_w(&mut self, i: u32) {
         let fs = (i >> 11) & 31;
         let fd = (i >> 6) & 31;
-        self.code.local_get(EE).mem(op::I32_LOAD, 2, fpr(fs)).op(F32_CONVERT_I32_S);
+        self.code
+            .local_get(EE)
+            .mem(op::I32_LOAD, 2, fpr(fs))
+            .op(F32_CONVERT_I32_S);
         self.fpu_result(fpr(fd));
     }
 
