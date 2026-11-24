@@ -182,7 +182,9 @@ enum End {
 fn blocks(micro: &[u8], start: u32, entries: &[u32], wrap: u32) -> Vec<Block> {
     let mut out = Vec::new();
     let mut seen = BTreeMap::new();
-    let mut todo: VecDeque<u32> = std::iter::once(start).chain(entries.iter().map(|&e| e & wrap)).collect();
+    let mut todo: VecDeque<u32> = std::iter::once(start)
+        .chain(entries.iter().map(|&e| e & wrap))
+        .collect();
     let mut total = 0;
     while let Some(first) = todo.pop_front() {
         if seen.contains_key(&first) || total >= MAX_INSTRUCTIONS {
