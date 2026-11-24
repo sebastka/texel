@@ -57,8 +57,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // VU1THREAD=1: VU1 in a thread of its own (see `vu1q`).
     if std::env::var("VU1THREAD").is_ok() {
         let b = &mut ps2.bus;
-        b.vu1q
-            .set_backend(Some(Box::new(texel_ps2::vu1q::Thread::spawn())), &b.vu1, &b.gif);
+        b.vu1q.set_backend(
+            Some(Box::new(texel_ps2::vu1q::Thread::spawn())),
+            &b.vu1,
+            &b.gif,
+            &b.vif1,
+        );
     }
     // TRACE=N: the first N instructions' addresses, with the stack pointer
     // and Status, when they change.

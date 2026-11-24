@@ -110,7 +110,8 @@ impl Ps2Emulator {
         self.ps2.settle();
         let b = &mut self.ps2.bus;
         b.vu1q.take_backend();
-        b.vu1q.set_backend(Some(Box::new(JsVu1 { send, wait })), &b.vu1, &b.gif);
+        b.vu1q
+            .set_backend(Some(Box::new(JsVu1 { send, wait })), &b.vu1, &b.gif, &b.vif1);
     }
 
     /// What the VUs' compiler did, for diagnostics.
@@ -270,7 +271,7 @@ impl Ps2Emulator {
         let vu1 = self.ps2.bus.vu1q.take_backend();
         self.ps2 = Ps2::new(&self.bios);
         let b = &mut self.ps2.bus;
-        b.vu1q.set_backend(vu1, &b.vu1, &b.gif);
+        b.vu1q.set_backend(vu1, &b.vu1, &b.gif, &b.vif1);
         self.ps2.bus.iop.sio2.cards = cards;
         // The same disc, booted again.
         if let Some(d) = disc {

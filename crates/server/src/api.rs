@@ -546,10 +546,13 @@ async fn game_image(
     let Some(g) = lib.game(&id) else {
         return not_found("game");
     };
-    let Some(name) = state.identify(g).await.name else {
+    // The YAML file's thumbnails name, when it gives one, needs no
+    // identification.
+    let pinned = g.overrides.as_ref().and_then(|o| o.thumbnails_name());
+    let Some(name) = state.identify(g).await.name.or_else(|| pinned.clone()) else {
         return not_found("image");
     };
-    match metadata::image(&state, g.console, &name, kind).await {
+    match metadata::image(&state, g.console, &name, pinned.as_deref(), kind).await {
         Some(path) => serve_path(path, req, "image/png").await,
         None => not_found("image"),
     }
