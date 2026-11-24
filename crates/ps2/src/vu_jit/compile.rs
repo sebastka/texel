@@ -104,6 +104,9 @@ const MAX: i32 = 0x7F7F_FFFF;
 pub struct Compiled {
     pub module: Vec<u8>,
     pub words: Vec<(u32, u64)>,
+    /// The PCs its blocks start at (where it can be entered, its jumps
+    /// through registers included).
+    pub starts: Vec<u32>,
 }
 
 fn field(offset: usize) -> u32 {
@@ -174,11 +177,14 @@ enum End {
     Stop(u32),
 }
 
-/// Finds the blocks reachable from `start`.
-fn blocks(micro: &[u8], start: u32, wrap: u32) -> Vec<Block> {
+/// Finds the blocks reachable from `start`, and from `entries` (PCs that
+/// jumps through registers were found going to).
+fn blocks(micro: &[u8], start: u32, entries: &[u32], wrap: u32) -> Vec<Block> {
     let mut out = Vec::new();
     let mut seen = BTreeMap::new();
-    let mut todo = VecDeque::from([start]);
+    let mut todo: VecDeque<u32> = std::iter::once(start)
+        .chain(entries.iter().map(|&e| e & wrap))
+        .collect();
     let mut total = 0;
     while let Some(first) = todo.pop_front() {
         if seen.contains_key(&first) || total >= MAX_INSTRUCTIONS {
@@ -248,11 +254,12 @@ fn blocks(micro: &[u8], start: u32, wrap: u32) -> Vec<Block> {
 
 /// Compiles the program at `start` (in 64-bit units) of a VU's micro memory,
 /// for a data memory of `qwords` quadwords (1024 for VU1, 256 for VU0).
-/// `helper`: the function-table index of `helpers::lower`.
-pub fn compile(micro: &[u8], start: u32, qwords: u32, helper: u32) -> Option<Compiled> {
+/// `helper`: the function-table index of `helpers::lower`; `entries`: more
+/// PCs to start blocks at (see `blocks`).
+pub fn compile(micro: &[u8], start: u32, entries: &[u32], qwords: u32, helper: u32) -> Option<Compiled> {
     let wrap = (micro.len() / 8).max(1) as u32 - 1;
     let start = start & wrap;
-    let blocks = blocks(micro, start, wrap);
+    let blocks = blocks(micro, start, entries, wrap);
     if blocks.is_empty() {
         return None;
     }
@@ -368,7 +375,8 @@ pub fn compile(micro: &[u8], start: u32, qwords: u32, helper: u32) -> Option<Com
         },
     ];
     let module = wasm::module(&types, &[(I32_LOCALS, I32), (V128_LOCALS, V128)], &e.code);
-    Some(Compiled { module, words })
+    let starts = blocks.iter().map(|b| b.start).collect();
+    Some(Compiled { module, words, starts })
 }
 
 /// The locals `macro_upper`'s code uses, past the function's first three

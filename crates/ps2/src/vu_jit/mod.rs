@@ -64,9 +64,16 @@ struct Program {
     func: u32,
     /// The instructions compiled: (PC, word).
     words: Vec<(u32, u64)>,
+    /// The PCs its blocks start at; and the ones it was compiled with,
+    /// besides its start (where jumps through registers went).
+    starts: Vec<u32>,
+    entries: Vec<u32>,
     /// The micro memory generation it was last found the same at.
     generation: u64,
 }
+
+/// Entries a program is recompiled with, at most.
+const ENTRIES: usize = 16;
 
 #[derive(Default)]
 struct Start {
@@ -135,6 +142,32 @@ impl VuJit {
                 return Some(Ran::Ended);
             }
             self.stats.stopped += 1;
+            // Stopped where no block starts (a jump through a register,
+            // to a PC found at run time): compiled again with a block
+            // there, for the next run.
+            let p = &start.programs[0];
+            let at = vu.pc;
+            if !p.starts.contains(&at) && p.entries.len() < ENTRIES {
+                let mut entries = p.entries.clone();
+                entries.push(at);
+                let qwords = (vu.data.len() / 16) as u32;
+                if let Some(c) = compile(&vu.micro, pc, &entries, qwords, self.backend.helper_index())
+                    && let Some(func) = self.backend.install(&c.module)
+                {
+                    self.stats.compiled += 1;
+                    let old = std::mem::replace(
+                        &mut start.programs[0],
+                        Program {
+                            func,
+                            words: c.words,
+                            starts: c.starts,
+                            entries,
+                            generation,
+                        },
+                    );
+                    self.backend.release(old.func);
+                }
+            }
             return Some(Ran::Stopped);
         }
         self.stats.interpreted += 1;
@@ -144,7 +177,7 @@ impl VuJit {
         }
         start.runs = 0;
         let qwords = (vu.data.len() / 16) as u32;
-        let Some(c) = compile(&vu.micro, pc, qwords, self.backend.helper_index()) else {
+        let Some(c) = compile(&vu.micro, pc, &[], qwords, self.backend.helper_index()) else {
             self.stats.failed += 1;
             return None;
         };
@@ -163,6 +196,8 @@ impl VuJit {
             Program {
                 func,
                 words: c.words,
+                starts: c.starts,
+                entries: Vec::new(),
                 generation,
             },
         );

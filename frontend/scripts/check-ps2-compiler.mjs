@@ -40,12 +40,19 @@ function run(compiled) {
   }
   const hashes = [];
   const started = performance.now();
+  // The second half's speed too: most blocks are compiled by then.
+  let half = started;
   for (let f = 1; f <= frames; f++) {
+    if (f === Math.floor(frames / 2) + 1) half = performance.now();
     emu.runFrame();
     if (f % 60 === 0) hashes.push(emu.stateHash());
   }
-  const fps = (frames * 1000) / (performance.now() - started);
-  console.log(`${compiled ? "compiled" : "interpreted"}: ${fps.toFixed(1)} frames per second; ${emu.compilerStats()}`);
+  const now = performance.now();
+  const fps = (frames * 1000) / (now - started);
+  const warm = ((frames - Math.floor(frames / 2)) * 1000) / (now - half);
+  console.log(
+    `${compiled ? "compiled" : "interpreted"}: ${fps.toFixed(1)} frames per second (second half ${warm.toFixed(1)}); ${emu.compilerStats()}`,
+  );
   return hashes;
 }
 
