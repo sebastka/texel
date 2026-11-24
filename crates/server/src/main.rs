@@ -14,6 +14,7 @@ mod netplay;
 mod overrides;
 mod state;
 mod verify;
+mod zipimage;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -40,16 +41,17 @@ pub struct Config {
     #[arg(long, env = "TEXEL_PS1_BIOS")]
     pub ps1_bios: Option<PathBuf>,
 
-    /// PlayStation games: CUE/BIN, ISO, CHD, PBP [default: LIBRARY/ps1/games].
+    /// PlayStation games: CUE/BIN, ISO, CHD, PBP, zipped images [default:
+    /// LIBRARY/ps1/games].
     #[arg(long, env = "TEXEL_PS1_GAMES")]
     pub ps1_games: Option<PathBuf>,
 
-    /// PlayStation 2 BIOS images, for later: not emulated yet [default:
+    /// PlayStation 2 BIOS images (any layout of subdirectories) [default:
     /// LIBRARY/ps2/bios].
     #[arg(long, env = "TEXEL_PS2_BIOS")]
     pub ps2_bios: Option<PathBuf>,
 
-    /// PlayStation 2 games, for later: not emulated yet [default:
+    /// PlayStation 2 games: ISO, CHD, zipped images [default:
     /// LIBRARY/ps2/games].
     #[arg(long, env = "TEXEL_PS2_GAMES")]
     pub ps2_games: Option<PathBuf>,

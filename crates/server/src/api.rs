@@ -252,7 +252,22 @@ async fn bios_data(State(state): AppStateRef, viewer: Viewer, Path(id): Path<Str
     }
     let lib = state.library.read().await.clone();
     match lib.bios(&id) {
-        Some(b) => serve_path(b.path.clone(), req, "application/octet-stream").await,
+        Some(b) if b.entry.is_none() => serve_path(b.path.clone(), req, "application/octet-stream").await,
+        // In a zip: decompressed whole (a few MiB at most).
+        Some(b) => {
+            let b = b.clone();
+            match tokio::task::spawn_blocking(move || crate::library::read_bios(&b)).await {
+                Ok(Ok(rom)) => ([(header::CONTENT_TYPE, "application/octet-stream")], rom).into_response(),
+                Ok(Err(e)) => {
+                    tracing::warn!(error = %e, "reading a zipped BIOS failed");
+                    StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "reading a zipped BIOS failed");
+                    StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                }
+            }
+        }
         None => not_found("BIOS"),
     }
 }

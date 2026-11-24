@@ -136,7 +136,8 @@ impl AppState {
         let _guard = self.scan_lock.lock().await;
         let roots = self.config.library_roots();
         let started = std::time::Instant::now();
-        match tokio::task::spawn_blocking(move || crate::library::scan(&roots)).await {
+        let index_dir = self.config.state.join("cache").join("zip-index");
+        match tokio::task::spawn_blocking(move || crate::library::scan(&roots, &index_dir)).await {
             Ok(lib) => {
                 let count = |c| {
                     (
