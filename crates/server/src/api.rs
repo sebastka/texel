@@ -772,7 +772,11 @@ async fn rescan(State(state): AppStateRef, _: Admin) -> StatusCode {
     state.rescan().await;
     if state.config.fetch_metadata {
         let s = state.clone();
-        tokio::spawn(async move { s.refresh_dats(false).await });
+        tokio::spawn(async move {
+            if s.refresh_dats(false).await {
+                s.rescan().await;
+            }
+        });
     }
     StatusCode::NO_CONTENT
 }

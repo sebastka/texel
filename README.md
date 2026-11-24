@@ -87,7 +87,7 @@ Games are identified by the serial in their `SYSTEM.CNF` (through libretro's Red
 | [Redump](https://redump.info/downloads) game DATs | Canonical names, regions, languages; SHA-1 verification |
 | [Redump](https://redump.info/downloads) BIOS DATs | BIOS models |
 | [Redump](https://redump.info/downloads) SBI files | Subchannel data of LibCrypt-protected PS1 discs |
-| [Redump](https://redump.info/downloads) CUE sheets | Kept with the DATs (not used yet) |
+| [Redump](https://redump.info/downloads) CUE sheets | BIN files found without their CUE sheet |
 | [libretro-database](https://github.com/libretro/libretro-database) | Serial → Redump name |
 | libretro-thumbnails ([PS1](https://github.com/libretro-thumbnails/Sony_-_PlayStation), [PS2](https://github.com/libretro-thumbnails/Sony_-_PlayStation_2)) | Box art, title screens, in-game snapshots |
 | [Wikipedia](https://en.wikipedia.org/) | Game descriptions (CC BY-SA, credited on the game page) |

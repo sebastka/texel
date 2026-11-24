@@ -284,8 +284,9 @@ async fn main() -> anyhow::Result<()> {
 /// The first scan, DAT refreshes, verification and periodic rescans.
 async fn background(state: Arc<state::AppState>) {
     state.rescan().await;
-    if state.config.fetch_metadata {
-        state.refresh_dats(false).await;
+    // New DATs bring CUE sheets for BIN files found without one: again.
+    if state.config.fetch_metadata && state.refresh_dats(false).await {
+        state.rescan().await;
     }
     let mut last_scan = tokio::time::Instant::now();
     loop {
@@ -300,8 +301,8 @@ async fn background(state: Arc<state::AppState>) {
         let every = state.config.rescan_minutes;
         if every > 0 && last_scan.elapsed() >= Duration::from_secs(every * 60) {
             state.rescan().await;
-            if state.config.fetch_metadata {
-                state.refresh_dats(false).await;
+            if state.config.fetch_metadata && state.refresh_dats(false).await {
+                state.rescan().await;
             }
             last_scan = tokio::time::Instant::now();
         }

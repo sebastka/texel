@@ -140,7 +140,9 @@ impl AppState {
         let roots = self.config.library_roots();
         let started = std::time::Instant::now();
         let index_dir = self.config.state.join("cache").join("zip-index");
-        match tokio::task::spawn_blocking(move || crate::library::scan(&roots, &index_dir)).await {
+        // Redump's CUE sheets, for BIN files without one.
+        let dats = self.dats.read().await.clone();
+        match tokio::task::spawn_blocking(move || crate::library::scan(&roots, &index_dir, &dats)).await {
             Ok(lib) => {
                 let count = |c| {
                     (
@@ -188,6 +190,7 @@ impl AppState {
             Some((_, file)) => tokio::fs::read(dir.join(file)).await.ok(),
             None => None,
         };
+        let cues = tokio::fs::read(dir.join(src.cues_file)).await.ok();
         let dats = tokio::task::spawn_blocking(move || {
             let games = games.map(|x| dat::parse_xml(&x)).transpose().unwrap_or_else(|e| {
                 tracing::warn!(error = %e, "invalid cached Redump DAT");
@@ -206,6 +209,12 @@ impl AppState {
                     Err(e) => tracing::warn!(error = %e, "invalid cached Redump SBI files"),
                 }
             }
+            if let Some(zip) = cues {
+                match dat::unzip_cues(&zip) {
+                    Ok(cues) => dats.cues = cues,
+                    Err(e) => tracing::warn!(error = %e, "invalid cached Redump CUE sheets"),
+                }
+            }
             dats
         })
         .await
@@ -215,6 +224,7 @@ impl AppState {
             games = dats.games.len(),
             bios = dats.bios.len(),
             sbi = dats.sbi.len(),
+            cues = dats.cues.len(),
             "DATs loaded"
         );
         dats
@@ -225,8 +235,8 @@ impl AppState {
     /// file is downloaded only when it is missing or its published version
     /// changed: Redump names each file after its version (the download's
     /// file name), libretro's are told by their ETag; a HEAD request asks.
-    /// `force`: download them all.
-    pub async fn refresh_dats(&self, force: bool) {
+    /// `force`: download them all. Returns whether any changed.
+    pub async fn refresh_dats(&self, force: bool) -> bool {
         let dir = dat_dir(&self.config);
         let versions_path = dir.join("versions.json");
         let mut versions: HashMap<String, String> = tokio::fs::read(&versions_path)
@@ -272,6 +282,7 @@ impl AppState {
             }
             self.load_cached_dats().await;
         }
+        changed
     }
 
     /// A download's version, from a HEAD request: the file name it is

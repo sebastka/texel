@@ -232,7 +232,8 @@ fn mtime(meta: &std::fs::Metadata) -> u64 {
 /// games can move between directories. A game found at the same relative
 /// path in two directories is taken from the first; a BIOS found twice
 /// (the same content) is listed once.
-pub fn scan(roots: &[Root], index_dir: &Path) -> Library {
+/// `dats`: Redump's CUE sheets, for BIN files found without one.
+pub fn scan(roots: &[Root], index_dir: &Path, dats: &crate::dat::AllDats) -> Library {
     let mut lib = Library::default();
     let mut bios_seen = HashSet::new();
     let mut games_seen: std::collections::HashMap<String, PathBuf> = std::collections::HashMap::new();
@@ -245,7 +246,7 @@ pub fn scan(roots: &[Root], index_dir: &Path) -> Library {
             }
         }
         for dir in &root.games {
-            for g in scan_games(root.console, dir, index_dir) {
+            for g in scan_games(root.console, dir, index_dir, dats.get(root.console)) {
                 let place = g.files.first().map(|f| f.path.clone()).unwrap_or_default();
                 match games_seen.entry(g.id.clone()) {
                     std::collections::hash_map::Entry::Occupied(first) => tracing::warn!(
@@ -483,7 +484,7 @@ fn resolve(dir: &Path, name: &str) -> Option<PathBuf> {
         .map(|e| e.path())
 }
 
-fn scan_games(console: Console, dir: &Path, index_dir: &Path) -> Vec<Game> {
+fn scan_games(console: Console, dir: &Path, index_dir: &Path, dats: &crate::dat::Dats) -> Vec<Game> {
     if !dir.is_dir() {
         tracing::warn!(console = console.name(), dir = %dir.display(), "no game directory");
         return Vec::new();
@@ -526,6 +527,50 @@ fn scan_games(console: Console, dir: &Path, index_dir: &Path) -> Vec<Game> {
             }
             Err(e) => {
                 tracing::warn!(cue = %cue.display(), error = %e, "invalid CUE sheet, ignored");
+            }
+        }
+    }
+    // BIN files without a CUE sheet: Redump's, when they are a game's
+    // tracks (by their names, else their sizes; see `Dats::match_cues`).
+    // Keyed by the first track's path, as that file alone was before.
+    let mut loose: std::collections::BTreeMap<&Path, Vec<&PathBuf>> = std::collections::BTreeMap::new();
+    for path in files.iter().filter(|p| extension(p) == "bin" && !used.contains(*p)) {
+        loose.entry(path.parent().unwrap_or(dir)).or_default().push(path);
+    }
+    for paths in loose.values() {
+        let found: Vec<(String, u64, std::fs::Metadata)> = paths
+            .iter()
+            .filter_map(|p| {
+                let meta = p.metadata().ok()?;
+                Some((p.file_name()?.to_string_lossy().into_owned(), meta.len(), meta))
+            })
+            .collect();
+        let named: Vec<(String, u64)> = found.iter().map(|(n, s, _)| (n.clone(), *s)).collect();
+        for m in dats.match_cues(&named) {
+            let game_files: Vec<GameFile> = m
+                .files
+                .iter()
+                .map(|&k| {
+                    let path = paths[k].clone();
+                    used.insert(path.clone());
+                    GameFile {
+                        name: found[k].0.clone(),
+                        rel: rel_path(kind, dir, &path),
+                        path,
+                        size: found[k].1,
+                        mtime: mtime(&found[k].2),
+                        virt: None,
+                    }
+                })
+                .collect();
+            let sizes: std::collections::HashMap<&str, u64> =
+                game_files.iter().map(|f| (f.name.as_str(), f.size)).collect();
+            match parse_cue(&m.cue, |n| sizes.get(n).copied()) {
+                Ok(layout) => {
+                    let rel = game_files[0].rel.clone();
+                    games.push(make_game(console, rel, Some(m.cue), layout, game_files));
+                }
+                Err(e) => tracing::warn!(game = %m.name, error = %e, "Redump's CUE sheet does not fit, ignored"),
             }
         }
     }
@@ -641,6 +686,30 @@ fn scan_games(console: Console, dir: &Path, index_dir: &Path) -> Vec<Game> {
                 Err(e) => {
                     tracing::warn!(file = %path.display(), cue = %cue_name, error = %e, "invalid CUE sheet in a zip, ignored")
                 }
+            }
+        }
+        // BIN files without a CUE sheet: Redump's, as for files.
+        let loose: Vec<&(String, crate::zipimage::ZipEntry)> = listing
+            .images
+            .iter()
+            .filter(|(n, _)| !used_entries.contains(n) && n.to_ascii_lowercase().ends_with(".bin"))
+            .collect();
+        let named: Vec<(String, u64)> = loose.iter().map(|(n, e)| (n.clone(), e.size)).collect();
+        for m in dats.match_cues(&named) {
+            let game_files: Vec<GameFile> = m
+                .files
+                .iter()
+                .map(|&k| {
+                    let (name, entry) = loose[k];
+                    used_entries.insert(name.clone());
+                    file_of(name, entry)
+                })
+                .collect();
+            let sizes: std::collections::HashMap<&str, u64> =
+                game_files.iter().map(|f| (f.name.as_str(), f.size)).collect();
+            match parse_cue(&m.cue, |n| sizes.get(n).copied()) {
+                Ok(layout) => found.push((format!("{}.cue", m.name), Some(m.cue.clone()), layout, game_files)),
+                Err(e) => tracing::warn!(game = %m.name, error = %e, "Redump's CUE sheet does not fit, ignored"),
             }
         }
         for (name, entry) in &listing.images {
@@ -776,7 +845,7 @@ mod tests {
             bios: Vec::new(),
             games: vec![one.clone(), two.clone()],
         };
-        let lib = scan(&[root], &base.join("index"));
+        let lib = scan(&[root], &base.join("index"), &crate::dat::AllDats::default());
         let mut found: Vec<(&str, &Path)> = lib
             .games
             .iter()
@@ -830,11 +899,58 @@ mod tests {
             bios: Vec::new(),
             games: vec![games.clone()],
         };
-        let lib = scan(&[root], &base.join("index"));
+        let lib = scan(&[root], &base.join("index"), &crate::dat::AllDats::default());
         assert_eq!(lib.games.len(), 1);
         let own = lib.games[0].sbi.as_ref().expect("the zipped game's own SBI");
         assert!(matches!(own, SbiFile::Zipped { entry, .. } if entry == "Game (Europe).sbi"));
         assert_eq!(own.read().unwrap(), b"own");
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn loose_bins_get_redump_cue_sheets() {
+        let base = std::env::temp_dir().join(format!("texel-loose-{}", std::process::id()));
+        let game = base.join("games/Some Game");
+        std::fs::create_dir_all(&game).unwrap();
+        // Two tracks, not named as Redump names them, no CUE sheet.
+        std::fs::write(game.join("a.bin"), vec![0u8; 2352 * 20]).unwrap();
+        std::fs::write(game.join("b.bin"), vec![0u8; 2352 * 30]).unwrap();
+        let rom = |name: &str, size: u64| crate::dat::DatRom {
+            name: name.to_owned(),
+            size,
+            sha1: String::new(),
+        };
+        let redump = crate::dat::DatGame {
+            name: "Game (Europe)".to_owned(),
+            roms: vec![
+                rom("Game (Europe) (Track 1).bin", 2352 * 20),
+                rom("Game (Europe) (Track 2).bin", 2352 * 30),
+            ],
+            ..Default::default()
+        };
+        let mut dats = crate::dat::AllDats {
+            ps1: crate::dat::Dats::new(vec![redump], Vec::new(), Vec::new()),
+            ..Default::default()
+        };
+        dats.ps1.cues.insert(
+            "Game (Europe)".to_owned(),
+            "FILE \"Game (Europe) (Track 1).bin\" BINARY\n  TRACK 01 MODE2/2352\n    INDEX 01 00:00:00\n\
+             FILE \"Game (Europe) (Track 2).bin\" BINARY\n  TRACK 02 AUDIO\n    INDEX 00 00:00:00\n    INDEX 01 00:02:00\n"
+                .to_owned(),
+        );
+        let root = Root {
+            console: Console::Ps1,
+            bios: Vec::new(),
+            games: vec![base.join("games")],
+        };
+        let lib = scan(&[root], &base.join("index"), &dats);
+        // One game of two tracks, keyed by the first's path.
+        assert_eq!(lib.games.len(), 1);
+        let g = &lib.games[0];
+        assert_eq!(g.rel, "games/Some Game/a.bin");
+        let names: Vec<&str> = g.files.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, ["a.bin", "b.bin"]);
+        assert!(g.cue.as_deref().is_some_and(|c| c.contains("FILE \"b.bin\" BINARY")));
         std::fs::remove_dir_all(&base).unwrap();
     }
 
