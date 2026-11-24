@@ -285,7 +285,9 @@ fn build_index(file: &mut File, start: u64, compressed: u64, size: u64, crc: u32
     let mut check = 0u32;
     // The start: a fresh decompressor (a raw stream's first block gives
     // `Z_BLOCK` no stop before it).
-    let mut points: Vec<(u64, u64, u8, Vec<u8>)> = vec![(0, 0, 0, Vec::new())];
+    // Each point's window is compressed as it is recorded: (out, input,
+    // bits, the window's length, compressed).
+    let mut points: Vec<(u64, u64, u8, u32, Vec<u8>)> = vec![(0, 0, 0, 0, deflate(&[])?)];
     loop {
         if in_pos == in_len && left > 0 {
             let n = (CHUNK as u64).min(left) as usize;
@@ -319,52 +321,54 @@ fn build_index(file: &mut File, start: u64, compressed: u64, size: u64, crc: u32
             } else {
                 window[..at].to_vec()
             };
-            points.push((total_out, total_in, (kind & 7) as u8, before));
+            points.push((
+                total_out,
+                total_in,
+                (kind & 7) as u8,
+                before.len() as u32,
+                deflate(&before)?,
+            ));
             last = total_out;
         }
     }
     ensure!(total_out == size, "{total_out} bytes decompressed, the zip says {size}");
     ensure!(check == crc, "CRC {check:08x}, the zip says {crc:08x}");
 
-    // MAGIC, size, the points' count, the points (40 bytes each), then
-    // their windows, compressed.
-    let mut head = Vec::with_capacity(20 + points.len() * 33);
+    // MAGIC, size, the points' count, the points (`POINT_BYTES` each),
+    // then their windows, compressed.
+    let mut head = Vec::with_capacity(20 + points.len() * POINT_BYTES);
     head.extend_from_slice(MAGIC);
     head.extend_from_slice(&size.to_le_bytes());
     head.extend_from_slice(&u32::try_from(points.len())?.to_le_bytes());
-    let mut windows = Vec::new();
-    let mut table = Vec::new();
-    for (out, input, bits, before) in &points {
-        let mut e = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::fast());
-        e.write_all(before)?;
-        let packed = e.finish()?;
-        table.push((
-            *out,
-            *input,
-            *bits,
-            windows.len() as u64,
-            before.len() as u32,
-            packed.len() as u32,
-        ));
-        windows.extend_from_slice(&packed);
-    }
-    let windows_at = (head.len() + table.len() * POINT_BYTES) as u64;
-    for (out, input, bits, w_at, w_len, w_packed) in table {
+    let mut at = (20 + points.len() * POINT_BYTES) as u64;
+    for (out, input, bits, len, packed) in &points {
         head.extend_from_slice(&out.to_le_bytes());
         head.extend_from_slice(&input.to_le_bytes());
-        head.push(bits);
-        head.extend_from_slice(&(windows_at + w_at).to_le_bytes());
-        head.extend_from_slice(&w_len.to_le_bytes());
-        head.extend_from_slice(&w_packed.to_le_bytes());
+        head.push(*bits);
+        head.extend_from_slice(&at.to_le_bytes());
+        head.extend_from_slice(&len.to_le_bytes());
+        head.extend_from_slice(&(packed.len() as u32).to_le_bytes());
+        at += packed.len() as u64;
     }
-    head.extend_from_slice(&windows);
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
     let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, &head)?;
+    let mut out = std::io::BufWriter::new(File::create(&tmp)?);
+    out.write_all(&head)?;
+    for (.., packed) in &points {
+        out.write_all(packed)?;
+    }
+    out.into_inner().map_err(|e| e.into_error())?.sync_all()?;
     std::fs::rename(&tmp, path)?;
     Ok(())
+}
+
+/// A window, compressed for the index.
+fn deflate(data: &[u8]) -> anyhow::Result<Vec<u8>> {
+    let mut e = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::fast());
+    e.write_all(data)?;
+    Ok(e.finish()?)
 }
 
 /// Bytes per point in the index: out, input, bits, window offset, length,

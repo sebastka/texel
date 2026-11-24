@@ -345,45 +345,85 @@ fn scan_ps2_bios(dir: &Path) -> Vec<Bios> {
 }
 
 /// The files under `dir` of `size` bytes, and the entries of that size in
-/// its zips: (file, entry in the zip, content). Unreadable zips are skipped.
-fn bios_candidates(dir: &Path, size: u64) -> Vec<(PathBuf, Option<String>, Vec<u8>)> {
+/// its zips: (file, entry in the zip, content), read one at a time as the
+/// caller goes: a library's BIOSes (hundreds of 4 MiB PS2 images in a
+/// Redump set) are never all in memory together. Unreadable zips are
+/// skipped.
+fn bios_candidates(dir: &Path, size: u64) -> BiosCandidates {
     let mut files = Vec::new();
     walk(dir, &mut files, 0);
-    let mut out = Vec::new();
-    for path in files {
-        if extension(&path) == "zip" {
-            match zipped_of_size(&path, size) {
-                Ok(found) => out.extend(found.into_iter().map(|(name, rom)| (path.clone(), Some(name), rom))),
-                Err(e) => tracing::warn!(file = %path.display(), error = %e, "unreadable zip, ignored"),
-            }
-            continue;
-        }
-        // `fs::metadata` follows symbolic links, unlike `DirEntry::metadata`.
-        if std::fs::metadata(&path).map(|m| m.len()).ok() != Some(size) {
-            continue;
-        }
-        if let Ok(rom) = std::fs::read(&path) {
-            out.push((path, None, rom));
-        }
+    BiosCandidates {
+        files: files.into_iter(),
+        size,
+        zip: None,
     }
-    out
 }
 
-/// A zip's entries of `size` bytes, decompressed: (name, content).
-fn zipped_of_size(path: &Path, size: u64) -> anyhow::Result<Vec<(String, Vec<u8>)>> {
-    let mut archive = zip::ZipArchive::new(std::fs::File::open(path)?)?;
-    let mut out = Vec::new();
-    for i in 0..archive.len() {
-        let mut f = archive.by_index(i)?;
-        if f.is_dir() || f.size() != size {
-            continue;
+struct BiosCandidates {
+    files: std::vec::IntoIter<PathBuf>,
+    size: u64,
+    /// The zip being read: its path, and the next entry.
+    zip: Option<(PathBuf, zip::ZipArchive<std::fs::File>, usize)>,
+}
+
+impl Iterator for BiosCandidates {
+    type Item = (PathBuf, Option<String>, Vec<u8>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some((path, archive, next)) = &mut self.zip {
+                while *next < archive.len() {
+                    let k = *next;
+                    *next += 1;
+                    match zipped_of_size(archive, k, self.size) {
+                        Ok(Some((name, rom))) => return Some((path.clone(), Some(name), rom)),
+                        Ok(None) => {}
+                        Err(e) => {
+                            tracing::warn!(file = %path.display(), error = %e, "unreadable zip, ignored");
+                            break;
+                        }
+                    }
+                }
+                self.zip = None;
+                continue;
+            }
+            let path = self.files.next()?;
+            if extension(&path) == "zip" {
+                match std::fs::File::open(&path)
+                    .map_err(anyhow::Error::from)
+                    .and_then(|f| Ok(zip::ZipArchive::new(f)?))
+                {
+                    Ok(archive) => self.zip = Some((path, archive, 0)),
+                    Err(e) => tracing::warn!(file = %path.display(), error = %e, "unreadable zip, ignored"),
+                }
+                continue;
+            }
+            // `fs::metadata` follows symbolic links, unlike `DirEntry::metadata`.
+            if std::fs::metadata(&path).map(|m| m.len()).ok() != Some(self.size) {
+                continue;
+            }
+            if let Ok(rom) = std::fs::read(&path) {
+                return Some((path, None, rom));
+            }
         }
-        let name = f.name()?.into_owned();
-        let mut rom = Vec::with_capacity(size as usize);
-        std::io::Read::read_to_end(&mut f, &mut rom)?;
-        out.push((name, rom));
     }
-    Ok(out)
+}
+
+/// A zip's entry `k` if it is of `size` bytes, decompressed: (name,
+/// content).
+fn zipped_of_size(
+    archive: &mut zip::ZipArchive<std::fs::File>,
+    k: usize,
+    size: u64,
+) -> anyhow::Result<Option<(String, Vec<u8>)>> {
+    let mut f = archive.by_index(k)?;
+    if f.is_dir() || f.size() != size {
+        return Ok(None);
+    }
+    let name = f.name()?.into_owned();
+    let mut rom = Vec::with_capacity(size as usize);
+    std::io::Read::read_to_end(&mut f, &mut rom)?;
+    Ok(Some((name, rom)))
 }
 
 /// A BIOS image's content: the file, or its entry in a zip. Blocking.
@@ -968,7 +1008,7 @@ mod tests {
         zip.start_file("readme.txt", deflated).unwrap();
         zip.write_all(b"not a BIOS").unwrap();
         zip.finish().unwrap();
-        let mut found = bios_candidates(&dir, 512 * 1024);
+        let mut found: Vec<_> = bios_candidates(&dir, 512 * 1024).collect();
         found.sort_by(|a, b| a.1.cmp(&b.1));
         assert_eq!(found.len(), 2);
         assert_eq!(found[0].1, None);
