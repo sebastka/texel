@@ -27,6 +27,15 @@ pub struct Intc {
     pub stat: u32,
     /// INTC_MASK: enabled sources; written 1 to toggle.
     pub mask: u32,
+    /// The vertical blanks the bus's clock raised in its last advance: INT0
+    /// waits for them until the EE's next read of INTC_STAT, a few cycles at
+    /// most (`Ps2::run`). Code polling INTC_STAT sees them, as on the
+    /// console, where a load of INTC_STAT under way when the source rises
+    /// returns it, and the interrupt is taken right after (games wait for
+    /// VBON so, interrupts on: the kernel's handler would clear it first).
+    /// Never outlives a slice: not saved.
+    #[serde(skip)]
+    pub fresh: u32,
 }
 
 impl Intc {
@@ -42,9 +51,10 @@ impl Intc {
         self.mask ^= value & 0x7FFF;
     }
 
-    /// INT0, wired to the EE's IP2.
+    /// INT0, wired to the EE's IP2: the sources raised and enabled, but
+    /// those just raised by the clock (`fresh`).
     pub fn line(&self) -> bool {
-        self.stat & self.mask != 0
+        self.stat & !self.fresh & self.mask != 0
     }
 }
 
@@ -64,5 +74,16 @@ mod tests {
         i.write_mask(1 << 2);
         i.write_stat(1 << 2);
         assert!(!i.line());
+    }
+
+    #[test]
+    fn fresh_sources_wait() {
+        let mut i = Intc::default();
+        i.write_mask(1 << 2);
+        i.raise(Interrupt::VblankStart);
+        i.fresh = 1 << 2;
+        assert!(!i.line(), "a vertical blank waits a few cycles");
+        i.fresh = 0;
+        assert!(i.line());
     }
 }

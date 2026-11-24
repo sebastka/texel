@@ -451,3 +451,12 @@ Artwork comes from libretro-thumbnails, by Redump name, but the repository keeps
 - **The game's YAML file**: `thumbnails:` names the images outright, for renames these cannot guess; a game Texel cannot identify then gets its images too.
 
 An image found under none of them is remembered as missing, and tried again after a week, when the DATs change, or when the lookup tries more names (the marker holds the version of the lookup that wrote it).
+
+## D59. A vertical blank's interrupt waits for the next read of INTC_STAT
+
+Some games wait for the vertical blank by polling INTC_STAT for VBON with interrupts enabled and VBON unmasked (Jak and Daxter: The Lost Frontier, Ico). The EE took the interrupt as soon as the bus raised VBON, between slices, and the kernel's handler cleared the bit before the loop could read it: the games waited forever. On the console, a load of INTC_STAT under way when the source rises returns it, and the interrupt is taken right after.
+
+- **Held until read.** A vertical blank (VBON, VBOF) the bus raises waits (`Intc::fresh`, out of INT0) while the EE runs the next slice's first cycles, until the EE's next read of INTC_STAT: the EE stops right after it, as when it is found polling, and the interrupt is taken there. Without such a read, after 32 cycles.
+- **Not longer.** Holding the interrupt for a whole slice, or 32 cycles regardless of reads, broke three games of the library (R-Type Final, DBZ Budokai, Spyro: A Hero's Tail): having seen VBON, they acknowledge it themselves, and their own vertical blank handler then never runs. The timers' interrupts and those of the GS and the VIFs are not held.
+- **Measured.** Over the 18 games of the library, 60 s each: Ico (its 50/60 Hz choice, then its memory card prompt) and The Lost Frontier (its language menu) now start, where they showed nothing; 15 others give the same frames and primitives as before, DBZ Budokai 3% fewer primitives, the same menu.
+- **Save states** keep their format: what is held never outlives a slice.

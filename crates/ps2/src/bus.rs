@@ -228,6 +228,10 @@ impl Bus {
 
     /// Advances the timers and video timing by `cycles` EE cycles.
     pub fn advance(&mut self, cycles: u64) {
+        // What the EE's slice raised (GS, VIFs) goes to INT0 at once; the
+        // vertical blanks raised below wait a few cycles (`Intc::fresh`).
+        self.sync_irqs();
+        let raised = self.intc.stat;
         self.vu1q.now += cycles;
         self.bus_remainder += cycles;
         let bus_cycles = self.bus_remainder / 2;
@@ -236,7 +240,6 @@ impl Bus {
         let hblanks = self.line_pos / LINE_CYCLES;
         self.line_pos %= LINE_CYCLES;
         self.timers.advance(bus_cycles, hblanks, &mut self.intc);
-        self.sync_irqs();
         self.iop_remainder += cycles;
         let iop_cycles = self.iop_remainder / IOP_CLOCK_DIVIDER;
         self.iop_remainder %= IOP_CLOCK_DIVIDER;
@@ -256,6 +259,9 @@ impl Bus {
             self.intc.raise(Interrupt::VblankEnd);
             self.iop.intc.raise(iop::irq::VBLANK_END);
         }
+        // The vertical blanks only: the timers' interrupts come at once.
+        let blanks = 1 << Interrupt::VblankStart as u32 | 1 << Interrupt::VblankEnd as u32;
+        self.intc.fresh = self.intc.stat & !raised & blanks;
     }
 
     fn note_unknown(&mut self, addr: u32) {

@@ -32,6 +32,10 @@ use texel_ps1::cpu::{Cpu, CpuBus};
 /// (and the IOP's turn, in its slower cycles). See D50.
 const SLICE: u64 = 512;
 
+/// EE cycles a vertical blank's interrupt waits at most, the EE running
+/// meanwhile, for a read of INTC_STAT (`Intc::fresh`).
+const INTC_LATENCY: u64 = 32;
+
 /// The machine, as far as it goes.
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct Ps2 {
@@ -272,15 +276,34 @@ impl Ps2 {
         self.bus.iop.fetch(jump) == to_itself && self.bus.iop.fetch(jump.wrapping_add(4)) == 0
     }
 
+    /// The EE, for `cycles` (only time passes in its idle loop).
+    fn run_ee(&mut self, cycles: u64) {
+        if self.ee.idling() {
+            self.ee.skip(cycles);
+        } else {
+            self.ee.run(&mut self.bus, cycles);
+        }
+    }
+
     /// Runs about `cycles` EE cycles.
     pub fn run(&mut self, cycles: u64) {
         let end = self.ee.cycles + cycles;
         while self.ee.cycles < end {
-            if self.ee.idling() {
-                self.ee.skip(SLICE);
-            } else {
-                self.ee.run(&mut self.bus, SLICE);
+            let mut left = SLICE;
+            if self.bus.intc.fresh != 0 {
+                // A vertical blank's interrupt, taken right after the next
+                // read of INTC_STAT (or a few cycles): code polling it sees
+                // the source, then the interrupt is taken, before the code
+                // can do anything else (acknowledge it itself, say).
+                self.ee.intc_watch = true;
+                self.run_ee(INTC_LATENCY);
+                self.ee.intc_watch = false;
+                left -= INTC_LATENCY;
+                self.bus.intc.fresh = 0;
+                let (int0, int1) = (self.bus.intc.line(), self.bus.dmac_line());
+                self.ee.check_interrupts(int0, int1);
             }
+            self.run_ee(left);
             self.iop_budget += (SLICE / iop::IOP_CLOCK_DIVIDER) as i64;
             let mut first = true;
             if let Some(p) = &mut self.iop_printf {
