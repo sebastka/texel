@@ -13,8 +13,9 @@ use crate::intc::{Intc, Interrupt};
 use crate::iop::{self, IOP_CLOCK_DIVIDER, IopBus};
 use crate::sif::FIFO_WORDS;
 use crate::timers::Timers;
-use crate::vif::Vif;
+use crate::vif::{Direct, Vif};
 use crate::vu::Vu;
+use crate::vu1q::Why;
 
 /// The scratchpad channels' interleave sizes: skip (bits 0-7) and
 /// transfer (bits 16-23), in quadwords.
@@ -113,6 +114,9 @@ pub struct Bus {
     pub vif1: Vif,
     pub vu0: Vu,
     pub vu1: Vu,
+    /// VU1's work, queued until something needs what it owns (`vu1q`).
+    #[serde(skip)]
+    pub vu1q: crate::vu1q::Vu1Queue,
     /// CMSAR0: where VCALLMSR starts VU0.
     pub cmsar0: u32,
     /// The IOP's memory and devices, which the EE reaches too: its RAM
@@ -163,6 +167,10 @@ impl Bus {
         self.code_lines = vec![0; RAM_SIZE / CODE_LINE / 64].into_boxed_slice();
         self.iop.transplant(&mut old.iop);
         self.gs.rendering = old.gs.rendering;
+        // VU1 elsewhere: it goes on from the new state.
+        if let Some(b) = old.vu1q.take_backend() {
+            self.vu1q.set_backend(Some(b), &self.vu1, &self.gif);
+        }
     }
 
     pub fn new(bios: &[u8]) -> Self {
@@ -183,6 +191,7 @@ impl Bus {
             vif1: Vif::new(1),
             vu0: Vu::new(0),
             vu1: Vu::new(1),
+            vu1q: Default::default(),
             cmsar0: 0,
             iop: IopBus::new(bios),
             sif0_end: false,
@@ -220,6 +229,7 @@ impl Bus {
 
     /// Advances the timers and video timing by `cycles` EE cycles.
     pub fn advance(&mut self, cycles: u64) {
+        self.vu1q.now += cycles;
         self.bus_remainder += cycles;
         let bus_cycles = self.bus_remainder / 2;
         self.bus_remainder %= 2;
@@ -237,6 +247,7 @@ impl Bus {
         if before < VBLANK_START && self.frame_pos >= VBLANK_START {
             self.intc.raise(Interrupt::VblankStart);
             self.iop.intc.raise(iop::irq::VBLANK_START);
+            self.sync_vu1(Why::VBlank);
             self.gs.vblank();
         }
         if self.frame_pos >= FRAME_CYCLES {
@@ -273,6 +284,9 @@ impl Bus {
 
     pub fn read<const N: usize>(&mut self, pa: u32) -> [u8; N] {
         let pa = pa & !(N as u32 - 1);
+        if (0x1100_8000..0x1101_0000).contains(&pa) {
+            self.sync_vu1(Why::VuMemory);
+        }
         if let Some((mem, at)) = self.memory(pa) {
             let mut out = [0u8; N];
             if let Some(src) = mem.get(at..at + N) {
@@ -300,6 +314,11 @@ impl Bus {
         // The BIOS is read-only.
         if (0x1FC0_0000..0x2000_0000).contains(&pa) {
             return;
+        }
+        if (0x1100_8000..0x1101_0000).contains(&pa) {
+            self.sync_vu1(Why::VuMemory);
+            // VU1 elsewhere: its copy too.
+            self.vu1q.poke(pa - 0x1100_8000, &data);
         }
         // The VUs' micro memory: compiled programs check theirs again.
         if (0x1100_8000..0x1100_C000).contains(&pa) {
@@ -381,6 +400,7 @@ impl Bus {
     fn io_read(&mut self, pa: u32, width: usize) -> u128 {
         match pa {
             0x1200_0000..0x1200_2000 => {
+                self.sync_vu1(Why::Gs);
                 let off = pa - 0x1200_0000;
                 match width {
                     8 | 16 => u128::from(self.gs.read64(off & !7)),
@@ -415,6 +435,7 @@ impl Bus {
     fn io_write(&mut self, pa: u32, width: usize, value: u128) {
         match pa {
             0x1200_0000..0x1200_2000 => {
+                self.sync_vu1(Why::Gs);
                 let off = pa - 0x1200_0000;
                 match width {
                     8 | 16 => self.gs.write64(off & !7, value as u64),
@@ -425,9 +446,19 @@ impl Bus {
             0x1000_4000..0x1000_7000 if width == 16 => {
                 let words: [u32; 4] = std::array::from_fn(|k| (value >> (32 * k)) as u32);
                 match pa & 0xF000 {
-                    0x4000 => self.vif0.write(&words, &mut self.vu0, &mut self.gif, &mut self.gs),
-                    0x5000 => self.vif1.write(&words, &mut self.vu1, &mut self.gif, &mut self.gs),
-                    _ => self.gif.write(2, value, &mut self.gs),
+                    0x4000 => self.vif0.write(
+                        &words,
+                        &mut Direct {
+                            vu: &mut self.vu0,
+                            gif: &mut self.gif,
+                            gs: &mut self.gs,
+                        },
+                    ),
+                    0x5000 => self.vif1.write(&words, &mut self.vu1q),
+                    _ => {
+                        self.sync_vu1(Why::Gif);
+                        self.gif.write(2, value, &mut self.gs);
+                    }
                 }
             }
             0x1000_0000..0x1001_0000 => match width {
@@ -773,9 +804,19 @@ impl Bus {
     /// Where a channel's data goes.
     fn dma_sink(&mut self, ch: u32, words: &[u32], q: u128) {
         match ch {
-            0 => self.vif0.write(words, &mut self.vu0, &mut self.gif, &mut self.gs),
-            1 => self.vif1.write(words, &mut self.vu1, &mut self.gif, &mut self.gs),
-            2 => self.gif.write(2, q, &mut self.gs),
+            0 => self.vif0.write(
+                words,
+                &mut Direct {
+                    vu: &mut self.vu0,
+                    gif: &mut self.gif,
+                    gs: &mut self.gs,
+                },
+            ),
+            1 => self.vif1.write(words, &mut self.vu1q),
+            2 => {
+                self.sync_vu1(Why::Gif);
+                self.gif.write(2, q, &mut self.gs);
+            }
             _ => {
                 // To the scratchpad, at SADR.
                 let sadr_reg = CHANNELS[ch as usize].0 + 0x80;
@@ -784,6 +825,12 @@ impl Bus {
                 self.write128(SCRATCHPAD + (sadr & 0x3FF0), q);
             }
         }
+    }
+
+    /// Runs VU1's queued work (see `vu1q`): before anything reads or
+    /// changes what VU1, the GIF or the GS own.
+    pub fn sync_vu1(&mut self, why: Why) {
+        self.vu1q.run(&mut self.vu1, &mut self.gif, &mut self.gs, why);
     }
 
     /// Interrupts from the GS and the VIFs, to the INTC.

@@ -5,10 +5,69 @@
 //! TOPS).
 //!
 //! Microprograms run to their end when started.
+//!
+//! A VIF reaches its VU through a `VuSink`: VIF0 acts on VU0 at once
+//! (`Direct`), VIF1 queues for VU1 (`vu1q`), which runs when what it owns
+//! is needed. The VIF never reads VU memory: a masked UNPACK writes the
+//! lanes it sets only.
 
 use crate::gif::Gif;
 use crate::gs::Gs;
 use crate::vu::Vu;
+
+/// What a VIF does to its VU, and the GIF (VIF1's DIRECT).
+pub trait VuSink {
+    /// Sets the lanes given (x first) of data quadword `qaddr` (wrapped).
+    fn write_lanes(&mut self, qaddr: u32, lanes: [Option<u32>; 4]);
+    /// Micro memory's word at byte `at` (wrapped).
+    fn write_micro(&mut self, at: u32, word: u32);
+    fn micro_len(&self) -> u32;
+    /// Starts a program at `pc` (None: where the last one stopped), with
+    /// ITOP, and TOP when given (VIF1).
+    fn start(&mut self, pc: Option<u32>, itop: u16, top: Option<u16>);
+    /// A DIRECT quadword, to the GIF's path 2.
+    fn direct(&mut self, q: u128);
+}
+
+/// Acting on a VU at once.
+pub struct Direct<'a> {
+    pub vu: &'a mut Vu,
+    pub gif: &'a mut Gif,
+    pub gs: &'a mut Gs,
+}
+
+impl VuSink for Direct<'_> {
+    fn write_lanes(&mut self, qaddr: u32, lanes: [Option<u32>; 4]) {
+        for (k, v) in lanes.iter().enumerate() {
+            if let Some(v) = v {
+                self.vu.write_lane(qaddr, k, *v);
+            }
+        }
+    }
+
+    fn write_micro(&mut self, at: u32, word: u32) {
+        let at = at as usize % self.vu.micro.len();
+        self.vu.micro[at..at + 4].copy_from_slice(&word.to_le_bytes());
+        self.vu.micro_gen += 1;
+    }
+
+    fn micro_len(&self) -> u32 {
+        self.vu.micro.len() as u32
+    }
+
+    fn start(&mut self, pc: Option<u32>, itop: u16, top: Option<u16>) {
+        self.vu.itop = itop;
+        if let Some(top) = top {
+            self.vu.top = top;
+        }
+        let pc = pc.unwrap_or(self.vu.pc);
+        self.vu.run(pc, self.gif, self.gs);
+    }
+
+    fn direct(&mut self, q: u128) {
+        self.gif.write(1, q, self.gs);
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 enum Pending {
@@ -83,7 +142,7 @@ impl Vif {
     }
 
     /// Feeds words to the VIF.
-    pub fn write(&mut self, words: &[u32], vu: &mut Vu, gif: &mut Gif, gs: &mut Gs) {
+    pub fn write(&mut self, words: &[u32], vu: &mut impl VuSink) {
         let mut i = 0;
         while i < words.len() {
             // UNPACK's data, vectors at a time, from the words themselves.
@@ -94,7 +153,7 @@ impl Vif {
                     continue;
                 }
             }
-            self.word(words[i], vu, gif, gs);
+            self.word(words[i], vu);
             i += 1;
         }
     }
@@ -103,7 +162,7 @@ impl Vif {
     /// vectors `words` hold whole, as `unpack_word` would word by word, and
     /// returns the words used (the rest of the last one kept in `bytes`
     /// for the next vector, or padding after the last vector).
-    fn unpack_words(&mut self, words: &[u32], vu: &mut Vu) -> usize {
+    fn unpack_words(&mut self, words: &[u32], vu: &mut impl VuSink) -> usize {
         let (elements, bits) = self.format();
         // V4-5, rare (and the undefined 4-bit formats): word by word.
         if !matches!(bits, 8 | 16 | 32) {
@@ -126,9 +185,9 @@ impl Vif {
         used
     }
 
-    fn word(&mut self, w: u32, vu: &mut Vu, gif: &mut Gif, gs: &mut Gs) {
+    fn word(&mut self, w: u32, vu: &mut impl VuSink) {
         match self.pending {
-            Pending::None => self.command(w, vu, gif, gs),
+            Pending::None => self.command(w, vu),
             Pending::Mask => {
                 self.mask = w;
                 self.pending = Pending::None;
@@ -150,11 +209,10 @@ impl Vif {
                 };
             }
             Pending::Mpg(left, at) => {
-                let at = at as usize % vu.micro.len();
-                vu.micro[at..at + 4].copy_from_slice(&w.to_le_bytes());
-                vu.micro_gen += 1;
+                let at = at % vu.micro_len();
+                vu.write_micro(at, w);
                 self.pending = if left > 1 {
-                    Pending::Mpg(left - 1, at as u32 + 4)
+                    Pending::Mpg(left - 1, at + 4)
                 } else {
                     Pending::None
                 };
@@ -168,7 +226,7 @@ impl Vif {
                         .enumerate()
                         .fold(0u128, |a, (k, &x)| a | u128::from(x) << (32 * k));
                     self.buffer.clear();
-                    gif.write(1, q, gs);
+                    vu.direct(q);
                 }
                 self.pending = if left > 1 {
                     Pending::Direct(left - 1)
@@ -180,7 +238,7 @@ impl Vif {
         }
     }
 
-    fn command(&mut self, w: u32, vu: &mut Vu, gif: &mut Gif, gs: &mut Gs) {
+    fn command(&mut self, w: u32, vu: &mut impl VuSink) {
         self.code = w;
         let cmd = (w >> 24) & 0x7F;
         let num = (w >> 16) & 0xFF;
@@ -204,8 +262,8 @@ impl Vif {
             0x05 => self.mode = imm & 3,
             0x07 => self.mark = imm,
             // MSCAL, MSCALF; MSCNT.
-            0x14 | 0x15 => self.start(imm, vu, gif, gs),
-            0x17 => self.start(vu.pc, vu, gif, gs),
+            0x14 | 0x15 => self.start(Some(imm), vu),
+            0x17 => self.start(None, vu),
             0x20 => self.pending = Pending::Mask,
             0x30 => self.pending = Pending::Row(4),
             0x31 => self.pending = Pending::Col(4),
@@ -235,16 +293,16 @@ impl Vif {
 
     /// MSCAL/MSCNT: TOP and ITOP for the program, double buffering on VIF1,
     /// then the program runs.
-    fn start(&mut self, pc: u32, vu: &mut Vu, gif: &mut Gif, gs: &mut Gs) {
-        vu.itop = self.itops as u16;
+    fn start(&mut self, pc: Option<u32>, vu: &mut impl VuSink) {
+        let mut top = None;
         if self.index == 1 {
-            vu.top = self.tops as u16;
+            top = Some(self.tops as u16);
             self.dbf = !self.dbf;
             // A 10-bit register: VU1's memory is 1024 quadwords.
             self.tops = (self.base + if self.dbf { self.ofst } else { 0 }) & 0x3FF;
         }
         self.calls += 1;
-        vu.run(pc, gif, gs);
+        vu.start(pc, self.itops as u16, top);
     }
 
     // --- UNPACK ------------------------------------------------------------------
@@ -271,7 +329,7 @@ impl Vif {
         self.wl <= self.cl || self.written % self.wl.max(1) < self.cl
     }
 
-    fn unpack_word(&mut self, w: u32, vu: &mut Vu) {
+    fn unpack_word(&mut self, w: u32, vu: &mut impl VuSink) {
         self.bytes.extend_from_slice(&w.to_le_bytes());
         let (elements, bits) = self.format();
         let vector_bytes = if bits == 5 { 2 } else { (elements * bits / 8) as usize };
@@ -325,7 +383,13 @@ impl Vif {
     }
 
     /// `unpack_words`' vectors, of `BITS`-bit elements: the bytes used.
-    fn unpack_run<const BITS: u32>(&mut self, words: &[u32], elements: u32, signed: bool, vu: &mut Vu) -> usize {
+    fn unpack_run<const BITS: u32>(
+        &mut self,
+        words: &[u32],
+        elements: u32,
+        signed: bool,
+        vu: &mut impl VuSink,
+    ) -> usize {
         let size = (elements * BITS / 8) as usize;
         let get = |at: usize, k: usize| -> u32 {
             match BITS {
@@ -367,7 +431,7 @@ impl Vif {
 
     /// Filling writes: vectors with no input, from the row and column
     /// registers through the mask.
-    fn unpack_fill(&mut self, vu: &mut Vu) {
+    fn unpack_fill(&mut self, vu: &mut impl VuSink) {
         while self.vectors_left() > 0 && !self.needs_data() {
             self.write_vector([None; 4], vu);
         }
@@ -378,7 +442,7 @@ impl Vif {
 
     /// Writes a vector (masked, with the row added or accumulated) at the
     /// next address.
-    fn write_vector(&mut self, data: [Option<u32>; 4], vu: &mut Vu) {
+    fn write_vector(&mut self, data: [Option<u32>; 4], vu: &mut impl VuSink) {
         let wl = self.wl.max(1);
         let cycle = self.written % wl;
         let dest = if self.wl <= self.cl {
@@ -389,11 +453,7 @@ impl Vif {
         let masked = (self.code >> 24) & 0x10 != 0;
         if !masked && self.mode == 0 {
             // The lanes given, as they are.
-            for (k, v) in data.iter().enumerate() {
-                if let Some(v) = v {
-                    vu.write_lane(dest, k, *v);
-                }
-            }
+            vu.write_lanes(dest, data);
             self.written += 1;
             if let Pending::Unpack(n) = self.pending {
                 self.pending = Pending::Unpack(n - 1);
@@ -401,7 +461,7 @@ impl Vif {
             return;
         }
         let row = cycle.min(3);
-        let mut out = vu.read_q(dest);
+        let mut out = [None; 4];
         for k in 0..4 {
             let m = if masked {
                 (self.mask >> (row * 8 + 2 * k as u32)) & 3
@@ -422,11 +482,9 @@ impl Vif {
                 (2, _) => Some(self.col[row as usize]),
                 _ => None,
             };
-            if let Some(v) = value {
-                out[k] = v;
-            }
+            out[k] = value;
         }
-        vu.write_q(dest, out, 0xF);
+        vu.write_lanes(dest, out);
         self.written += 1;
         if let Pending::Unpack(n) = self.pending {
             self.pending = Pending::Unpack(n - 1);
@@ -441,7 +499,14 @@ mod tests {
     fn feed(vif: &mut Vif, vu: &mut Vu, words: &[u32]) {
         let mut gif = Gif::default();
         let mut gs = Gs::default();
-        vif.write(words, vu, &mut gif, &mut gs);
+        vif.write(
+            words,
+            &mut Direct {
+                vu,
+                gif: &mut gif,
+                gs: &mut gs,
+            },
+        );
     }
 
     /// UNPACKs fed in chunks (vectors at a time, `unpack_words`) do what
@@ -462,7 +527,14 @@ mod tests {
             // The stream, made against the word-by-word VIF.
             let mut stream = Vec::new();
             let mut push = |w: u32, vif: &mut Vif, vu: &mut Vu, stream: &mut Vec<u32>| {
-                vif.word(w, vu, &mut gif, &mut gs);
+                vif.word(
+                    w,
+                    &mut Direct {
+                        vu,
+                        gif: &mut gif,
+                        gs: &mut gs,
+                    },
+                );
                 stream.push(w);
             };
             for _ in 0..30 {

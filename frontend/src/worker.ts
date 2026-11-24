@@ -6,6 +6,8 @@ import init, { Emulator } from "./wasm/texel_web.js";
 import type { Ps2Emulator } from "./wasm/texel_web_ps2.js";
 import { RING_FRAMES, Ring } from "./audio";
 import type { FromDrawer, ToDrawer } from "./draw-worker";
+import { OPS_BYTES, Pipe, RECORDS_BYTES, Vu1Link } from "./vu1-pipe";
+import type { ToVu1 } from "./vu1-worker";
 import { Painter } from "./paint";
 import { Session } from "./netplay";
 import { cardUrl } from "./api";
@@ -164,6 +166,22 @@ function gpuFailed(e: unknown): null {
   return null;
 }
 
+/** VU1 in a worker of its own (vu1-worker.ts), where there are cores to
+ * spare: it runs while the EE goes on. Needs SharedArrayBuffer (the page is
+ * cross-origin isolated). */
+function startVu1Worker(ps2emu: Ps2Emulator) {
+  if (!globalThis.crossOriginIsolated || navigator.hardwareConcurrency < 4) return;
+  const ops = Pipe.create(OPS_BYTES);
+  const records = Pipe.create(RECORDS_BYTES);
+  const worker = new Worker(new URL("./vu1-worker.ts", import.meta.url), { type: "module" });
+  worker.postMessage({ ops, records, compiler: compiled } satisfies ToVu1);
+  const link = new Vu1Link(ops, records);
+  ps2emu.setVu1Worker(
+    (batch: Uint8Array) => link.send(batch),
+    () => link.wait(),
+  );
+}
+
 /** Netplay's hidden half, for the GPU's presentation. */
 const HIDDEN_CODES = { top: 1, bottom: 2, left: 3, right: 4 } as const;
 
@@ -187,6 +205,7 @@ async function start(msg: StartMessage) {
     } catch (e) {
       console.warn("The EE's and VUs' compilers are not available, interpreting:", e);
     }
+    startVu1Worker(ps2emu);
     emu = ps2emu as unknown as Emulator;
     gameId = null;
     if (msg.gameId) {

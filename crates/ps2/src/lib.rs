@@ -21,6 +21,7 @@ pub mod spu2;
 pub mod timers;
 pub mod vif;
 pub mod vu;
+pub mod vu1q;
 pub mod vu_jit;
 
 use bus::Bus;
@@ -110,6 +111,13 @@ impl Ps2 {
 
     /// Saves the machine's state (not the BIOS, the disc or the memory
     /// cards), with its GS memory and CLUT.
+    /// Runs VU1's queued work (`vu1q`): before saving a state, which does
+    /// not keep the queue. The machine that saves goes on from there, as a
+    /// machine loading the state does.
+    pub fn settle(&mut self) {
+        self.bus.sync_vu1(crate::vu1q::Why::Save);
+    }
+
     pub fn save_state(&self) -> Vec<u8> {
         Self::pack_state(&self.save_core(), &self.bus.gs.mem.words, self.bus.gs.clut())
     }
