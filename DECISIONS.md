@@ -123,7 +123,7 @@ The DMA interrupt (IRQ3) is raised when DICR's master flag (bit 31) goes from 0 
 
 ## D19. LibCrypt: SBI files, and the CPU's debug registers
 
-LibCrypt (European discs, from 1999) reads, with GetlocP, the subchannel Q data of 32 sectors that were corrupted on purpose when the disc was pressed; a copy reports their positions correctly, and the game refuses to go on (Disney's Tarzan stops at its copyright screen) or misbehaves later. CUE/BIN and CHD images do not keep subchannel data, so Redump publishes it for each protected disc as an SBI file: the disc crate reads it, and the CD-ROM controller answers GetlocP from it for the sectors it lists. SBI files sit next to the image they belong to, named like it; the server serves them with the disc, and verify.py checks their format (Redump's DATs do not list them).
+LibCrypt (European discs, from 1999) reads, with GetlocP, the subchannel Q data of 32 sectors that were corrupted on purpose when the disc was pressed; a copy reports their positions correctly, and the game refuses to go on (Disney's Tarzan stops at its copyright screen) or misbehaves later. CUE/BIN and CHD images do not keep subchannel data, so Redump publishes it for each protected disc as an SBI file: the disc crate reads it, and the CD-ROM controller answers GetlocP from it for the sectors it lists. SBI files sit next to the image they belong to, named like it, or in a shared directory (D53); the server serves them with the disc, and verify.py checks their format (Redump's DATs do not list them).
 
 LibCrypt also keeps its state in the CPU's debug registers (COP0 BPC and BDAM: a pointer to its table of sectors, and the key it builds): they now keep what is written, though their breakpoints are not emulated. They are saved after the rest of save states (format 3; format 2 states load with them at zero).
 
@@ -395,3 +395,11 @@ A library may be spread over several directories (another volume, a second colle
 
 - **Merged as one.** A game's path is relative to its directory (`games/…`, `ps2/games/…`), whichever directory it is in: its id, and so its saves, settings and verification hash, do not depend on where it lies. Games can move from one directory to another, and a directory can be added, without anything to migrate; with one directory, nothing changes.
 - **Duplicates.** A game found at the same relative path in two directories is taken from the first listed, and the scan warns. A BIOS is identified by its content: found twice, it is listed once.
+
+## D53. Shared SBI files, by Redump name
+
+Redump publishes the SBI files of every LibCrypt-protected disc (D19) as one set. A copy next to each protected image works, but the set kept whole in a directory of its own (`TEXEL_PS1_SBI`, several directories as in D52) covers every protected disc at once, and a newer set replaces it as is. The files keep Redump's names (`Disney's Tarzan (Europe).sbi`), so a disc finds its file by its Redump name.
+
+- **Not by serial.** A serial is shared by a disc's revisions and variants, and their SBI files may differ: Spyro - Year of the Dragon (Europe) Rev 0 and Rev 1 are both SCES-02835, with different files, so one of them would get the other's and stop at its protection check. Some protected discs have no serial in libretro's table (betas, a demo, some French, Spanish and Scandinavian releases), and others several, or odd ones (`SCES-02105/P`).
+- **Lookup.** A disc's own file, next to its image, comes first (it may be the only copy, or one the set lacks). Otherwise, a disc whose hashes identify it gets the file of its Redump name, if any. A disc not identified yet (not hashed, or a dump Redump does not list) has only its serial: the file of that serial's discs is used only when they all have the same one (the EDC and non-EDC variants of CTR do), and none otherwise; once hashed, it gets its own.
+- **When.** The directory is indexed with each library scan; the lookup is done when the game's page or the player asks, since a disc's identity changes as it gets hashed.

@@ -45,6 +45,8 @@ pub struct Root {
     pub console: Console,
     pub bios: Vec<PathBuf>,
     pub games: Vec<PathBuf>,
+    /// Shared SBI files (PS1), named after the discs' Redump names.
+    pub sbi: Vec<PathBuf>,
 }
 
 #[derive(Clone, Debug)]
@@ -163,6 +165,10 @@ impl Game {
 pub struct Library {
     pub bios: Vec<Bios>,
     pub games: Vec<Game>,
+    /// The shared SBI files: Redump name (the file name without `.sbi`) →
+    /// file; the first directory's wins. A disc's own, next to its image,
+    /// is `Game::sbi`.
+    pub sbi: std::collections::HashMap<String, PathBuf>,
 }
 
 impl Library {
@@ -209,13 +215,23 @@ fn mtime(meta: &std::fs::Metadata) -> u64 {
 /// path in two directories is taken from the first; a BIOS found twice
 /// (the same content) is listed once.
 pub fn scan(roots: &[Root], index_dir: &Path) -> Library {
-    let mut lib = Library {
-        bios: Vec::new(),
-        games: Vec::new(),
-    };
+    let mut lib = Library::default();
     let mut bios_seen = HashSet::new();
     let mut games_seen: std::collections::HashMap<String, PathBuf> = std::collections::HashMap::new();
     for root in roots {
+        for dir in &root.sbi {
+            // Optional: no directory is no shared SBI file.
+            let Ok(entries) = std::fs::read_dir(dir) else { continue };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("sbi"))
+                    && path.is_file()
+                    && let Some(name) = path.file_stem().and_then(|s| s.to_str())
+                {
+                    lib.sbi.entry(name.to_owned()).or_insert(path);
+                }
+            }
+        }
         for dir in &root.bios {
             for b in scan_bios(root.console, dir) {
                 if bios_seen.insert(b.id.clone()) {
@@ -737,6 +753,7 @@ mod tests {
             console: Console::Ps1,
             bios: Vec::new(),
             games: vec![one.clone(), two.clone()],
+            sbi: Vec::new(),
         };
         let lib = scan(&[root], &base.join("index"));
         let mut found: Vec<(&str, &Path)> = lib
