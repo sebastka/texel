@@ -424,3 +424,9 @@ OpenBIOS (PCSX-Redux's, MIT) lets PS1 games start without a BIOS dumped from a c
 - **Newest, once.** OpenBIOS has no release of its own: every PCSX-Redux build ships it, and builds are published on distrib.app (nightly). The server takes the newest Windows build (a plain zip, where the Linux one is an AppImage, its files in a squashfs), checks it against its manifest's SHA-1, and reads `openbios.bin` out of it (512 KiB, OpenBIOS's mark at 0x78). OpenPS2BIOS comes from its newest GitHub release, checked against GitHub's SHA-256 of the asset and the release's `.sha256` file, its size, and identified as a PS2 BIOS. A `VERSION` file keeps the build or release: one already there is not downloaded again (OpenBIOS itself changes far less often than the builds: build 938's is byte for byte build 585's).
 - **Where it comes from.** Each gets a `SOURCE.md` as the scripts wrote it (build or release, date, commit, SHA-256), so the BIOS's page says so.
 - **Optional.** `TEXEL_FETCH_OPEN_BIOS=false` turns it off; the scripts still work for a library kept by hand.
+
+## D56. The scan reads BIOSes one at a time
+
+A library holding Redump's PS2 BIOS set (hundreds of 4 MiB images, each in a zip of its own) brought the server past its 512 MiB in production, its container killed seconds after each start. The BIOS scan read every file and zip entry of a BIOS's size into memory before identifying any of them. It now reads them one at a time, as it identifies them: on a library with that set, the server's peak went from 817 MB to 94 MB (the DATs and the server alone take 90), and stays at about 130 MB with the verification and the zipped images' indexing running.
+
+The seek index of a zipped image (D51) also kept every resume point's 32 KiB uncompressed until the end, then compressed them all: they are compressed as they are recorded, and written out piece by piece. Indexing a 4.4 GB disc takes 59 MB at most, about its index's size.
