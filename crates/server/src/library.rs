@@ -790,7 +790,8 @@ fn make_game(console: Console, rel: String, cue: Option<String>, layout: Layout,
         layout,
         Files {
             files: &files,
-            cache: Cache::default(),
+            // Reading SYSTEM.CNF: zipped images are not indexed for that.
+            cache: Cache::scanning(),
         },
     );
     match texel_disc::read_system_cnf(&mut disc) {

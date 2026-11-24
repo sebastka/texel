@@ -487,6 +487,15 @@ async fn serve_virtual(state: &AppState, f: crate::library::GameFile, range: Opt
         )
             .into_response();
     };
+    // A zipped image not indexed yet: built here, before taking the shared
+    // lock of the open images (other players' reads go on meanwhile).
+    if let Some(crate::images::Virtual::Zip(entry)) = &f.virt {
+        let (zip, entry) = (f.path.clone(), entry.clone());
+        if let Ok(Err(e)) = tokio::task::spawn_blocking(move || crate::zipimage::ensure_index(&zip, &entry)).await {
+            tracing::warn!(error = %e, "indexing a zipped image failed");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    }
     let images = state.images.clone();
     let len = (end - start + 1) as usize;
     let read = tokio::task::spawn_blocking(move || {

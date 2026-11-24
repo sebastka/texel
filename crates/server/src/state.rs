@@ -29,6 +29,8 @@ pub struct AppState {
     /// Open CHD/PBP containers, for serving their tracks.
     pub images: Arc<std::sync::Mutex<crate::images::Cache>>,
     pub ready: AtomicBool,
+    /// Wakes the builder of zipped images' seek indexes (after a scan).
+    zip_indexes: tokio::sync::Notify,
     /// Netplay rooms, in memory.
     pub rooms: crate::netplay::Rooms,
     /// Sign-in and sessions.
@@ -126,6 +128,7 @@ impl AppState {
             igdb,
             images: Arc::default(),
             ready: AtomicBool::new(false),
+            zip_indexes: tokio::sync::Notify::new(),
             rooms: crate::netplay::Rooms::default(),
             auth,
             scan_lock: Mutex::new(()),
@@ -157,6 +160,7 @@ impl AppState {
                 );
                 *self.library.write().await = Arc::new(lib);
                 self.ready.store(true, Ordering::Relaxed);
+                self.zip_indexes.notify_one();
             }
             Err(e) => tracing::error!(error = %e, "library scan failed"),
         }
@@ -441,6 +445,43 @@ pub fn split_name(name: &str) -> (String, Vec<String>) {
         .map(str::to_owned)
         .collect();
     (name[..title_end].to_owned(), tags)
+}
+
+/// Builds the seek indexes of the zipped images the last scan found without
+/// one, one at a time, after each scan (`AppState::rescan` wakes it). A
+/// player reading an image before its turn builds it then (`zipimage`).
+pub async fn index_zips(state: Arc<AppState>) {
+    loop {
+        state.zip_indexes.notified().await;
+        let lib = state.library.read().await.clone();
+        let mut todo: Vec<(PathBuf, crate::zipimage::ZipEntry)> = lib
+            .games
+            .iter()
+            .flat_map(|g| &g.files)
+            .filter_map(|f| match &f.virt {
+                Some(crate::images::Virtual::Zip(e)) if e.index.as_ref().is_some_and(|i| !i.is_file()) => {
+                    Some((f.path.clone(), e.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        todo.sort_by(|a, b| a.0.cmp(&b.0));
+        todo.dedup_by(|a, b| a.1.index == b.1.index);
+        if todo.is_empty() {
+            continue;
+        }
+        tracing::info!(images = todo.len(), "building zipped images' seek indexes");
+        for (zip, entry) in todo {
+            match tokio::task::spawn_blocking(move || crate::zipimage::ensure_index(&zip, &entry).map_err(|e| (zip, e)))
+                .await
+            {
+                Ok(Ok(_)) => {}
+                Ok(Err((zip, e))) => tracing::warn!(zip = %zip.display(), error = %e, "indexing a zipped image failed"),
+                Err(e) => tracing::warn!(error = %e, "indexing task failed"),
+            }
+        }
+        tracing::info!("zipped images' seek indexes built");
+    }
 }
 
 /// A stable file name for a cache key.

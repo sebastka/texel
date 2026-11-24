@@ -285,9 +285,11 @@ async fn main() -> anyhow::Result<()> {
     let hashes = db.hashes().await.context("loading hashes")?;
     let state = Arc::new(state::AppState::new(config.clone(), db, hashes)?);
     state.load_cached_dats().await;
-    state.rescan().await;
 
+    // Serving at once: the first scan runs in the background (`/readyz`
+    // says so until it is done), and zipped images' seek indexes after it.
     tokio::spawn(background(state.clone()));
+    tokio::spawn(state::index_zips(state.clone()));
 
     let app = api::router(state.clone());
     let listener = tokio::net::TcpListener::bind(config.listen)
@@ -298,8 +300,9 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// DAT refreshes, verification and periodic rescans.
+/// The first scan, DAT refreshes, verification and periodic rescans.
 async fn background(state: Arc<state::AppState>) {
+    state.rescan().await;
     if state.config.fetch_metadata {
         state.refresh_dats(false).await;
     }
