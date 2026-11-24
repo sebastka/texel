@@ -87,7 +87,7 @@ pub async fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
     tokio::fs::rename(&tmp, path).await
 }
 
-fn dat_dir(config: &Config) -> PathBuf {
+pub(crate) fn dat_dir(config: &Config) -> PathBuf {
     config.state.join("cache").join("dats")
 }
 
