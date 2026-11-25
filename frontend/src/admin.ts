@@ -1,8 +1,9 @@
 // Administration: invitations (tokens handed over to friends, who type
-// them when registering), and users (reset tokens, deletion).
+// them when registering), users (reset tokens, deletion), and features
+// still being tried out (the server's settings).
 
 import { avatar } from "./account-menu";
-import { ApiError, api, type InviteRow, type UserRow } from "./api";
+import { ApiError, api, type InviteRow, type Settings, type UserRow } from "./api";
 import { h } from "./dom";
 import type { Shell } from "./main";
 
@@ -44,6 +45,54 @@ export async function renderAdmin(shell: Shell) {
   const invitesBody = h("tbody");
   const usersBody = h("tbody");
   const note = h("input", { placeholder: "Who it is for (a note)", maxLength: 100, "aria-label": "Note" });
+  const features = h("div.admin-features");
+
+  /** A switch per setting, saved as soon as it changes. */
+  const renderFeatures = (settings: Settings) => {
+    const toggle = (key: "netplayRollback" | "netplayDatagrams", title: string, about: string, warning?: string | null) => {
+      const box = h("input.switch", { type: "checkbox", checked: settings[key], "aria-label": title }) as HTMLInputElement;
+      box.onchange = () => {
+        box.disabled = true;
+        void api
+          .saveSettings({ ...settings, [key]: box.checked })
+          .then(renderFeatures, (e: unknown) => {
+            box.checked = settings[key];
+            fail(e);
+          })
+          .finally(() => (box.disabled = false));
+      };
+      return h(
+        "label.admin-feature",
+        {},
+        h(
+          "span.admin-feature-text",
+          {},
+          h("strong", {}, title),
+          h("span.muted.small", {}, about),
+          warning ? h("span.small.error", {}, warning) : null,
+        ),
+        box,
+      );
+    };
+    features.replaceChildren(
+      toggle(
+        "netplayRollback",
+        "Netplay: rollback",
+        "Rooms opened from now on run ahead with the other players' last inputs, and go back a few frames when one " +
+          "turns out otherwise: the input delay is hidden, at the cost of brief corrections and of more work for " +
+          "each player's machine. Off: each frame waits for every player's input (lockstep). Rooms already open keep " +
+          "theirs.",
+      ),
+      toggle(
+        "netplayDatagrams",
+        "Netplay: inputs as datagrams",
+        "Players' inputs also go over WebTransport (UDP), each carrying the last few: a lost packet no longer holds " +
+          "the game back while it is sent again. Needs the server to listen for it (TEXEL_WEBTRANSPORT_LISTEN, with " +
+          "a certificate), and a browser with WebTransport; the others play as before. Players joining from now on.",
+        settings.datagramsListening ? null : "The server does not listen for them: on, this changes nothing.",
+      ),
+    );
+  };
 
   const confirmButton = (label: string, run: () => void) => {
     const b = h(
@@ -119,9 +168,10 @@ export async function renderAdmin(shell: Shell) {
 
   async function refresh() {
     try {
-      const [invites, users] = await Promise.all([api.invites(), api.users()]);
+      const [invites, users, settings] = await Promise.all([api.invites(), api.users(), api.settings()]);
       invitesBody.replaceChildren(...invites.map(inviteRow));
       usersBody.replaceChildren(...users.map(userRow));
+      renderFeatures(settings);
     } catch (e) {
       fail(e);
     }
@@ -169,6 +219,9 @@ export async function renderAdmin(shell: Shell) {
           "Deleting a user deletes their memory cards and save states.",
       ),
       table(["Name", "Signs in with", "Since", "Last seen", ""], usersBody),
+      h("h2", {}, "Features"),
+      h("p.muted", {}, "Features still being tried out: off until turned on here, for everyone."),
+      features,
     ),
   );
   await refresh();

@@ -84,6 +84,32 @@ impl Db {
         sqlx::query("SELECT 1").execute(&self.pool).await.is_ok()
     }
 
+    // --- Settings ---------------------------------------------------------------
+    // The administrators' (see `settings`): a row per setting, its value as JSON.
+
+    /// Every setting: name and value.
+    pub async fn settings(&self) -> anyhow::Result<Vec<(String, String)>> {
+        Ok(sqlx::query_as("SELECT name, value FROM settings")
+            .fetch_all(&self.pool)
+            .await?)
+    }
+
+    /// Sets these settings (the others stay), at once.
+    pub async fn set_settings(&self, rows: &[(String, String)]) -> anyhow::Result<()> {
+        let mut tx = self.pool.begin().await?;
+        for (name, value) in rows {
+            sqlx::query(
+                "INSERT INTO settings (name, value) VALUES (?, ?) ON DUPLICATE KEY UPDATE value = VALUES(value)",
+            )
+            .bind(name)
+            .bind(value)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
     // --- Memory cards ---------------------------------------------------------
     // A user's own cards, named, of one console ("ps1" or "ps2"): inserted in
     // whichever game the user plays.

@@ -68,6 +68,8 @@ export interface RoomSnapshot {
   /** The host handed out the controllers (no automatic second one). */
   assigned: boolean;
   view: SplitView;
+  /** Rollback rather than lockstep (the room's, from the server). */
+  rollback: boolean;
 }
 
 export interface Member {
@@ -94,6 +96,9 @@ export interface NetStatus {
   assigned: boolean;
   /** This member's input delay, in frames. */
   delay: number | null;
+  /** Rollback rooms: frames run ahead on predicted inputs now, and the
+   * frames replayed in the last few seconds (corrections). */
+  rollback: { ahead: number; replayed: number } | null;
   /** Members the game waits for, while stalled. */
   waitingFor: string[];
   /** Set by the host. */
@@ -174,6 +179,6 @@ export type FromWorker =
   | { type: "state-loaded"; slot: number }
   | { type: "net"; status: NetStatus }
   /** A message for the room. */
-  | { type: "net-out"; data: string | Uint8Array }
+  | { type: "net-out"; data: string | Uint8Array; datagram?: boolean }
   | { type: "stopped" }
   | { type: "error"; message: string };

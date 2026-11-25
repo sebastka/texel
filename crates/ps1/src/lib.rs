@@ -14,6 +14,7 @@ mod gte;
 mod irq;
 mod mdec;
 pub mod pad;
+mod rewind;
 mod sio;
 pub mod spu;
 mod timers;
@@ -34,6 +35,7 @@ pub use sio::{MEMCARD_SIZE, MemoryCard, button};
 use bios::fnv1a;
 use bus::{BIOS_SIZE, Bus};
 use cpu::Cpu;
+pub use rewind::Rewind;
 
 /// CPU clock in Hz.
 pub const CPU_CLOCK: u32 = 33_868_800;
@@ -551,7 +553,12 @@ impl System {
         let mut out = Vec::with_capacity(5 << 20);
         out.extend_from_slice(STATE_MAGIC);
         out.extend_from_slice(&STATE_VERSION.to_le_bytes());
-        let snapshot = SnapshotRef {
+        postcard::to_extend(&self.snapshot_ref(), out).expect("serialising to memory cannot fail")
+    }
+
+    /// What a state holds (see `save_state`, and `rewind`'s).
+    fn snapshot_ref(&self) -> SnapshotRef<'_> {
+        SnapshotRef {
             bios_hash: fnv1a(&self.bus.bios),
             cpu: &self.cpu,
             bus: &self.bus,
@@ -561,8 +568,7 @@ impl System {
                 gpu_list: self.bus.gpu_list,
                 spu_capture: self.bus.spu.capture,
             },
-        };
-        postcard::to_extend(&snapshot, out).expect("serialising to memory cannot fail")
+        }
     }
 
     /// Restores a state from [`System::save_state`]. It must come from the

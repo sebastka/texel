@@ -177,6 +177,17 @@ export interface UserRow {
   lastSeenAt: number | null;
 }
 
+/** The administrators' settings (see the server's settings.rs). */
+export interface Settings {
+  /** Netplay rooms opened from now on use rollback rather than lockstep. */
+  netplayRollback: boolean;
+  /** Netplay inputs also go as datagrams (WebTransport), where the server
+   * listens for them. */
+  netplayDatagrams: boolean;
+  /** Read only: the server listens for them. */
+  datagramsListening?: boolean;
+}
+
 export interface InviteRow {
   id: number;
   kind: "invite" | "reset";
@@ -277,6 +288,8 @@ export const api = {
   deleteUser: (id: number) => send("DELETE", `/api/admin/users/${id}`),
   resetUser: (id: number) => send<{ id: number; token: string }>("POST", `/api/admin/users/${id}/reset`),
   invites: () => json<InviteRow[]>("/api/admin/invites"),
+  settings: () => json<Settings>("/api/admin/settings"),
+  saveSettings: (settings: Settings) => send<Settings>("PUT", "/api/admin/settings", settings),
   createInvite: (note: string) => send<{ id: number; token: string }>("POST", "/api/admin/invites", { note }),
   deleteInvite: (id: number) => send("DELETE", `/api/admin/invites/${id}`),
   /** The user's memory cards (of a console), with their saves. */

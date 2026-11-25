@@ -35,6 +35,11 @@ pub struct AppState {
     zip_indexes: tokio::sync::Notify,
     /// Netplay rooms, in memory.
     pub rooms: crate::netplay::Rooms,
+    /// The administrators' settings (see `settings`).
+    pub settings: RwLock<crate::settings::Settings>,
+    /// The UDP port browsers open netplay's datagram sessions at, once the
+    /// endpoint listens (see `webtransport`).
+    pub datagram_port: std::sync::OnceLock<u16>,
     /// Sign-in and sessions.
     pub auth: crate::auth::Auth,
     scan_lock: Mutex<()>,
@@ -174,7 +179,12 @@ pub(crate) fn dat_dir(config: &Config) -> PathBuf {
 }
 
 impl AppState {
-    pub fn new(config: Config, db: crate::db::Db, hashes: HashCache) -> anyhow::Result<Self> {
+    pub fn new(
+        config: Config,
+        db: crate::db::Db,
+        hashes: HashCache,
+        settings: crate::settings::Settings,
+    ) -> anyhow::Result<Self> {
         let http = reqwest::Client::builder()
             .user_agent(concat!("texel/", env!("CARGO_PKG_VERSION")))
             .timeout(Duration::from_secs(300))
@@ -213,6 +223,8 @@ impl AppState {
             ready: AtomicBool::new(false),
             zip_indexes: tokio::sync::Notify::new(),
             rooms: crate::netplay::Rooms::default(),
+            settings: RwLock::new(settings),
+            datagram_port: std::sync::OnceLock::new(),
             auth,
             scan_lock: Mutex::new(()),
         })

@@ -78,7 +78,7 @@ The emulators run entirely in the browser: the server serves the web app, the BI
 
 - **Accounts** (`auth/`): OpenID Connect (the server is the client: authorization code with PKCE) or invitations (Argon2id passwords); the browser holds a session cookie only. Requests that change something must come from Texel's own pages (`Sec-Fetch-Site`, `Origin`) (D44).
 - **Database** (`db.rs`): MariaDB or MySQL: users and sessions, invitations, memory cards (each user's own, per console), save states (with their screenshots), each game's chosen BIOS and cards, and verification hashes. The server creates its tables (D9, D48).
-- **Netplay** (`netplay.rs`): rooms of up to 8 people under a short code, over WebSocket: the server routes the controllers' input and the room's messages; it runs no emulation. Rooms live in its memory: one replica (D16, D46).
+- **Netplay** (`netplay.rs`): rooms of up to 8 people under a short code, over WebSocket: the server routes the controllers' input and the room's messages; it runs no emulation. Rooms live in its memory: one replica (D16, D46). Inputs may also come as datagrams, over WebTransport (`webtransport.rs`, D69); and rooms may use rollback rather than lockstep (D68). Both are administrators' settings (`settings.rs`).
 - **HTTP** (`api.rs`): the JSON API, BIOS and disc downloads (with ranges), and the web app, with the `Cross-Origin-Opener-Policy` and `Cross-Origin-Embedder-Policy` headers that `SharedArrayBuffer` needs (audio, the PS2's VU1 worker).
 
 ## The web app

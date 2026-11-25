@@ -106,6 +106,7 @@ function joinRoom(room: RoomSnapshot) {
     runFrame,
     status: (status) => post({ type: "net", status }),
     send: (data) => scope.postMessage({ type: "net-out", data } satisfies FromWorker, typeof data === "string" ? [] : [data.buffer]),
+    sendDatagram: (data) => scope.postMessage({ type: "net-out", data, datagram: true } satisfies FromWorker, [data.buffer]),
     gzip: (data, decompress = false) => compress(data, "gzip", decompress),
     onStarted: () => draw(),
   });

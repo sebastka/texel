@@ -41,6 +41,37 @@ pub struct MemoryCard {
 }
 
 impl MemoryCard {
+    /// Becomes a copy of `other`, in place (rollback keeps a card per
+    /// frame); whether it was written stays, or becomes so when its data
+    /// changes.
+    pub(crate) fn copy_from(&mut self, other: &MemoryCard) {
+        if self.data[..] != other.data[..] {
+            self.data.copy_from_slice(&other.data);
+            self.dirty = true;
+        }
+        self.flag = other.flag;
+        self.command = other.command;
+        self.step = other.step;
+        self.sector = other.sector;
+        self.checksum = other.checksum;
+        self.last = other.last;
+        self.buffer = other.buffer;
+    }
+
+    pub(crate) fn duplicate(&self) -> MemoryCard {
+        MemoryCard {
+            data: self.data.clone(),
+            flag: self.flag,
+            dirty: self.dirty,
+            command: self.command,
+            step: self.step,
+            sector: self.sector,
+            checksum: self.checksum,
+            last: self.last,
+            buffer: self.buffer,
+        }
+    }
+
     /// A freshly formatted card.
     pub fn formatted() -> Self {
         let mut data = vec![0u8; MEMCARD_SIZE].into_boxed_slice();

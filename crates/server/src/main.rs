@@ -15,8 +15,10 @@ mod netplay;
 mod openbios;
 mod overrides;
 mod pagecache;
+mod settings;
 mod state;
 mod verify;
+mod webtransport;
 mod zipimage;
 
 use std::net::SocketAddr;
@@ -126,6 +128,25 @@ pub struct Config {
     /// Texel's own pages. Without it, the request's Host is used, over http.
     #[arg(long, env = "TEXEL_PUBLIC_URL")]
     pub public_url: Option<String>,
+
+    /// Netplay's datagrams (WebTransport, over HTTP/3): the UDP address to
+    /// listen at, e.g. `[::]:4433`. Needs a certificate and its key for the
+    /// name users reach Texel at; an administrator then turns them on.
+    #[arg(long, env = "TEXEL_WEBTRANSPORT_LISTEN", requires_all = ["webtransport_cert", "webtransport_key"])]
+    pub webtransport_listen: Option<std::net::SocketAddr>,
+
+    /// The certificate chain (PEM), read again when it changes.
+    #[arg(long, env = "TEXEL_WEBTRANSPORT_CERT")]
+    pub webtransport_cert: Option<PathBuf>,
+
+    /// The certificate's private key (PEM).
+    #[arg(long, env = "TEXEL_WEBTRANSPORT_KEY")]
+    pub webtransport_key: Option<PathBuf>,
+
+    /// The UDP port browsers reach it at, when a load balancer maps another
+    /// to the one listened at (e.g. 443).
+    #[arg(long, env = "TEXEL_WEBTRANSPORT_PORT")]
+    pub webtransport_port: Option<u16>,
 
     /// OpenID Connect: the provider's issuer URL (sign-in with it is offered
     /// when set, with the client id).
@@ -274,7 +295,8 @@ async fn main() -> anyhow::Result<()> {
         anyhow::bail!("OpenID Connect needs both TEXEL_OIDC_ISSUER and TEXEL_OIDC_CLIENT_ID");
     }
     let hashes = db.hashes().await.context("loading hashes")?;
-    let state = Arc::new(state::AppState::new(config.clone(), db, hashes)?);
+    let settings = settings::load(&db).await.context("loading the settings")?;
+    let state = Arc::new(state::AppState::new(config.clone(), db, hashes, settings)?);
     state.load_cached_dats().await;
     {
         let s = state.clone();
@@ -286,6 +308,22 @@ async fn main() -> anyhow::Result<()> {
     // says so until it is done), and zipped images' seek indexes after it.
     tokio::spawn(background(state.clone()));
     tokio::spawn(state::index_zips(state.clone()));
+    if let (Some(listen), Some(cert), Some(key)) = (
+        config.webtransport_listen,
+        config.webtransport_cert.clone(),
+        config.webtransport_key.clone(),
+    ) {
+        let setup = webtransport::Setup {
+            listen,
+            cert,
+            key,
+            public_port: config.webtransport_port.unwrap_or(listen.port()),
+        };
+        // Netplay works without: a warning, not a failure.
+        if let Err(e) = webtransport::start(state.clone(), setup).await {
+            tracing::warn!(error = format!("{e:#}"), "netplay's datagrams are off");
+        }
+    }
 
     let app = api::router(state.clone());
     let listener = tokio::net::TcpListener::bind(config.listen)

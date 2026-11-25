@@ -31,6 +31,7 @@ fn physical(addr: u32) -> u32 {
 
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct Bus {
+    #[serde(with = "crate::rewind::big")]
     pub ram: Box<[u8]>,
     /// Not in save states: the system keeps its BIOS.
     #[serde(skip)]
@@ -601,6 +602,53 @@ fn slice() -> u32 {
 
 fn hundred() -> u32 {
     100
+}
+
+/// What a state leaves out of the bus's timing (see `crate::rewind`):
+/// rollback goes back to exactly where the machine was.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct Clock {
+    deadline: u32,
+    slice: u32,
+    overclock_frac: u32,
+    elapsed: u64,
+}
+
+impl Bus {
+    pub(crate) fn clock(&self) -> Clock {
+        Clock {
+            deadline: self.deadline,
+            slice: self.slice,
+            overclock_frac: self.overclock_frac,
+            elapsed: self.elapsed,
+        }
+    }
+
+    pub(crate) fn set_clock(&mut self, c: Clock) {
+        self.deadline = c.deadline;
+        self.slice = c.slice;
+        self.overclock_frac = c.overclock_frac;
+        self.elapsed = c.elapsed;
+    }
+
+    /// Rollback (see `crate::rewind`): this bus, from a light state, takes
+    /// from `old` what states leave out (the BIOS, the disc, the memory
+    /// cards, settings, the renderers' own state) and its large buffers
+    /// (RAM, VRAM, sound RAM: the caller copies their contents), in place:
+    /// compiled code holds RAM's address.
+    pub(crate) fn adopt(&mut self, old: &mut Bus) {
+        self.bios = std::mem::take(&mut old.bios);
+        self.ram = std::mem::take(&mut old.ram);
+        self.ram_writes = std::mem::take(&mut old.ram_writes);
+        self.overclock = old.overclock;
+        self.gpu.adopt(&mut old.gpu);
+        self.spu.adopt(&mut old.spu);
+        self.cdrom.adopt(&mut old.cdrom);
+        self.sio.cards = std::mem::take(&mut old.sio.cards);
+        for (pad, current) in self.sio.pads.iter_mut().zip(&old.sio.pads) {
+            pad.connected = current.connected;
+        }
+    }
 }
 
 /// RAM's pages for `Bus::ram_writes`: 256 bytes.

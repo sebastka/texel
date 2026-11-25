@@ -223,6 +223,18 @@ export function roomBar(a: BarActions): RoomBar {
         {},
         `Playing ${title ?? "a game"}`,
         net.delay !== null ? h("span.muted.small", {}, ` · input delay ${net.delay}`) : null,
+        room.datagrams === "on"
+          ? h("span.muted.small", { title: "Inputs also go as datagrams: a lost packet no longer holds the game back" }, " · datagrams")
+          : room.datagrams === "failed"
+            ? h("span.muted.small", { title: "The datagram session could not open (UDP blocked?): inputs go over the WebSocket only" }, " · no datagrams")
+            : null,
+        net.rollback
+          ? h(
+              "span.muted.small",
+              { title: "Frames run on predicted inputs now, and frames run again over the last two seconds (corrections)" },
+              ` · rollback: ${net.rollback.ahead} ahead, ${net.rollback.replayed} replayed`,
+            )
+          : null,
       );
     }
     const heir = room.heir;

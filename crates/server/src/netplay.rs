@@ -14,6 +14,10 @@
 //! to everyone, the sender included, and handles `load`. Binary messages
 //! start with two bytes, `to` (255: everyone else) and `from`, stamped by
 //! the server.
+//!
+//! Members may also send their inputs as datagrams (`webtransport`): the
+//! server stamps them as binary messages and forwards them to the members
+//! that have a datagram session, the WebSocket carrying everything still.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -53,6 +57,8 @@ const PING_EVERY: Duration = Duration::from_secs(10);
 /// frozen in the back/forward cache, where its socket may stay open).
 const SILENT: Duration = Duration::from_secs(30);
 const EVERYONE: u8 = 255;
+/// The largest datagram forwarded (QUIC's start under any path's MTU).
+const MAX_DATAGRAM: usize = 1200;
 /// The member who opens a room.
 const OPENER: u8 = 0;
 
@@ -82,6 +88,10 @@ struct Room {
     next_id: u8,
     members: BTreeMap<u8, Member>,
     chat: VecDeque<Value>,
+    /// Members run ahead and go back when an input differs (rollback),
+    /// rather than wait for every input: the administrators' setting when
+    /// the room was opened, for its whole life.
+    rollback: bool,
 }
 
 struct Member {
@@ -89,6 +99,31 @@ struct Member {
     /// Signed in: may become the host.
     registered: bool,
     tx: mpsc::Sender<Message>,
+    /// Opens this member's datagram session (see `webtransport`).
+    token: String,
+    datagrams: Option<wtransport::Connection>,
+}
+
+impl Member {
+    fn new(name: String, registered: bool, tx: mpsc::Sender<Message>) -> Self {
+        let mut bytes = [0u8; 16];
+        getrandom::fill(&mut bytes).expect("the OS random number generator");
+        Self {
+            name,
+            registered,
+            tx,
+            token: hex::encode(bytes),
+            datagrams: None,
+        }
+    }
+}
+
+impl Drop for Member {
+    fn drop(&mut self) {
+        if let Some(c) = &self.datagrams {
+            c.close(wtransport::VarInt::from_u32(0), b"left");
+        }
+    }
 }
 
 impl Room {
@@ -132,7 +167,90 @@ impl Room {
     }
 }
 
+/// Where members open their datagram sessions, when they are on.
+async fn datagram_port(state: &AppState) -> Option<u16> {
+    let on = state.settings.read().await.netplay_datagrams;
+    state.datagram_port.get().copied().filter(|_| on)
+}
+
 impl Rooms {
+    /// A room of `members` without connections (tests): their tokens.
+    #[cfg(test)]
+    pub fn test_room(&self, code: &str, members: u8) -> Vec<String> {
+        let members: BTreeMap<u8, Member> = (0..members)
+            .map(|id| (id, Member::new(format!("P{id}"), true, mpsc::channel(QUEUE).0)))
+            .collect();
+        let tokens = members.values().map(|m| m.token.clone()).collect();
+        let room = Room {
+            playing: None,
+            host: OPENER,
+            epoch: 0,
+            next_id: members.len() as u8,
+            members,
+            chat: VecDeque::new(),
+            rollback: false,
+        };
+        self.lock().insert(code.to_owned(), room);
+        tokens
+    }
+
+    /// The room and member a datagram session's token is for.
+    pub fn member_by_token(&self, token: &str) -> Option<(String, u8)> {
+        self.lock().iter().find_map(|(code, room)| {
+            room.members
+                .iter()
+                .find(|(_, m)| m.token == token)
+                .map(|(id, _)| (code.clone(), *id))
+        })
+    }
+
+    /// A member's datagram session opened (replacing one before): false
+    /// when the member is gone.
+    pub fn attach_datagrams(&self, code: &str, id: u8, connection: wtransport::Connection) -> bool {
+        let mut rooms = self.lock();
+        let Some(member) = rooms.get_mut(code).and_then(|r| r.members.get_mut(&id)) else {
+            return false;
+        };
+        if let Some(old) = member.datagrams.replace(connection) {
+            old.close(wtransport::VarInt::from_u32(0), b"replaced");
+        }
+        true
+    }
+
+    /// A member's datagram session closed (unless another replaced it).
+    pub fn detach_datagrams(&self, code: &str, id: u8, stable_id: usize) {
+        let mut rooms = self.lock();
+        if let Some(member) = rooms.get_mut(code).and_then(|r| r.members.get_mut(&id))
+            && member.datagrams.as_ref().is_some_and(|c| c.stable_id() == stable_id)
+        {
+            member.datagrams = None;
+        }
+    }
+
+    /// Forwards a member's datagram (a binary message to everyone else,
+    /// stamped as such) to the members with a datagram session. False when
+    /// the member is gone.
+    pub fn forward_datagram(&self, code: &str, from: u8, payload: &[u8]) -> bool {
+        let rooms = self.lock();
+        let Some(room) = rooms.get(code).filter(|r| r.members.contains_key(&from)) else {
+            return false;
+        };
+        if payload.len() < 3 || payload.len() > MAX_DATAGRAM || payload[0] != EVERYONE {
+            return true;
+        }
+        let mut data = payload.to_vec();
+        data[1] = from;
+        for (id, m) in &room.members {
+            if *id != from
+                && let Some(c) = &m.datagrams
+            {
+                // Lost like any datagram when it cannot go.
+                let _ = c.send_datagram(&data);
+            }
+        }
+        true
+    }
+
     /// Whether room `code` is open and plays this game (or uses this
     /// BIOS): what its code lets a player without an account read.
     pub fn grants(&self, code: &str, game: Option<&str>, bios: Option<&str>) -> bool {
@@ -204,6 +322,8 @@ pub async fn host(
     if state.rooms.lock().len() >= MAX_ROOMS {
         return (StatusCode::SERVICE_UNAVAILABLE, "too many rooms").into_response();
     }
+    let rollback = state.settings.read().await.netplay_rollback;
+    let datagrams = datagram_port(&state).await;
     ws.max_message_size(MAX_MESSAGE).on_upgrade(move |socket| async move {
         let (tx, rx) = mpsc::channel(QUEUE);
         let code = {
@@ -212,14 +332,7 @@ pub async fn host(
                 .find(|c| !rooms.contains_key(c))
                 .expect("an endless iterator");
             let mut members = BTreeMap::new();
-            members.insert(
-                OPENER,
-                Member {
-                    name: clean_name(&user.name),
-                    registered: true,
-                    tx,
-                },
-            );
+            members.insert(OPENER, Member::new(clean_name(&user.name), true, tx));
             let room = Room {
                 playing: None,
                 host: OPENER,
@@ -227,8 +340,9 @@ pub async fn host(
                 next_id: 1,
                 members,
                 chat: VecDeque::new(),
+                rollback,
             };
-            let _ = room.send(OPENER, text(&welcome(&code, OPENER, &room)));
+            let _ = room.send(OPENER, text(&welcome(&code, OPENER, &room, datagrams)));
             rooms.insert(code.clone(), room);
             code
         };
@@ -237,7 +351,12 @@ pub async fn host(
     })
 }
 
-fn welcome(code: &str, you: u8, room: &Room) -> Value {
+/// The room as it is, for a member arriving; with where to open its
+/// datagram session (`datagrams`: the port, when they are on).
+fn welcome(code: &str, you: u8, room: &Room, datagrams: Option<u16>) -> Value {
+    let datagrams = datagrams
+        .zip(room.members.get(&you))
+        .map(|(port, m)| json!({ "port": port, "path": format!("{}?token={}", crate::webtransport::PATH, m.token) }));
     json!({
         "type": "welcome",
         "code": code,
@@ -249,6 +368,8 @@ fn welcome(code: &str, you: u8, room: &Room) -> Value {
         "epoch": room.epoch,
         "members": room.roster(),
         "chat": room.chat,
+        "rollback": room.rollback,
+        "datagrams": datagrams,
     })
 }
 
@@ -306,6 +427,7 @@ pub async fn join(
         }
         Some(_) => {}
     }
+    let datagrams = datagram_port(&state).await;
     ws.max_message_size(MAX_MESSAGE).on_upgrade(move |socket| async move {
         let (tx, rx) = mpsc::channel(QUEUE);
         let name = clean_name(viewer.user.as_ref().map_or(&q.name, |u| &u.name));
@@ -318,15 +440,8 @@ pub async fn join(
             }
             let id = room.next_id;
             room.next_id += 1;
-            room.members.insert(
-                id,
-                Member {
-                    name: name.clone(),
-                    registered,
-                    tx,
-                },
-            );
-            let _ = room.send(id, text(&welcome(&code, id, room)));
+            room.members.insert(id, Member::new(name.clone(), registered, tx));
+            let _ = room.send(id, text(&welcome(&code, id, room, datagrams)));
             let joined = json!({ "type": "joined", "id": id, "name": name, "registered": registered });
             room.broadcast(Some(id), &text(&joined));
             id
@@ -551,11 +666,7 @@ mod tests {
 
     #[test]
     fn successors_have_accounts() {
-        let member = |registered| Member {
-            name: String::new(),
-            registered,
-            tx: mpsc::channel(1).0,
-        };
+        let member = |registered| Member::new(String::new(), registered, mpsc::channel(1).0);
         let mut room = Room {
             playing: None,
             host: OPENER,
@@ -563,6 +674,7 @@ mod tests {
             next_id: 4,
             members: BTreeMap::from([(OPENER, member(true)), (1, member(false)), (3, member(true))]),
             chat: VecDeque::new(),
+            rollback: false,
         };
         assert_eq!(room.successor(), Some(3));
         room.members.remove(&3);

@@ -118,6 +118,9 @@ Environment variables (or the server's options of the same names: `texel --help`
 | `TEXEL_WEB` | `/usr/share/texel/web` | The built web app |
 | `TEXEL_LISTEN` | `0.0.0.0:8080` | Listen address |
 | `TEXEL_PUBLIC_URL` | | The address users reach Texel at (`https://texel.example.com`): OpenID Connect's redirect, secure cookies, the same-origin check. Without it, the request's host, over http |
+| `TEXEL_WEBTRANSPORT_LISTEN` | | Netplay's datagrams (WebTransport, HTTP/3): the UDP address to listen at, e.g. `[::]:4433`. Needs the next two; an administrator then turns them on |
+| `TEXEL_WEBTRANSPORT_CERT`, `TEXEL_WEBTRANSPORT_KEY` | | A certificate (chain) and its key, PEM, for the name users reach Texel at (as the HTTPS one: e.g. cert-manager's); read again when they change |
+| `TEXEL_WEBTRANSPORT_PORT` | the one listened at | The UDP port browsers reach it at, when a load balancer maps another (e.g. 443) |
 | `TEXEL_FETCH_METADATA` | `true` | Fetch DATs, artwork, game details, and DuckStation's cheat and patch database |
 | `TEXEL_FETCH_OPEN_BIOS` | `true` | Download the open-source BIOSes (OpenBIOS, OpenPS2BIOS) when a newer one is published (checked at start) |
 | `TEXEL_VERIFY` | `true` | Hash games in the background to verify them against Redump |
@@ -153,6 +156,8 @@ A game's page has its Play button, with the memory cards to use (the game's last
 - **The player's toolbar** has save states (4 slots per disc, with screenshots), disc changes, Analog, Resolution (1× to 4×), Precise geometry, Widescreen, Smooth, Fast-forward and Fullscreen; and Codes, for a PlayStation game with cheats or patches: each opt-in, off whenever a game starts or the disc changes (a room plays with its host's).
 
 **Playing together**: Play together, in the header, opens a room; friends join with its code (Join) or its link, signed in or not (then the room's code only lets them load its game). The game the host starts is the room's: everyone's browser runs it in step. Two people play, on the console's two controllers, handed out by the host (several people on one controller share it); the others watch. The host may hide each player's half of the screen from the other. While others are in the room, resets, save states and disc changes are off. When the host leaves, the first member with an account takes over.
+
+Two netplay features are being tried out, off until an administrator turns them on (Admin, Features): **rollback**, which hides the input delay (each player runs ahead on the others' last inputs and goes back a few frames when one differs), and **inputs as datagrams** (WebTransport over UDP, set up with `TEXEL_WEBTRANSPORT_*`), so that a lost packet no longer holds the game back.
 
 ## Documentation
 

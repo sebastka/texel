@@ -158,6 +158,26 @@ impl Cheats {
         self.codes.is_empty()
     }
 
+    /// What running the codes changes (their registers, the frames each
+    /// ran), for rollback to go back to (see `crate::rewind`).
+    pub(crate) fn save(&self, out: &mut Vec<u32>) {
+        out.clear();
+        out.extend_from_slice(&self.regs);
+        out.extend(self.codes.iter().map(|c| c.frames));
+    }
+
+    /// Back to what `save` kept, with the same codes.
+    pub(crate) fn restore(&mut self, saved: &[u32]) {
+        if saved.len() != self.regs.len() + self.codes.len() {
+            return;
+        }
+        let (regs, frames) = saved.split_at(self.regs.len());
+        self.regs.copy_from_slice(regs);
+        for (code, &f) in self.codes.iter_mut().zip(frames) {
+            code.frames = f;
+        }
+    }
+
     /// Runs the codes with this activation.
     pub fn run(&mut self, activation: Activation, bus: &mut Bus, pad: Pad) {
         for code in &mut self.codes {
