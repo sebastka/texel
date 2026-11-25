@@ -460,6 +460,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ipu.busy(),
         ipu.output.len()
     );
+    for (code, opt, started, failed, next) in &ipu.error_log {
+        println!(
+            "  IPU error: command {code:X} options {opt:08X}, from bit {started} to {failed} (+{}), then {next:08X}",
+            failed.saturating_sub(*started)
+        );
+    }
+    if let Some((ctrl, words)) = &ipu.error_input {
+        println!("  IPU first non-intra BDEC error: IPU_CTRL {ctrl:08X}, input:");
+        for q in words {
+            println!("    {q:032X}");
+        }
+    }
     let mut gs_regs: BTreeMap<u32, u64> = BTreeMap::new();
     for &(off, v) in &ps2.bus.gs.privileged.writes {
         gs_regs.insert(off, v);

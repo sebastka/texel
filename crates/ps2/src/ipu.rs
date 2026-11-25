@@ -678,6 +678,15 @@ pub struct Ipu {
     pub commands: [u64; 16],
     #[serde(skip)]
     pub errors: u64,
+    /// Diagnostics: the first errors: the command (its code and
+    /// options), the bit it started at, the bit it failed at, and the 32
+    /// bits from there (0 when not there).
+    #[serde(skip)]
+    pub error_log: Vec<(u32, u32, u64, u64, u32)>,
+    /// Diagnostics: the first error's IPU_CTRL and input (the quadwords
+    /// from the one its command started in).
+    #[serde(skip)]
+    pub error_input: Option<(u32, Vec<u128>)>,
 }
 
 impl Default for Ipu {
@@ -700,6 +709,8 @@ impl Default for Ipu {
             irq: false,
             commands: [0; 16],
             errors: 0,
+            error_log: Vec::new(),
+            error_input: None,
         }
     }
 }
@@ -744,6 +755,8 @@ impl Ipu {
                 dec,
                 commands: self.commands,
                 errors: self.errors,
+                error_log: std::mem::take(&mut self.error_log),
+                error_input: self.error_input.take(),
                 ..Self::default()
             };
             return;
@@ -839,6 +852,7 @@ impl Ipu {
             pull,
         };
         let mut reach = 0;
+        let started = b.pos;
         let done = execute(
             &mut self.dec,
             &mut b,
@@ -847,6 +861,15 @@ impl Ipu {
             &mut self.data,
             &mut reach,
         );
+        if done && self.dec.ctrl & CTRL_ECD != 0 && self.error_log.len() < 32 {
+            let failed = b.pos;
+            let next = b.peek(32).unwrap_or(0);
+            self.error_log.push((job.code, job.opt, started, failed, next));
+            if self.error_input.is_none() && job.code == 2 && job.opt & (1 << 27) == 0 {
+                let words = b.input.iter().copied().take(12).collect();
+                self.error_input = Some((self.dec.ctrl, words));
+            }
+        }
         self.pos = b.pos;
         self.reach = reach;
         // What is behind the bit pointer is gone.
@@ -1274,6 +1297,42 @@ fn convert(dec: &mut Decoder, b: &mut Bits, job: &mut Job, out: &mut Vec<u8>) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every code of a list of tables' (TEXEL_VLC: lines of "dct T BITS
+    /// RUN LEVEL", "dct T BITS esc|eob 0" or "cbp 0 BITS VALUE 0", from
+    /// another copy of the standard's tables) decodes as the list says.
+    #[test]
+    #[ignore = "needs TEXEL_VLC, a list of codes"]
+    fn codes_match_another_copy_of_the_tables() {
+        let path = std::env::var("TEXEL_VLC").expect("TEXEL_VLC");
+        let mut wrong = Vec::new();
+        for line in std::fs::read_to_string(path).unwrap().lines() {
+            let f: Vec<&str> = line.split_whitespace().collect();
+            let bits = f[2];
+            let mut bytes = [0u8; 16];
+            for (k, c) in bits.chars().enumerate() {
+                if c == '1' {
+                    bytes[k / 8] |= 0x80 >> (k % 8);
+                }
+            }
+            let mut input = VecDeque::from([u128::from_le_bytes(bytes), 0]);
+            let mut pull = || None;
+            let mut b = Bits { input: &mut input, pos: 0, pull: &mut pull };
+            let t = tables();
+            let vlc = if f[0] == "dct" { &t.dct[f[1].parse::<usize>().unwrap()] } else { &t.cbp };
+            let want = match (f[0], f[3]) {
+                ("dct", "esc") => ESCAPE,
+                ("dct", "eob") => EOB,
+                ("dct", run) => rl(run.parse().unwrap(), f[4].parse().unwrap()),
+                (_, v) => v.parse().unwrap(),
+            };
+            let got = vlc.read(&mut b).ok().flatten();
+            if got != Some((want, bits.len() as u32)) {
+                wrong.push(format!("{line}: got {got:?}"));
+            }
+        }
+        assert!(wrong.is_empty(), "{} codes differ:\n{}", wrong.len(), wrong.join("\n"));
+    }
 
     /// The code tables are prefix-free (`Vlc::new` checks), and complete
     /// where the standard's are.
