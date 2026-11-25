@@ -2,7 +2,7 @@ import "./style.css";
 import { renderAccount, renderRegister, renderSignIn } from "./account";
 import { accountMenu } from "./account-menu";
 import { renderAdmin } from "./admin";
-import { api, gameRegion, image, type Bios, type Console, type Game, type GameDetail, type GameListItem, type SaveState, type User } from "./api";
+import { api, gameRegion, image, type Bios, type Console, type Firmware, type Game, type GameDetail, type GameListItem, type SaveState, type User } from "./api";
 import { renderCards } from "./cards";
 import {
   REDUMP_EXPLAINED,
@@ -44,6 +44,8 @@ const BIOS_KEY = "texel.bios";
 let biosList: Bios[] = [];
 /** PlayStation 2 BIOSes: listed, not used yet. */
 let ps2BiosList: Bios[] = [];
+/** PS2 firmware other than BIOSes (DVD player, arcade, MechaCon). */
+let firmwareList: Firmware[] = [];
 let games: GameListItem[] = [];
 /** The signed-in user: null shows the sign-in page (but to join a room). */
 let me: User | null = null;
@@ -386,6 +388,70 @@ function biosBadge(b: Bios) {
   }
   if (b.verified === false) return h("span.badge.warn", { title: "Not in Redump's BIOS DAT: modified or bad dump" }, "Unknown dump");
   return h("span.badge.muted", { title: "Redump's BIOS DAT is not downloaded yet" }, "Unchecked");
+}
+
+const FIRMWARE_KINDS: Record<Firmware["kind"], { title: string; name: string; note: string }> = {
+  dvd: {
+    title: "DVD player",
+    name: "DVD Player",
+    note: "The console's DVD video player (its rom1). Listed only: Texel does not play DVD video.",
+  },
+  arcade: {
+    title: "Arcade boards",
+    name: "Arcade BIOS",
+    note: "The BIOS of a PS2-based arcade board. Listed only: arcade games are not emulated.",
+  },
+  mechacon: {
+    title: "MechaCon",
+    name: "MechaCon",
+    note: "The firmware of the disc drive's controller in slim consoles. Listed only: Texel answers the drive's commands itself.",
+  },
+};
+
+function firmwareBadge(f: Firmware) {
+  if (f.verified === true) return h("span.badge.good", { title: "Matches a dump in Redump's BIOS DAT" }, "Verified");
+  if (f.verified === null) return h("span.badge.muted", { title: "Redump's BIOS DAT is not downloaded yet" }, "Unchecked");
+  return h("span.badge.warn", { title: "Not in Redump's BIOS DAT: modified or bad dump" }, "Unknown dump");
+}
+
+/** The PS2 tab's table of firmware other than BIOSes, by kind. */
+function firmwareTable(list: Firmware[]) {
+  const kinds = ["dvd", "arcade", "mechacon"] as const;
+  const sorted = [...list].sort(
+    (a, b) => kinds.indexOf(a.kind) - kinds.indexOf(b.kind) || (a.date ?? "").localeCompare(b.date ?? "") || a.file.localeCompare(b.file),
+  );
+  const rows = sorted.flatMap((f, i) => {
+    const kind = FIRMWARE_KINDS[f.kind];
+    const heading = i === 0 || sorted[i - 1]!.kind !== f.kind ? [h("tr.group-row", {}, h("th", { colSpan: 5 }, kind.title))] : [];
+    return [
+      ...heading,
+      h(
+        "tr",
+        {},
+        h("td.bios-cell", {}, h("div.bios-name", {}, f.model ?? `${kind.name} ${f.version}`), h("div.muted.small", {}, f.file)),
+        h("td.nowrap.fact-cell", { "data-label": "Version" }, f.version),
+        h("td.nowrap.fact-cell", { "data-label": "Date" }, formatDate(f.date) ?? "—"),
+        h("td.nowrap.fact-cell", {}, firmwareBadge(f)),
+        h(
+          "td.relevance.desc-cell",
+          {},
+          h("div.small", {}, kind.note),
+          h("div.sha", { title: `SHA-1 ${f.sha1} (click to copy)`, onclick: () => void navigator.clipboard?.writeText(f.sha1) }, `SHA-1 ${f.sha1.slice(0, 12)}…`),
+        ),
+      ),
+    ];
+  });
+  return h(
+    "section",
+    {},
+    h("div.page-head", {}, h("h2", {}, "Other firmware"), h("span.count", {}, `${list.length} image${list.length === 1 ? "" : "s"}`)),
+    h(
+      "table.bios-list",
+      {},
+      h("thead", {}, h("tr", {}, h("th", {}, "Firmware"), h("th", {}, "Version"), h("th", {}, "Date"), h("th", {}, "Dump"), h("th", {}, "Notes"))),
+      h("tbody", {}, ...rows),
+    ),
+  );
 }
 
 function cover(g: Game, kind: "boxart" | "title" | "snap" = "boxart", cls = "cover") {
@@ -1173,6 +1239,7 @@ function renderBios(platform: Console = shownConsole) {
             h("tbody", {}, ...rows),
           )
         : h("p.error", {}, page.empty),
+      platform === "ps2" && firmwareList.length ? firmwareTable(firmwareList) : null,
     ),
   );
 }
@@ -1699,11 +1766,11 @@ async function load() {
   me = await api.me();
   if (!me) {
     // Only signed-in users see the library.
-    [biosList, ps2BiosList, games] = [[], [], []];
+    [biosList, ps2BiosList, games, firmwareList] = [[], [], [], []];
     return;
   }
   let all: Bios[];
-  [all, games] = await Promise.all([api.bios(), api.games()]);
+  [all, games, firmwareList] = await Promise.all([api.bios(), api.games(), api.firmware()]);
   biosList = all.filter((b) => b.console === "ps1");
   ps2BiosList = all.filter((b) => b.console === "ps2");
 }
