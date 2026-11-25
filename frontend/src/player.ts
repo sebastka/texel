@@ -5,6 +5,7 @@ import { createRing } from "./audio";
 import workletUrl from "./audio-worklet.ts?worker&url";
 import { Input } from "./input";
 import type { CodeSet, FromWorker, NetStatus, Ports, RoomSnapshot, Slots, SplitView, StartMessage, ToWorker } from "./protocol";
+import { keepScreenOn } from "./wake";
 
 interface Callbacks {
   onStatus: (s: string) => void;
@@ -173,6 +174,8 @@ export class Player {
       this.send({ type: "viewport", width, height });
     });
     this.resize.observe(canvas);
+    // The screen stays on while the game runs.
+    keepScreenOn(!this.paused);
     let ring: SharedArrayBuffer | null = null;
     if (crossOriginIsolated) {
       try {
@@ -355,6 +358,7 @@ export class Player {
     this.send({ type: "pause", paused: this.paused });
     if (this.paused) void this.audio?.suspend();
     else void this.audio?.resume();
+    keepScreenOn(!this.paused);
     this.cb.onPause(this.paused);
     this.cb.onStatus(this.paused ? "Paused" : "Running");
   }
@@ -434,6 +438,7 @@ export class Player {
     this.rumble.forEach((_, port) => this.input.rumble(port, 0, 0));
     this.resize?.disconnect();
     this.input.dispose();
+    keepScreenOn(false);
     document.removeEventListener("visibilitychange", this.onVisibility);
     void this.audio?.close();
     const end = () => this.worker.terminate();
