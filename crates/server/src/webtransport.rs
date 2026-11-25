@@ -114,22 +114,42 @@ fn token(path: &str) -> Option<&str> {
 /// A member's session: forwards its datagrams to its room until either
 /// goes away.
 async fn session(state: Arc<AppState>, incoming: IncomingSession) {
-    let Ok(request) = incoming.await else { return };
+    let request = match incoming.await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::info!(error = %e, "datagram session failed before its request");
+            return;
+        }
+    };
     let on = state.settings.read().await.netplay_datagrams;
     serve(&state.rooms, on, request).await;
 }
 
 /// Serves a session request (`on`: datagrams are turned on).
 async fn serve(rooms: &Rooms, on: bool, request: SessionRequest) {
+    let from = request.remote_address();
     let Some(token) = token(request.path()).map(str::to_owned) else {
+        tracing::info!(%from, path = request.path(), "datagram session refused: not ours");
         request.not_found().await;
         return;
     };
-    let Some((code, id)) = rooms.member_by_token(&token).filter(|_| on) else {
+    if !on {
+        tracing::info!(%from, "datagram session refused: datagrams are off (Admin, Features)");
+        request.forbidden().await;
+        return;
+    }
+    let Some((code, id)) = rooms.member_by_token(&token) else {
+        tracing::info!(%from, "datagram session refused: no member has this token (left the room?)");
         request.forbidden().await;
         return;
     };
-    let Ok(connection) = request.accept().await else { return };
+    let connection = match request.accept().await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::info!(%from, error = %e, "datagram session failed while accepting it");
+            return;
+        }
+    };
     if !rooms.attach_datagrams(&code, id, connection.clone()) {
         return;
     }
