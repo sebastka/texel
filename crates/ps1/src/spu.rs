@@ -447,6 +447,18 @@ impl Spu {
     }
 
     /// Advances by `cycles`; returns whether the SPU interrupt fires.
+    /// The CPU cycles until the SPU may raise its interrupt (raised, or
+    /// enabled: at the next sample), if it can.
+    pub fn next_event(&self) -> Option<u32> {
+        if self.pending_irq {
+            Some(1)
+        } else if self.control & 0x40 != 0 && !self.irq_flag {
+            Some(CYCLES_PER_SAMPLE - self.frac)
+        } else {
+            None
+        }
+    }
+
     pub fn tick(&mut self, cycles: u32) -> bool {
         self.frac += cycles;
         while self.frac >= CYCLES_PER_SAMPLE {

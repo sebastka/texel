@@ -324,6 +324,16 @@ impl Sio {
         }
     }
 
+    /// The CPU cycles until a transfer or its acknowledge ends, if one is
+    /// under way.
+    pub fn next_event(&self) -> Option<u32> {
+        match (self.transfer, self.ack) {
+            (Some((left, ..)), _) => Some(left.max(1)),
+            (None, Some(left)) => Some(left.max(1)),
+            (None, None) => None,
+        }
+    }
+
     pub fn tick(&mut self, cycles: u32, irq: &mut Irq) {
         if let Some((left, resp, ack)) = self.transfer {
             if left > cycles {

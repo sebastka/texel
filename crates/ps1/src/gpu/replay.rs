@@ -3,10 +3,12 @@
 //! another worker: another core). Its VRAMs: the scaled one it draws, and
 //! the native one textures are read from, as the recorder sends it.
 //!
-//! Precise triangles (`Command::Precise`) are for the GPU renderer: record
-//! without precise geometry for this one.
+//! Precise triangles (`Command::Precise`) are drawn as the GPU renderer
+//! draws them (`Raster::exact_triangle`).
 
-use super::{Command, Display, Prim, Raster, Spans, Transfer, VRAM_HEIGHT, VRAM_WIDTH, Vertex, display_rgba};
+use super::{
+    Command, Display, Picture, Prim, Raster, Spans, Transfer, VRAM_HEIGHT, VRAM_WIDTH, Vertex, display_15, display_rgba,
+};
 
 pub struct Replay {
     scale: usize,
@@ -92,8 +94,10 @@ impl Replay {
                     let mut r = self.raster(pixel.check_mask, pixel.set_mask, *area);
                     r.line_scaled(*a, *b, pixel.shaded, &pixel.prim);
                 }
-                // For the GPU renderer.
-                Command::Precise { .. } => {}
+                Command::Precise { pixel, vertices, bbox } => {
+                    let mut r = self.raster(pixel.check_mask, pixel.set_mask, *bbox);
+                    r.exact_triangle(vertices, *bbox, pixel.textured, pixel.shaded, &pixel.prim);
+                }
                 Command::Fill { x, y, w, h, color } => {
                     for row in 0..*h {
                         let ny = ((y + row) & 0x1ff) as usize;
@@ -139,6 +143,12 @@ impl Replay {
     /// The displayed picture, RGBA8888, into `out`: its size.
     pub fn render_display(&self, d: Display, out: &mut Vec<u8>) -> (usize, usize) {
         display_rgba(d, self.scale, &self.hires, &self.native, out)
+    }
+
+    /// The displayed picture as the scaled VRAM holds it (see
+    /// `display_15`; `None`: `render_display`).
+    pub fn picture<'a>(&'a self, d: Display, wrapped: &'a mut Vec<u16>) -> Option<Picture<'a>> {
+        display_15(d, self.scale, &self.hires, wrapped)
     }
 
     fn raster(&mut self, check_mask: bool, set_mask: bool, area: [i32; 4]) -> Raster<'_> {

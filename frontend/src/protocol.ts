@@ -20,6 +20,30 @@ export interface StartMessage {
   scale: number;
   /** Netplay: the room whose game this is, to run in step with it. */
   room: RoomSnapshot | null;
+  /** Cheat and patch codes, from the start. */
+  codes: CodeSet | null;
+}
+
+/** A code enabled (see the core's `cheats`): its lines with its `?` digits
+ * filled. */
+export interface EnabledCode {
+  name: string;
+  body: string;
+  activation: string;
+}
+
+/** The cheat and patch codes a game runs with, and what they need of the
+ * emulator (the largest any asks). A netplay room shares its host's. */
+export interface CodeSet {
+  codes: EnabledCode[];
+  /** The CPU's speed, in percent (100: the console's). */
+  overclock: number;
+  /** RAM, in MiB (2, or 8). */
+  ramMiB: number;
+  /** The picture shown 16:9 (a patch renders it so). */
+  wide: boolean;
+  /** No widescreen by the GTE (a patch does its own). */
+  noGteWidescreen: boolean;
 }
 
 /** A memory card per slot: the user's card ids (null: none of theirs). */
@@ -99,6 +123,8 @@ export type ToWorker =
   | { type: "stop" }
   /** PlayStation enhancements: precise geometry (GPU), widescreen. */
   | { type: "precise"; on: boolean }
+  /** The codes enabled from now on (see `CodeSet`). */
+  | { type: "codes"; set: CodeSet }
   | { type: "widescreen"; on: boolean }
   /** Fast-forward: frames as fast as the machine runs them, without sound. */
   | { type: "fast"; on: boolean }
@@ -133,7 +159,11 @@ export type FromWorker =
   | { type: "pad"; port: number; analog: boolean; small: number; large: number }
   /** renderer: what the PS2 runs on beyond software (the GS on WebGPU, the
    * EE's code compiled), or null. */
-  | { type: "started"; pal: boolean; bios: string; renderer: string | null }
+  /** precise: precise geometry can be shown (the PlayStation's, drawn on
+   * the GPU or in the drawing worker). */
+  | { type: "started"; pal: boolean; bios: string; renderer: string | null; precise: boolean }
+  /** Codes the core refused, and why. */
+  | { type: "codes-refused"; refused: [string, string][] }
   | { type: "stats"; fps: number; width: number; height: number }
   /** The resolution drawn changed: lowered while emulation lags (`chosen`:
    * the one chosen, which it returns to). */

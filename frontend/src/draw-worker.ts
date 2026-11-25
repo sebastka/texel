@@ -5,7 +5,7 @@
 // none is dropped (they change what is drawn next), only pictures are.
 
 import init, { Replayer } from "./wasm/texel_web.js";
-import { Painter } from "./paint";
+import { type Painter, painter as makePainter } from "./paint";
 import type { Half } from "./protocol";
 
 export type ToDrawer =
@@ -28,25 +28,34 @@ export type FromDrawer =
 const scope = self as unknown as DedicatedWorkerGlobalScope;
 let replayer: Replayer | null = null;
 let painter: Painter | null = null;
+/** This module's memory, where the replayer's pictures are. */
+let memory: WebAssembly.Memory | null = null;
 
 async function draw(msg: Extract<ToDrawer, { type: "draw" }>) {
   if (!replayer || !painter) return;
   const started = performance.now();
   for (const d of msg.drawings) replayer.apply(new Uint8Array(d));
-  replayer.render();
-  const pixels = replayer.frame() as Uint8ClampedArray<ArrayBuffer>;
-  painter.paint(pixels, replayer.frameWidth, replayer.frameHeight, msg.viewport, msg.smooth, msg.hidden);
+  // The 15-bit picture, unconverted, where the painter takes it (WebGL);
+  // else RGBA (24-bit pictures, a 2D canvas).
+  const layout = painter.takes15 && memory ? replayer.picture() : undefined;
+  if (layout && memory) painter.paint15(memory.buffer, layout, msg.viewport, msg.smooth, msg.hidden);
+  else {
+    replayer.render();
+    const pixels = replayer.frame() as Uint8ClampedArray<ArrayBuffer>;
+    painter.paint(pixels, replayer.frameWidth, replayer.frameHeight, msg.viewport, msg.smooth, msg.hidden);
+  }
   const ms = performance.now() - started;
-  const screenshot = msg.screenshot ? await painter.picture.convertToBlob({ type: "image/png" }) : null;
+  const screenshot = msg.screenshot ? await painter.screenshot() : null;
   scope.postMessage({ type: "drawn", ms, screenshot } satisfies FromDrawer);
 }
 
 scope.onmessage = (e: MessageEvent<ToDrawer>) => {
   const msg = e.data;
   if (msg.type === "start") {
-    void init().then(() => {
+    void init().then((wasm) => {
+      memory = wasm.memory;
       replayer = new Replayer();
-      painter = new Painter(msg.canvas);
+      painter = makePainter(msg.canvas);
       scope.postMessage({ type: "drawn", ms: 0, screenshot: null } satisfies FromDrawer);
     });
     return;

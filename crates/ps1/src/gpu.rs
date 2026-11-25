@@ -284,7 +284,7 @@ impl Gpu {
         self.display_mode & 0x20 != 0
     }
 
-    fn dot_divider(&self) -> u32 {
+    pub(crate) fn dot_divider(&self) -> u32 {
         if self.display_mode & 0x40 != 0 {
             7
         } else {
@@ -1058,6 +1058,28 @@ impl Gpu {
         if self.is_pal() { 314 } else { 263 }
     }
 
+    /// The CPU cycles until `lines` more lines have started (see `tick`).
+    pub fn cycles_to_lines(&self, lines: u32) -> u32 {
+        let line_len: u32 = if self.is_pal() { 3406 } else { 3413 } * 7;
+        let need = (u64::from(lines) * u64::from(line_len)).saturating_sub(u64::from(self.line_frac));
+        need.div_ceil(11).clamp(1, u64::from(u32::MAX)) as u32
+    }
+
+    /// The CPU cycles until the vertical blank starts (see `tick`).
+    pub fn cycles_to_vblank(&self) -> u32 {
+        let lines = self.lines_per_frame();
+        let vblank = self.v_range.1.clamp(self.v_range.0 + 1, lines - 1);
+        let s = self.scanline;
+        let to = if s < vblank {
+            vblank - s
+        } else if s < lines {
+            lines - s + vblank
+        } else {
+            1 + vblank
+        };
+        self.cycles_to_lines(to)
+    }
+
     /// Advances video timing by `cycles` CPU cycles.
     pub fn tick(&mut self, cycles: u32) -> GpuTick {
         self.queue_drawing();
@@ -1150,6 +1172,28 @@ impl Gpu {
             &self.hires[..]
         };
         display_rgba(self.display(), self.scale, src, &self.vram, out)
+    }
+
+    /// The displayed picture's size: what `render_display` gives.
+    pub fn display_dims(&self) -> (usize, usize) {
+        let d = self.display();
+        let s = if d.depth24 { 1 } else { self.scale };
+        (d.w as usize * s, d.h as usize * s)
+    }
+
+    /// The displayed picture as VRAM holds it, for a renderer that converts
+    /// its colours itself (see `display_15`); `None` while drawing is
+    /// recorded (the recording's renderer shows it).
+    pub fn picture<'a>(&'a self, wrapped: &'a mut Vec<u16>) -> Option<Picture<'a>> {
+        if self.record {
+            return None;
+        }
+        let src = if self.scale == 1 {
+            &self.vram[..]
+        } else {
+            &self.hires[..]
+        };
+        display_15(self.display(), self.scale, src, wrapped)
     }
 }
 
@@ -1334,37 +1378,57 @@ impl Raster<'_> {
                 self.touch([xs + lo as i32, y, xs + hi as i32, y]);
                 let first = xs + lo as i32;
                 let mut steps = DitherSteps::new(first, self.scale);
-                // The last texel, reused while the coordinates stay (the
-                // scaled pass, reading the native VRAM it does not write).
-                let mut last: Option<(i32, i32, u16)> = None;
-                let reuse = self.tex.is_some();
-                for x in first..=xs + hi as i32 {
-                    let (r, g, b) = if SHADED {
-                        ((attr[0] >> 16) as i32, (attr[1] >> 16) as i32, (attr[2] >> 16) as i32)
-                    } else {
-                        flat
+                if !TEX && !SHADED && !prim.semi && !self.check_mask {
+                    // One colour, or four (dithered): the row filled, as
+                    // `pixel` would (vectorised where it can be).
+                    let colour = |d: i32| {
+                        let c = |v: i32| ((v + d).clamp(0, 255) >> 3) as u16;
+                        c(flat.0) | (c(flat.1) << 5) | (c(flat.2) << 10) | (u16::from(self.set_mask) << 15)
                     };
-                    let (u, v) = if TEX {
-                        ((attr[3] >> 16) as i32, (attr[4] >> 16) as i32)
-                    } else {
-                        (0, 0)
-                    };
-                    let dither = dither_row.map_or(0, |d| d[steps.column()]);
-                    steps.step();
-                    let t = if TEX {
-                        self.texel_reusing(&mut last, reuse, u, v, prim)
-                    } else {
-                        0
-                    };
-                    self.pixel::<TEX>(base + x as usize, dither, r, g, b, t, prim);
-                    if SHADED {
-                        for k in 0..3 {
-                            attr[k] += planes[k].1;
+                    let row = &mut self.target[base + first as usize..=base + (xs + hi as i32) as usize];
+                    match dither_row {
+                        None => row.fill(colour(0)),
+                        Some(d) => {
+                            let colours = [colour(d[0]), colour(d[1]), colour(d[2]), colour(d[3])];
+                            for p in row {
+                                *p = colours[steps.column()];
+                                steps.step();
+                            }
                         }
                     }
-                    if TEX {
-                        attr[3] += planes[3].1;
-                        attr[4] += planes[4].1;
+                } else {
+                    // The last texel, reused while the coordinates stay (the
+                    // scaled pass, reading the native VRAM it does not write).
+                    let mut last: Option<(i32, i32, u16)> = None;
+                    let reuse = self.tex.is_some();
+                    for x in first..=xs + hi as i32 {
+                        let (r, g, b) = if SHADED {
+                            ((attr[0] >> 16) as i32, (attr[1] >> 16) as i32, (attr[2] >> 16) as i32)
+                        } else {
+                            flat
+                        };
+                        let (u, v) = if TEX {
+                            ((attr[3] >> 16) as i32, (attr[4] >> 16) as i32)
+                        } else {
+                            (0, 0)
+                        };
+                        let dither = dither_row.map_or(0, |d| d[steps.column()]);
+                        steps.step();
+                        let t = if TEX {
+                            self.texel_reusing(&mut last, reuse, u, v, prim)
+                        } else {
+                            0
+                        };
+                        self.pixel::<TEX>(base + x as usize, dither, r, g, b, t, prim);
+                        if SHADED {
+                            for k in 0..3 {
+                                attr[k] += planes[k].1;
+                            }
+                        }
+                        if TEX {
+                            attr[3] += planes[3].1;
+                            attr[4] += planes[4].1;
+                        }
                     }
                 }
             }
@@ -1532,6 +1596,70 @@ impl Raster<'_> {
     /// The texel at `u, v`; `last`: the previous one, reused when at the
     /// same coordinates and `reuse` (textures not changing while drawn).
     #[inline(always)]
+    /// A precise triangle (`Command::Precise`), as the GPU renderer draws
+    /// it (`crates/ps1-gpu`'s `exact_triangle`): float edge functions at
+    /// the pixels' corners with the console's top-left rule, colours
+    /// interpolated linearly, texture coordinates in perspective when every
+    /// vertex has a depth (else affine); then as any pixel.
+    fn exact_triangle(&mut self, v: &[ExactVertex; 3], bbox: [i32; 4], textured: bool, shaded: bool, prim: &Prim) {
+        let [(x0, y0), (x1, y1), (x2, y2)] = v.map(|p| (p.x, p.y));
+        // The edge function of a to b at (x, y), less a little when the
+        // edge is not a top or left one (its pixels are the neighbour's).
+        let edge = |ax: f32, ay: f32, bx: f32, by: f32, x: f32, y: f32| {
+            let e = (bx - ax) * (y - ay) - (by - ay) * (x - ax);
+            let top_left = (ay == by && bx > ax) || by < ay;
+            if top_left { e >= 0.0 } else { e > 0.0 }
+        };
+        let area = (x1 - x0) * (y2 - y0) - (x2 - x0) * (y1 - y0);
+        let z = v.map(|p| p.z);
+        let perspective = z.iter().all(|&z| z > 0.0);
+        let mix = |l: [f32; 3], a: [f32; 3]| l[0] * a[0] + l[1] * a[1] + l[2] * a[2];
+        let channel = |f: fn(&ExactVertex) -> i32| v.each_ref().map(|p| f(p) as f32);
+        let (cr, cg, cb) = (channel(|p| p.color.0), channel(|p| p.color.1), channel(|p| p.color.2));
+        let (us, vs) = (channel(|p| p.uv.0), channel(|p| p.uv.1));
+        let reuse = self.tex.is_some();
+        let mut last = None;
+        for y in bbox[1]..=bbox[3] {
+            let base = y as usize * self.stride;
+            let dither_row = self.dither_row(y, prim);
+            let py = y as f32;
+            for x in bbox[0]..=bbox[2] {
+                let px = x as f32;
+                if !edge(x1, y1, x2, y2, px, py) || !edge(x2, y2, x0, y0, px, py) || !edge(x0, y0, x1, y1, px, py) {
+                    continue;
+                }
+                let l = [
+                    ((x2 - x1) * (py - y1) - (y2 - y1) * (px - x1)) / area,
+                    ((x0 - x2) * (py - y2) - (y0 - y2) * (px - x2)) / area,
+                    ((x1 - x0) * (py - y0) - (y1 - y0) * (px - x0)) / area,
+                ];
+                let (r, g, b) = if shaded {
+                    let round = |c: [f32; 3]| (mix(l, c) + 0.5).floor() as i32;
+                    (round(cr), round(cg), round(cb))
+                } else {
+                    v[0].color
+                };
+                self.pixels += 1;
+                self.touch([x, y, x, y]);
+                let dither = dither_row.map_or(0, |d| d[((x / self.scale) & 3) as usize]);
+                if textured {
+                    let q = if perspective {
+                        [l[0] / z[0], l[1] / z[1], l[2] / z[2]]
+                    } else {
+                        l
+                    };
+                    let den = q[0] + q[1] + q[2];
+                    let u = (mix(q, us) / den + 0.5).floor() as i32;
+                    let tv = (mix(q, vs) / den + 0.5).floor() as i32;
+                    let t = self.texel_reusing(&mut last, reuse, u, tv, prim);
+                    self.pixel::<true>(base + x as usize, dither, r, g, b, t, prim);
+                } else {
+                    self.pixel::<false>(base + x as usize, dither, r, g, b, 0, prim);
+                }
+            }
+        }
+    }
+
     fn texel_reusing(&self, last: &mut Option<(i32, i32, u16)>, reuse: bool, u: i32, v: i32, p: &Prim) -> u16 {
         if let Some((lu, lv, t)) = *last
             && (lu, lv) == (u, v)
@@ -1890,6 +2018,58 @@ pub struct Spans {
     pub ye: i32,
 }
 
+/// The displayed picture as VRAM holds it (15-bit colours, the mask bit
+/// on top): `w` by `h` pixels from `x`, `y` in `pixels`, whose rows are
+/// `stride` pixels long.
+pub struct Picture<'a> {
+    pub pixels: &'a [u16],
+    pub stride: usize,
+    pub x: usize,
+    pub y: usize,
+    pub w: usize,
+    pub h: usize,
+}
+
+/// The displayed area of `scaled` (VRAM at `scale`), as it is: `None` in
+/// 24-bit mode and with the display off (`display_rgba` then). A picture
+/// that wraps around VRAM's edges is copied into `wrapped` (rarely).
+pub(crate) fn display_15<'a>(
+    d: Display,
+    scale: usize,
+    scaled: &'a [u16],
+    wrapped: &'a mut Vec<u16>,
+) -> Option<Picture<'a>> {
+    if d.off || d.depth24 {
+        return None;
+    }
+    let (stride, rows) = (VRAM_WIDTH * scale, VRAM_HEIGHT * scale);
+    let (w, h) = (d.w as usize * scale, d.h as usize * scale);
+    let (x, y) = ((d.x as usize * scale) % stride, (d.y as usize * scale) % rows);
+    if x + w <= stride && y + h <= rows {
+        return Some(Picture {
+            pixels: scaled,
+            stride,
+            x,
+            y,
+            w,
+            h,
+        });
+    }
+    wrapped.clear();
+    for r in 0..h {
+        let row = &scaled[(y + r) % rows * stride..][..stride];
+        wrapped.extend((0..w).map(|c| row[(x + c) % stride]));
+    }
+    Some(Picture {
+        pixels: wrapped,
+        stride: w,
+        x: 0,
+        y: 0,
+        w,
+        h,
+    })
+}
+
 /// Renders the displayed area as RGBA8888 into `out` and returns its size:
 /// the display size times `scale` (`scaled`: the VRAM drawn at that scale),
 /// except in 24-bit mode (FMVs), which only exists at native resolution
@@ -1904,11 +2084,14 @@ pub(crate) fn display_rgba(
     let (w, h) = (d.w as usize, d.h as usize);
     let s = if d.depth24 { 1 } else { scale };
     let (ow, oh) = (w * s, h * s);
-    out.clear();
-    out.resize(ow * oh * 4, 0);
+    // Every pixel is written below: cleared only when the size changes.
+    if out.len() != ow * oh * 4 {
+        out.clear();
+        out.resize(ow * oh * 4, 0);
+    }
     if d.off {
         for px in out.as_chunks_mut::<4>().0 {
-            px[3] = 0xff;
+            *px = [0, 0, 0, 0xff];
         }
         return (ow, oh);
     }
@@ -1918,7 +2101,6 @@ pub(crate) fn display_rgba(
         (scaled, VRAM_WIDTH * s)
     };
     let rows = VRAM_HEIGHT * s;
-    let rgba = rgba_table();
     for y in 0..oh {
         let vy = (d.y as usize * s + y) % rows;
         let row = &src[vy * stride..(vy + 1) * stride];
@@ -1936,29 +2118,25 @@ pub(crate) fn display_rgba(
             }
         } else {
             // The row from the display's left edge, wrapping around VRAM
-            // at most once.
+            // at most once (the display is narrower than VRAM).
             let start = (d.x as usize * s) % stride;
-            let (first, wrapped) = row.split_at(start);
-            for (px, &c) in dst.iter_mut().zip(wrapped.iter().chain(first.iter().cycle())) {
-                *px = rgba[usize::from(c & 0x7fff)];
-            }
+            let before_wrap = (stride - start).min(dst.len());
+            let (left, right) = dst.split_at_mut(before_wrap);
+            widen(&row[start..start + before_wrap], left);
+            widen(&row[..right.len()], right);
         }
     }
     (ow, oh)
 }
 
-/// 15-bit colours as RGBA8888 (each 5-bit channel widened to 8 bits).
-fn rgba_table() -> &'static [[u8; 4]; 0x8000] {
-    static TABLE: std::sync::LazyLock<Box<[[u8; 4]; 0x8000]>> = std::sync::LazyLock::new(|| {
-        let e = |v: u16| ((v & 0x1f) << 3 | (v & 0x1f) >> 2) as u8;
-        let mut t = Box::new([[0u8; 4]; 0x8000]);
-        for (c, px) in t.iter_mut().enumerate() {
-            let c = c as u16;
-            *px = [e(c), e(c >> 5), e(c >> 10), 0xff];
-        }
-        t
-    });
-    &TABLE
+/// 15-bit colours as RGBA8888, each 5-bit channel widened to 8 bits (in
+/// 32-bit lanes, without a table: the compiler vectorises it).
+fn widen(src: &[u16], dst: &mut [[u8; 4]]) {
+    for (px, &c) in dst.iter_mut().zip(src) {
+        let c = u32::from(c);
+        let e = |v: u32| ((v & 0x1f) << 3) | ((v & 0x1f) >> 2);
+        *px = (e(c) | (e(c >> 5) << 8) | (e(c >> 10) << 16) | 0xff00_0000).to_le_bytes();
+    }
 }
 
 pub mod replay;
@@ -1973,6 +2151,52 @@ fn rgb24_to_15(c: u32) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_15_bit_picture_is_the_rgba_one() {
+        let scale = 2;
+        let vram: Vec<u16> = (0..VRAM_WIDTH * VRAM_HEIGHT * scale * scale)
+            .map(|i| (i as u32).wrapping_mul(2_654_435_761) as u16)
+            .collect();
+        // In the middle of VRAM, and wrapping around its right and bottom
+        // edges.
+        for (x, y) in [(64, 16), (900, 400)] {
+            let d = Display {
+                x,
+                y,
+                w: 320,
+                h: 240,
+                depth24: false,
+                off: false,
+            };
+            let mut rgba = Vec::new();
+            let (w, h) = display_rgba(d, scale, &vram, &vram, &mut rgba);
+            let mut wrapped = Vec::new();
+            let p = display_15(d, scale, &vram, &mut wrapped).expect("a 15-bit picture");
+            assert_eq!((p.w, p.h), (w, h));
+            let mut row = vec![[0u8; 4]; w];
+            for r in 0..h {
+                let start = (p.y + r) * p.stride + p.x;
+                widen(&p.pixels[start..start + w], &mut row);
+                assert_eq!(
+                    row.as_flattened(),
+                    &rgba[r * w * 4..(r + 1) * w * 4],
+                    "({x}, {y}), row {r}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn colours_widen_as_the_console_shows_them() {
+        let src: Vec<u16> = (0..=0xffff).collect();
+        let mut dst = vec![[0u8; 4]; src.len()];
+        widen(&src, &mut dst);
+        let e = |v: u16| ((v & 0x1f) << 3 | (v & 0x1f) >> 2) as u8;
+        for (&c, px) in src.iter().zip(&dst) {
+            assert_eq!(*px, [e(c), e(c >> 5), e(c >> 10), 0xff], "{c:04x}");
+        }
+    }
 
     fn draw_area(gpu: &mut Gpu) {
         gpu.gp0(0xe300_0000);

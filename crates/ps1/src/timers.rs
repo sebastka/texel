@@ -1,6 +1,6 @@
 //! The three root counters.
 
-use crate::gpu::GpuTick;
+use crate::gpu::{Gpu, GpuTick};
 use crate::irq::{Interrupt, Irq};
 
 #[derive(Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
@@ -85,6 +85,41 @@ impl Timers {
                 irq.raise([Interrupt::Timer0, Interrupt::Timer1, Interrupt::Timer2][i]);
             }
         }
+    }
+
+    /// The CPU cycles until a timer may raise its interrupt (reaching its
+    /// target or overflowing), if one can.
+    pub fn next_event(&self, gpu: &Gpu) -> Option<u32> {
+        let mut next: Option<u32> = None;
+        for (i, t) in self.t.iter().enumerate() {
+            // No interrupt, or a one-shot one already raised.
+            if t.mode & 0x30 == 0 || (t.mode & (1 << 6) == 0 && t.fired) {
+                continue;
+            }
+            if i == 2 && t.mode & 1 != 0 && matches!((t.mode >> 1) & 3, 0 | 3) {
+                continue;
+            }
+            let ticks = if t.target == 0 && t.counter == 0 {
+                1
+            } else if t.counter < t.target {
+                t.target - t.counter
+            } else {
+                0x1_0000 - t.counter.min(0xffff)
+            };
+            let cycles = match (i, (t.mode >> 8) & 3) {
+                (0, 1 | 3) => {
+                    let need = u64::from(ticks) * 7 * u64::from(gpu.dot_divider());
+                    need.saturating_sub(u64::from(t.frac))
+                        .div_ceil(11)
+                        .min(u64::from(u32::MAX)) as u32
+                }
+                (1, 1 | 3) => gpu.cycles_to_lines(ticks),
+                (2, 2 | 3) => (ticks * 8).saturating_sub(t.frac),
+                _ => ticks,
+            };
+            next = Some(next.map_or(cycles, |n| n.min(cycles)));
+        }
+        next
     }
 
     /// Returns whether an interrupt fires.

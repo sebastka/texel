@@ -4,6 +4,8 @@ import { accountMenu } from "./account-menu";
 import { renderAdmin } from "./admin";
 import { api, gameRegion, image, type Bios, type Console, type Firmware, type Game, type GameDetail, type GameListItem, type SaveState, type User } from "./api";
 import { renderCards } from "./cards";
+import { codesPanel } from "./codes";
+import type { CodeSet } from "./protocol";
 import {
   REDUMP_EXPLAINED,
   VERIFY_LABELS,
@@ -346,6 +348,16 @@ function consoleTabs(page: "games" | "bios" | "cards", active: Console, count: (
 }
 
 /** Games of a console, one entry per multi-disc game. */
+/** A multi-disc game's discs, in the list: how many, or which are here
+ * when some are missing ("Disc 2 of 2"). */
+function discsTag(g: Game) {
+  const total = g.discs.length + g.missingDiscs.length;
+  if (!g.missingDiscs.length) return h("span.tag", {}, `${total} discs`);
+  const here = g.discs.map((d) => d.number).join(", ");
+  const missing = g.missingDiscs.map((n) => `Disc ${n}`).join(", ");
+  return h("span.tag", { title: `${missing}: not in the library` }, `Disc${g.discs.length > 1 ? "s" : ""} ${here} of ${total}`);
+}
+
 const gamesOf = (c: Console) => games.filter((g) => g.console === c && (!g.discs.length || g.discs[0]?.id === g.id));
 
 const VERIFY_CLASS: Record<VerifyState, string> = {
@@ -755,7 +767,7 @@ function gameRow(g: GameListItem) {
             "span.small-tags",
             {},
             ...tags.other.filter((t) => !t.tag.startsWith("Disc ")).map((t) => h("span.tag", { title: t.note ?? "" }, t.tag)),
-            g.discs.length ? h("span.tag", {}, `${g.discs.length} discs`) : null,
+            g.discs.length ? discsTag(g) : null,
           )
         : null,
       g.serial ? h("div.serial", {}, g.serial) : null,
@@ -860,10 +872,12 @@ async function renderGame(id: string) {
               ? h(
                   "span.links",
                   {},
-                  ...g.discs.flatMap((d, i) => {
-                    const link = d.id === g.id ? h("strong", {}, `Disc ${d.number}`) : h("a.external", { href: `#/game/${d.id}` }, `Disc ${d.number}`);
-                    return i ? [" · ", link] : [link];
-                  }),
+                  ...[
+                    ...g.discs.map((d) => ({ number: d.number, el: d.id === g.id ? h("strong", {}, `Disc ${d.number}`) : h("a.external", { href: `#/game/${d.id}` }, `Disc ${d.number}`) })),
+                    ...g.missingDiscs.map((n) => ({ number: n, el: h("span.muted", { title: "Not in the library" }, `Disc ${n} (missing)`) })),
+                  ]
+                    .sort((a, b) => a.number - b.number)
+                    .flatMap(({ el }, i) => (i ? [" · ", el] : [el])),
                 )
               : null,
           ),
@@ -1463,7 +1477,7 @@ function renderPlayer(id: string, biosId: string, roomGame = false, cards: Slots
     smooth.setAttribute("aria-pressed", String(on));
   };
   const reset = h("button.ghost", { hidden: guest, onclick: () => player?.reset() }, "Reset");
-  // Enhancements: precise geometry (GPU only), widescreen (16:9).
+  // Enhancements: precise geometry, widescreen (16:9).
   const showToggle = (b: Element, label: string, on: boolean) => {
     b.textContent = `${label}: ${on ? "on" : "off"}`;
     b.setAttribute("aria-pressed", String(on));
@@ -1473,7 +1487,7 @@ function renderPlayer(id: string, biosId: string, roomGame = false, cards: Slots
     {
       title:
         "Precise geometry: draws 3D from the exact positions the console computed, before it rounded them: no wobbling " +
-        "polygons, textures in perspective. Needs WebGPU.",
+        "polygons, textures in perspective.",
       onclick: () => {
         if (player) showToggle(precise, "Precise", player.togglePrecise());
       },
@@ -1492,9 +1506,56 @@ function renderPlayer(id: string, biosId: string, roomGame = false, cards: Slots
     },
     "",
   ) as HTMLButtonElement;
+  // Patches can render 16:9 themselves: the picture is then shown so.
+  let codesWide = false;
   const setWide = (on: boolean) => {
     showToggle(wide, "Widescreen", on);
-    screen.classList.toggle("wide", on);
+    screen.classList.toggle("wide", on || codesWide);
+  };
+  // Cheat and patch codes: a section under the controls, when the game has
+  // some (the game stays in view while they are chosen).
+  let codesUi: ReturnType<typeof codesPanel> | null = null;
+  const codesSlot = h("div");
+  const codesSection = h("details.codes", { hidden: true }, h("summary", {}, "Cheats and patches"), codesSlot);
+  const codesButton = h(
+    "button.ghost",
+    {
+      hidden: true,
+      title: "Cheats and patches (draw distance, 60 fps, widescreen...) for this game, under the controls.",
+      onclick: () => {
+        codesSection.open = true;
+        codesSection.scrollIntoView({ behavior: "smooth", block: "start" });
+      },
+    },
+    "Codes",
+  ) as HTMLButtonElement;
+  /** A disc's codes in the panel (each disc has its own), none enabled:
+   * those of the disc before turned off. */
+  const loadCodes = async (gameId: string) => {
+    player?.setCodes(null);
+    showCodes(null);
+    if (playing) playing.codes = null;
+    codesUi = null;
+    codesSlot.replaceChildren();
+    codesButton.hidden = true;
+    codesSection.hidden = true;
+    const codes = await api.codes(gameId).catch(() => null);
+    if (!codes || !(codes.patches.length || codes.cheats.length) || current !== gameId) return;
+    codesUi = codesPanel(codes, (s) => {
+      showCodes(s);
+      player?.setCodes(s);
+      if (playing) playing.codes = s;
+    });
+    codesSlot.replaceChildren(codesUi.panel);
+    codesButton.hidden = false;
+    codesSection.hidden = false;
+    lock();
+  };
+  const showCodes = (set: CodeSet | null) => {
+    codesWide = !!set?.wide;
+    // A patch doing its own widescreen: not the GTE's too.
+    if (set?.noGteWidescreen && player?.widescreen) setWide(player.setWidescreen(false));
+    else setWide(player?.widescreen ?? false);
   };
   const fast = fastToggle();
   fast.hidden = guest;
@@ -1519,6 +1580,8 @@ function renderPlayer(id: string, biosId: string, roomGame = false, cards: Slots
     fast.disabled = inRoom;
     if (inRoom && player?.widescreen) setWide(player.setWidescreen(false));
     wide.disabled = inRoom;
+    // Codes change the game: the room's are the host's, as it started it.
+    codesUi?.lock(inRoom);
     if (locked) statesPanel.hidden = true;
     if (discPicker) discPicker.disabled = inRoom;
   };
@@ -1541,6 +1604,8 @@ function renderPlayer(id: string, biosId: string, roomGame = false, cards: Slots
               const target = (e.target as HTMLSelectElement).value;
               current = target;
               playing = { game: target, bios: biosId };
+              // The disc's own codes, none enabled.
+              void loadCodes(target);
               void api.game(target).then((d) => player?.swapDisc(d));
             },
           },
@@ -1578,6 +1643,7 @@ function renderPlayer(id: string, biosId: string, roomGame = false, cards: Slots
               fast,
               reset,
               statesButton,
+              codesButton,
               analog,
               resolution,
               precise,
@@ -1605,6 +1671,7 @@ function renderPlayer(id: string, biosId: string, roomGame = false, cards: Slots
             " loads it. Gamepads work too, with the standard layout; their Home button is the Analog button.",
           ),
         ),
+        codesSection,
       ),
     ),
   );
@@ -1614,11 +1681,11 @@ function renderPlayer(id: string, biosId: string, roomGame = false, cards: Slots
     onStateSaved: () => {
       if (!statesPanel.hidden) void renderStates();
     },
-    onStarted: (renderer) => {
-      const gpu = !!renderer?.includes("WebGPU");
-      precise.disabled = !gpu;
-      if (!gpu) precise.title += " This browser has no WebGPU: drawn in software.";
+    onStarted: (_renderer, shown) => {
+      precise.disabled = !shown;
+      if (!shown) precise.title += " Not available here: it needs WebGPU, or a spare processor core for drawing.";
     },
+    onCodesRefused: (refused) => codesUi?.refused(refused),
     onAnalog: (on) => {
       analog.textContent = on ? "Analog: on" : "Analog: off";
       analog.setAttribute("aria-pressed", String(on));
@@ -1642,7 +1709,7 @@ function renderPlayer(id: string, biosId: string, roomGame = false, cards: Slots
   setWide(room ? player.setWidescreen(false) : player.widescreen);
   const started = player;
   void api.game(id).then(
-    (g) => {
+    async (g) => {
       // A guest without an account has no library to name the game from.
       if (!now.textContent) {
         now.textContent = g.title;
@@ -1651,13 +1718,19 @@ function renderPlayer(id: string, biosId: string, roomGame = false, cards: Slots
       if (player !== started) return;
       if (guest && room) {
         attach(room);
-        // The host's cards come with its state.
-        return started.start(biosId, g, [null, null], room.snapshot());
+        // The host's codes, as everyone's; its cards come with its state.
+        const set = room.game?.codes ?? null;
+        showCodes(set);
+        return started.start(biosId, g, [null, null], room.snapshot(), set);
       }
+      // The game's codes: none enabled when it starts.
+      await loadCodes(id);
+      if (player !== started) return;
       const done = started.start(biosId, g, cards ?? g.lastCards);
       // A host's game is the room's: everyone follows (see the room's
-      // `game` event).
-      if (room?.isHost && room.state === "open") room.load({ game: id, bios: biosId });
+      // `game` event), with the codes it enables meanwhile (before others
+      // are in: then they are locked).
+      if (room?.isHost && room.state === "open") room.load({ game: id, bios: biosId, codes: null });
       return done;
     },
     (e: unknown) => (status.textContent = String(e)),

@@ -933,6 +933,64 @@ impl FileReader for Files<'_> {
     }
 }
 
+/// What identifies a PlayStation disc's build, as DuckStation hashes it
+/// (see `codes`): its boot executable's path (SYSTEM.CNF's `BOOT`, without
+/// `cdrom:`, leading slashes and the version), the executable, the primary
+/// volume descriptor (sector 16), and track 1's length in sectors. Reads
+/// the disc: for a request, not the scan.
+pub struct ExecutableIdentity {
+    pub name: String,
+    pub executable: Vec<u8>,
+    pub descriptor: Vec<u8>,
+    pub track1_sectors: u32,
+}
+
+pub fn executable_identity(game: &Game) -> anyhow::Result<ExecutableIdentity> {
+    let sizes = |n: &str| game.files.iter().find(|f| f.name == n).map(|f| f.size);
+    let layout = match &game.cue {
+        Some(cue) => parse_cue(cue, sizes)?,
+        None => {
+            let f = game.files.first().ok_or_else(|| anyhow::anyhow!("no image file"))?;
+            Layout::single_file(&f.name, f.size).ok_or_else(|| anyhow::anyhow!("not a disc image"))?
+        }
+    };
+    let track1 = layout.tracks.first().ok_or_else(|| anyhow::anyhow!("no track"))?;
+    let track1_sectors = track1.end - track1.start;
+    let mut disc = Disc::new(
+        layout,
+        Files {
+            files: &game.files,
+            cache: Cache::scanning(),
+        },
+    );
+    let cnf = texel_disc::read_system_cnf(&mut disc)?;
+    // DuckStation's reading of SYSTEM.CNF drops all whitespace.
+    let boot: String = cnf.boot.chars().filter(|c| !c.is_whitespace()).collect();
+    let mut name = boot
+        .strip_prefix("cdrom:")
+        .unwrap_or(&boot)
+        .trim_start_matches(['/', '\\'])
+        .to_owned();
+    if let Some(at) = name.rfind(';') {
+        name.truncate(at);
+    }
+    let (lba, size) = texel_disc::find_file(&mut disc, &name)?;
+    let mut executable = Vec::with_capacity(size as usize);
+    let mut sector = [0u8; texel_disc::DATA_SECTOR_SIZE];
+    for k in 0..size.div_ceil(texel_disc::DATA_SECTOR_SIZE as u32) {
+        disc.read_data(lba + k, &mut sector)?;
+        executable.extend_from_slice(&sector);
+    }
+    executable.truncate(size as usize);
+    disc.read_data(16, &mut sector)?;
+    Ok(ExecutableIdentity {
+        name,
+        executable,
+        descriptor: sector.to_vec(),
+        track1_sectors,
+    })
+}
+
 fn make_game(console: Console, rel: String, cue: Option<String>, layout: Layout, files: Vec<GameFile>) -> Game {
     let mut game = Game {
         id: short_id(&rel),

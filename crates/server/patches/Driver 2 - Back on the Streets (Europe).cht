@@ -1,0 +1,69 @@
+# Driver 2 - Back on the Streets (Europe): both discs have the same executable.
+# Texel's own patches, under Texel's licence (MIT).
+; Serials: SLES-02993, SLES-12993
+;
+; Skipped: "NTSC Mode" (Spain, SLES-02997 and SLES-12997, by PeterDelta, in DuckStation's
+; database), which runs the game at 60 Hz (with the CPU at 170%). Its codes change two
+; constants in the code (800A9744, 8008D8FC) and display settings in memory (800E0BD2...),
+; depending on a variable (800AA898); the European executable has no match for the two
+; constants nearby, and the lines alone do not identify the data in another build.
+
+[Increased Draw Distance]
+Description = Draws the city about 16 cells around the car rather than 7: buildings appear from much further away.
+Author = Texel
+Type = Gameshark
+Activation = EndFrame
+OverrideCPUOverclock = 300
+; The approach is that of Stenzek's patch for the American release (SLUS-01161, in
+; DuckStation's database); the code below is Texel's own, for the European executable,
+; whose routines are the American ones 8 bytes earlier.
+;
+; DrawMapPSX (8003F59C) walks the 2048-unit map cells around the camera in a square
+; spiral: 0x1B9 >> 1 cells in one-player mode (about 7 cells out), skipping those with
+; |h|+|v| >= 16, and reads each cell's visibility from a 21x21 table centred at
+; 800D74DC, which only covers +/-10 cells (and is read without bounds checks).
+;
+; - 8000C000 (unused BIOS RAM): the visibility lookup, with the cell's offsets (s4, s5)
+;   clamped to the table: cells past its edge take the edge cell's visibility.
+; - 8003F740: 0x1B9 cells -> 0x882 (33x33: 16 cells out); 8003F774: |h|+|v| < 23.
+; - 8003F804: the lookup jumps to the routine above, which returns to 8003F818.
+; - 80023A08 (GetFirstPackedCop): always checks that a cell's map region is loaded (as
+;   in two-player mode): beyond about 13 cells its slot may hold another region.
+; The game needs more CPU for it: the CPU runs at 300%.
+AA00C000 0000001C
+00000000 02801021  ; 8000C000: addu v0, s4, zero      ; the offset
+00000000 2841FFF6  ; 8000C004: slti at, v0, -10
+00000000 10200002  ; 8000C008: beq at, zero, hlo
+00000000 00000000  ; 8000C00C: nop
+00000000 2402FFF6  ; 8000C010: addiu v0, zero, -10   ; below the table: its edge
+00000000 2841000B  ; 8000C014: slti at, v0, 11
+00000000 14200002  ; 8000C018: bne at, zero, hhi
+00000000 00000000  ; 8000C01C: nop
+00000000 2402000A  ; 8000C020: addiu v0, zero, 10    ; above the table: its edge
+00000000 02A01821  ; 8000C024: addu v1, s5, zero      ; the offset
+00000000 2861FFF6  ; 8000C028: slti at, v1, -10
+00000000 10200002  ; 8000C02C: beq at, zero, vlo
+00000000 00000000  ; 8000C030: nop
+00000000 2403FFF6  ; 8000C034: addiu v1, zero, -10   ; below the table: its edge
+00000000 2861000B  ; 8000C038: slti at, v1, 11
+00000000 14200002  ; 8000C03C: bne at, zero, vhi
+00000000 00000000  ; 8000C040: nop
+00000000 2403000A  ; 8000C044: addiu v1, zero, 10    ; above the table: its edge
+00000000 00034100  ; 8000C048: sll t0, v1, 4           ; row * 21 = row*16 + row*4 + row
+00000000 00030880  ; 8000C04C: sll at, v1, 2
+00000000 01014021  ; 8000C050: addu t0, t0, at
+00000000 01034021  ; 8000C054: addu t0, t0, v1
+00000000 01024021  ; 8000C058: addu t0, t0, v0         ; + column
+00000000 3C01800D  ; 8000C05C: lui at, 0x800d
+00000000 01014021  ; 8000C060: addu t0, t0, at
+00000000 910374DC  ; 8000C064: lbu v1, 0x74dc(t0)    ; the cell's visibility
+00000000 0800FE06  ; 8000C068: j 0x8003f818              ; back, past the original lookup
+00000000 00000000  ; 8000C06C: nop
+AA03F740 00000001
+240201B9 24020882  ; 8003F740: addiu v0, zero, 0x1B9 -> 0x882
+AA03F774 00000001
+28630010 28630017  ; 8003F774: slti v1, v1, 16 -> 23
+AA03F804 00000001
+8FA30060 08003000  ; 8003F804: lw v1, 0x60(sp) -> j 0x8000C000
+AA023A08 00000001
+14620010 00000000  ; 80023A08: bne v1, v0 (one player: no check) -> nop

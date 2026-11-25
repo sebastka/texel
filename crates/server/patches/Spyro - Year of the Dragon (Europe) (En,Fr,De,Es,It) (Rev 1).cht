@@ -1,0 +1,23 @@
+# Spyro - Year of the Dragon (Europe) (Rev 1). Texel's own patch, under Texel's licence
+# (MIT), after the one for the American release (SCUS-94467) in DuckStation's database.
+# Rev 0 has the same serial and another executable: the codes check what they replace,
+# and do nothing there.
+; Serials: SCES-02835
+
+[Widescreen 16:9]
+Description = Draws the world 16:9: more of it to each side.
+Author = Texel
+Type = Gameshark
+Activation = EndFrame
+OverrideAspectRatio = 16:9
+DisableWidescreenRendering = True
+; The camera's matrix is built in the scratchpad at 800519F8 (its only caller: 800206EC);
+; its first element (1.0, t5, stored at 0(t6) by 80051A58) scales the picture's X. The
+; next call (jal 80050D60) goes to a routine in unused BIOS RAM that stores 0.75 there,
+; then goes on to the function, which uses v1 as scratch.
+AA00C000 00000003
+00000000 24030C00  ; 8000C000: addiu v1, zero, 0xC00
+00000000 08014358  ; 8000C004: j 0x80050D60
+00000000 A5C30000  ; 8000C008: sh v1, 0(t6)
+AA051A5C 00000001
+0C014358 0C003000  ; 80051A5C: jal 0x80050D60 -> jal 0x8000C000

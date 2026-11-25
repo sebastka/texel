@@ -4,6 +4,7 @@
 mod api;
 mod auth;
 mod cards;
+mod codes;
 mod dat;
 mod db;
 mod images;
@@ -275,6 +276,11 @@ async fn main() -> anyhow::Result<()> {
     let hashes = db.hashes().await.context("loading hashes")?;
     let state = Arc::new(state::AppState::new(config.clone(), db, hashes)?);
     state.load_cached_dats().await;
+    {
+        let s = state.clone();
+        let db = tokio::task::spawn_blocking(move || codes::CodeDb::load(&s)).await?;
+        *state.codes.write().await = Arc::new(db);
+    }
 
     // Serving at once: the first scan runs in the background (`/readyz`
     // says so until it is done), and zipped images' seek indexes after it.
@@ -296,6 +302,9 @@ async fn background(state: Arc<state::AppState>) {
     // New DATs bring CUE sheets for BIN files found without one, a new
     // open-source BIOS a BIOS: scanned again.
     let mut again = state.config.fetch_metadata && state.refresh_dats(false).await;
+    if state.config.fetch_metadata {
+        codes::refresh(&state).await;
+    }
     if state.config.fetch_open_bios {
         again |= openbios::refresh(&state.http, &state.open_bios_dir()).await;
     }
@@ -317,6 +326,9 @@ async fn background(state: Arc<state::AppState>) {
             state.rescan().await;
             if state.config.fetch_metadata && state.refresh_dats(false).await {
                 state.rescan().await;
+            }
+            if state.config.fetch_metadata {
+                codes::refresh(&state).await;
             }
             last_scan = tokio::time::Instant::now();
         }

@@ -150,7 +150,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 (w > 0 && h > 0).then(|| (w, h, replayed.clone()))
             }
         };
-        let Some(s) = software.as_ref() else {
+        let Some(s) = software.as_mut() else {
             if (enhanced || std::env::var("SHOTS").is_ok())
                 && let Some((w, h, g)) = &picture
             {

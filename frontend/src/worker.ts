@@ -8,10 +8,10 @@ import { RING_FRAMES, Ring } from "./audio";
 import type { FromDrawer, ToDrawer } from "./draw-worker";
 import { OPS_BYTES, Pipe, RECORDS_BYTES, Vu1Link } from "./vu1-pipe";
 import type { ToVu1 } from "./vu1-worker";
-import { Painter } from "./paint";
+import { type Painter, painter as makePainter } from "./paint";
 import { Session } from "./netplay";
 import { cardUrl } from "./api";
-import type { Axes, FromWorker, RoomSnapshot, Slots, StartMessage, ToWorker } from "./protocol";
+import type { Axes, CodeSet, FromWorker, RoomSnapshot, Slots, StartMessage, ToWorker } from "./protocol";
 
 const scope = self as unknown as DedicatedWorkerGlobalScope;
 const post = (msg: FromWorker) => scope.postMessage(msg);
@@ -28,13 +28,17 @@ let emu: Emulator | null = null;
  * frames go to the canvas through WebGPU. */
 let gpu: { present(width: number, height: number, smooth: boolean, hidden: number): void; readonly renderer: string | undefined } | null =
   null;
-/** The PS2's EE code is compiled to WebAssembly. */
-let compiled = false;
+/** What is compiled to WebAssembly (the PS2's EE and VUs, the PlayStation's
+ * CPU), for the player's status; null: all interpreted. */
+let compiled: string | null = null;
 /** A PS2 game's disc is in the drive (inserted by its own path). */
 let ps2Disc = false;
 let ring: Ring | null = null;
 /** Paints pictures drawn here (software, without a drawing worker). */
 let painter: Painter | null = null;
+/** The PlayStation's module's memory, where its pictures are (`picture`);
+ * null for the PS2. */
+let ps1Memory: WebAssembly.Memory | null = null;
 /** The PlayStation's scaled picture drawn in another worker (see
  * draw-worker.ts): it, whether it is ready for more, the recordings not
  * sent yet, a screenshot awaited. */
@@ -113,8 +117,51 @@ function joinRoom(room: RoomSnapshot) {
 /**
  * Reads bytes of a disc image file. Synchronous: the core reads sectors in
  * the middle of an instruction. Allowed in workers; the core caches chunks.
+ * The chunk after each is read ahead, in the background: games stream their
+ * discs, and a chunk read when needed stalls emulation as long as the
+ * server takes (it may unzip the image).
  */
 function readFile(file: number, offset: number, length: number): Uint8Array {
+  const key = `${gameId ?? ""} ${file} ${offset} ${length}`;
+  const ready = readAhead.get(key);
+  readAhead.delete(key);
+  const data = ready ?? readNow(file, offset, length);
+  readNext(file, offset + length, length);
+  return data;
+}
+
+/** Chunks read ahead (see `readFile`), by game, file, offset and length;
+ * and those under way. */
+const readAhead = new Map<string, Uint8Array>();
+const readingAhead = new Set<string>();
+/** Chunks read ahead and not asked for are dropped past this many. */
+const READ_AHEAD_KEPT = 8;
+
+function readNext(file: number, offset: number, length: number) {
+  const id = gameId ?? "";
+  const key = `${id} ${file} ${offset} ${length}`;
+  if (readAhead.has(key) || readingAhead.has(key)) return;
+  readingAhead.add(key);
+  // Past the file's end, or at its shorter last chunk: nothing kept (the
+  // core reads it when it needs it).
+  fetch(`/api/games/${encodeURIComponent(id)}/files/${file}`, {
+    headers: { Range: `bytes=${offset}-${offset + length - 1}` },
+  })
+    .then(async (resp) => {
+      const data = new Uint8Array(await resp.arrayBuffer());
+      if (resp.status !== 206 || data.length !== length) return;
+      readAhead.set(key, data);
+      // The oldest first (a Map keeps insertion order).
+      for (const old of readAhead.keys()) {
+        if (readAhead.size <= READ_AHEAD_KEPT) break;
+        readAhead.delete(old);
+      }
+    })
+    .catch(() => {})
+    .finally(() => readingAhead.delete(key));
+}
+
+function readNow(file: number, offset: number, length: number): Uint8Array {
   const xhr = new XMLHttpRequest();
   xhr.open("GET", `/api/games/${encodeURIComponent(gameId ?? "")}/files/${file}`, false);
   xhr.responseType = "arraybuffer";
@@ -141,10 +188,10 @@ function fetchSbi(id: string): Promise<Uint8Array | null> {
   return fetchBytes(`/api/games/${encodeURIComponent(id)}/sbi`);
 }
 
-/** What the PS2 runs on, for the player's status: the GS on the GPU, the
- * EE's code compiled. */
+/** What the console runs on, for the player's status: drawing on the GPU,
+ * code compiled. */
 function renderer(): string | null {
-  const parts = [gpu ? (gpu.renderer ? `WebGPU (${gpu.renderer})` : "WebGPU") : null, compiled ? "EE and VUs compiled" : null];
+  const parts = [gpu ? (gpu.renderer ? `WebGPU (${gpu.renderer})` : "WebGPU") : null, compiled];
   const shown = parts.filter((p) => p !== null);
   return shown.length > 0 ? shown.join(" · ") : null;
 }
@@ -174,7 +221,7 @@ function startVu1Worker(ps2emu: Ps2Emulator) {
   const ops = Pipe.create(OPS_BYTES);
   const records = Pipe.create(RECORDS_BYTES);
   const worker = new Worker(new URL("./vu1-worker.ts", import.meta.url), { type: "module" });
-  worker.postMessage({ ops, records, compiler: compiled } satisfies ToVu1);
+  worker.postMessage({ ops, records, compiler: compiled !== null } satisfies ToVu1);
   const link = new Vu1Link(ops, records);
   ps2emu.setVu1Worker(
     (batch: Uint8Array) => link.send(batch),
@@ -201,7 +248,7 @@ async function start(msg: StartMessage) {
     try {
       ps2emu.setCompiler(true);
       ps2emu.setVuCompiler(true);
-      compiled = true;
+      compiled = "EE and VUs compiled";
     } catch (e) {
       console.warn("The EE's and VUs' compilers are not available, interpreting:", e);
     }
@@ -221,11 +268,20 @@ async function start(msg: StartMessage) {
       );
     }
   } else {
-    await init();
+    ps1Memory = (await init()).memory;
     // Scaled drawing on the GPU, where the browser has WebGPU.
     const onGpu = (await webgpu()) ? await Emulator.withGpu(bios, msg.canvas).catch(gpuFailed) : null;
     gpu = onGpu;
     emu = onGpu ?? new Emulator(bios);
+    // The CPU's code compiled to WebAssembly as it runs (it runs exactly as
+    // interpreted: netplay peers may differ); interpreted if this browser
+    // will not make modules.
+    try {
+      emu.setCompiler(true);
+      compiled = "CPU compiled";
+    } catch (e) {
+      console.warn("The CPU's compiler is not available, interpreting:", e);
+    }
     gameId = msg.gameId;
   }
   if (gameId && !ps2Disc) {
@@ -237,6 +293,8 @@ async function start(msg: StartMessage) {
       (msg.sbi ? await fetchSbi(gameId) : undefined) ?? undefined,
     );
   }
+  // Codes from the start (a netplay room's, for everyone the same).
+  if (msg.codes) applyCodes(msg.codes);
   // A guest gets the host's memory cards with the game's state.
   const guest = msg.room !== null && msg.room.me !== msg.room.host;
   ownCards = !guest;
@@ -257,13 +315,13 @@ async function start(msg: StartMessage) {
     emu.setDrawingElsewhere(true);
   } else if (!gpu) {
     // On the GPU, the canvas is WebGPU's: no 2D context.
-    painter = new Painter(canvas);
+    painter = makePainter(canvas);
   }
   smooth = msg.smooth;
   ring = msg.audio ? new Ring(msg.audio) : null;
   chosenScale = autoScale = msg.scale;
   emu.setResolutionScale(msg.scale);
-  post({ type: "started", pal: emu.isPal, bios: emu.biosInfo(), renderer: renderer() });
+  post({ type: "started", pal: emu.isPal, bios: emu.biosInfo(), renderer: renderer(), precise: preciseShown() });
   if (msg.room) pendingRoom = msg.room;
   if (pendingRoom) joinRoom(pendingRoom);
   pendingRoom = null;
@@ -284,6 +342,38 @@ function frameInterval(): number {
   return 1000 / (emu?.isPal ? 49.76 : 59.83);
 }
 
+/** Applies cheat and patch codes (the PlayStation's: the PS2's module has
+ * none): their settings first (CPU speed, RAM size), then the codes;
+ * those refused are reported. */
+function applyCodes(set: CodeSet | null) {
+  const e = emu as {
+    setCodes?: (codes: string) => string;
+    setOverclock?: (percent: number) => void;
+    setRamSize?: (mib: number) => void;
+  } | null;
+  if (!e?.setCodes) return;
+  e.setOverclock?.(set?.overclock ?? 100);
+  e.setRamSize?.(set?.ramMiB ?? 2);
+  // A code a block: its activation and name, then its lines.
+  const text = (set?.codes ?? []).map((c) => `${c.activation}\t${c.name}\n${c.body}`).join("\n\n");
+  const refused = e
+    .setCodes(text)
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => {
+      const [name = "", why = ""] = line.split("\t");
+      return [name, why] as [string, string];
+    });
+  if (refused.length) post({ type: "codes-refused", refused });
+}
+
+/** Whether precise geometry can be shown: its triangles are recorded, for
+ * the GPU or the drawing worker (the scaled picture drawn here, in
+ * software, has no precise triangles). */
+function preciseShown(): boolean {
+  return gpu !== null || drawer !== null;
+}
+
 /** Runs frames as needed, paced by the audio queue when there is audio. */
 function tick() {
   if (!emu || paused) return;
@@ -294,8 +384,12 @@ function tick() {
       // As many frames as fit in a slice of time, then the page's turn.
       while (performance.now() - now < FAST_SLICE_MS && advance()) ran++;
     } else if (ring && audioRunning) {
-      // Keep the audio queue filled; the audio clock paces emulation.
-      while (ring.available() < AUDIO_TARGET && ran < 4 && advance()) ran++;
+      // Keep the audio queue filled; the audio clock paces emulation. A
+      // frame a tick, each shown (the next tick is 4 ms away); several, of
+      // which only the last is shown, only to catch up when the queue runs
+      // low.
+      const most = ring.available() < AUDIO_TARGET / 2 ? 4 : 1;
+      while (ring.available() < AUDIO_TARGET && ran < most && advance()) ran++;
     } else {
       while (now >= nextFrameAt && ran < 4 && advance()) {
         nextFrameAt += frameInterval();
@@ -392,7 +486,12 @@ function draw() {
     sendDrawings();
     return;
   }
-  painter?.paint(emu.frame() as Uint8ClampedArray<ArrayBuffer>, emu.frameWidth, emu.frameHeight, viewport, smooth, hidden);
+  if (!painter) return;
+  // The PlayStation's 15-bit picture, unconverted, where the painter takes
+  // it (WebGL); else RGBA (the PS2's pictures, 24-bit ones, a 2D canvas).
+  const layout = painter.takes15 && ps1Memory ? (emu as Emulator).picture() : undefined;
+  if (layout && ps1Memory) painter.paint15(ps1Memory.buffer, layout, viewport, smooth, hidden);
+  else painter.paint(emu.frame() as Uint8ClampedArray<ArrayBuffer>, emu.frameWidth, emu.frameHeight, viewport, smooth, hidden);
 }
 
 async function compress(data: Uint8Array, format: "gzip", decompress = false): Promise<Uint8Array> {
@@ -440,7 +539,7 @@ async function screenshot(): Promise<Blob | null> {
     else drawings.push(new ArrayBuffer(0));
     return shot;
   }
-  return painter ? painter.picture.convertToBlob({ type: "image/png" }) : null;
+  return painter ? painter.screenshot() : null;
 }
 
 /** Each second: lowers the resolution while emulation (or drawing) lags
@@ -583,10 +682,12 @@ scope.onmessage = (e: MessageEvent<ToWorker>) => {
       // Switching to the timer: start counting from now.
       nextFrameAt = performance.now();
       break;
+    case "codes":
+      applyCodes(msg.set);
+      break;
     case "precise":
-      // The PlayStation's only (the PS2's module has none), and on the GPU
-      // only: software drawing has no precise triangles.
-      (emu as { setPreciseGeometry?: (on: boolean) => void } | null)?.setPreciseGeometry?.(msg.on && gpu !== null);
+      // The PlayStation's only (the PS2's module has none).
+      (emu as { setPreciseGeometry?: (on: boolean) => void } | null)?.setPreciseGeometry?.(msg.on && preciseShown());
       break;
     case "widescreen":
       (emu as { setWidescreen?: (on: boolean) => void } | null)?.setWidescreen?.(msg.on);

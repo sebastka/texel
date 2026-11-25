@@ -59,7 +59,7 @@ The emulators run entirely in the browser: the server serves the web app, the BI
 - **Library** (`library.rs`): each console's BIOS and game directories, several of each, merged (D52). BIOS images are identified by their content wherever they are, zipped or not: the PS1's by their version string, the PS2's by their ROM's file system and `ROMVER`; the PS2's other firmware (DVD player, arcade boards' BIOSes, the MechaCon's) is listed apart and never booted (D62). Games are found as CUE/BIN, ISO, BIN, CHD, PBP or zips of these, and identified by the serial in their `SYSTEM.CNF` (through libretro's Redump-derived DAT) or by their track sizes; Redump's names group multi-disc games. A game's YAML file (next to it, or named after its serial anywhere in its directories, D8) points to its details when the automatic lookup fails. A loose BIN gets Redump's CUE sheet, and a LibCrypt-protected PS1 disc Redump's SBI file (D19, D53, D54).
 - **Compressed images** (`images.rs`, `zipimage.rs`): CHD and PBP are decompressed by the server, which presents their tracks as BIN files (D11). Zipped images are read in the zip, without unpacking it: a deflated image is indexed once (a resume point every 4 MiB, kept in the state directory, about 1% of the image), then read from the nearest point (D51, D56).
 - **Verification** (`verify.rs`): games are hashed in the background, track by track, against Redump's SHA-1s; hashes are kept in the database by path, size and modification time. Files read once in bulk (hashed, indexed) are dropped from the page cache as they are read (`pagecache.rs`).
-- **Metadata** (`dat.rs`, `metadata.rs`, `infobox.rs`, `openbios.rs`): DATs, artwork and game details, cached in the state directory; the browser never contacts third parties (the server proxies the artwork). Artwork is looked for under Redump's name, then under the older names and other casings libretro-thumbnails keeps (D58).
+- **Metadata** (`dat.rs`, `metadata.rs`, `infobox.rs`, `openbios.rs`, `codes.rs`): DATs, artwork and game details, cached in the state directory; the browser never contacts third parties (the server proxies the artwork). Artwork is looked for under Redump's name, then under the older names and other casings libretro-thumbnails keeps (D58).
 
   | Source | Used for |
   |---|---|
@@ -74,6 +74,7 @@ The emulators run entirely in the browser: the server serves the web app, the BI
   | [Wikipedia](https://en.wikipedia.org/) | Game descriptions (CC BY-SA, credited on the game page) |
   | [Wikidata](https://www.wikidata.org/) | Genres, developers, publishers, game modes, release date |
   | [IGDB](https://www.igdb.com/) (optional) | Fills what Wikipedia and Wikidata lack; rating |
+  | [DuckStation's database](https://github.com/duckstation/chtdb) | PS1 cheat and patch codes (draw distance, 60 fps, widescreen...); each code is its author's (D67) |
 
 - **Accounts** (`auth/`): OpenID Connect (the server is the client: authorization code with PKCE) or invitations (Argon2id passwords); the browser holds a session cookie only. Requests that change something must come from Texel's own pages (`Sec-Fetch-Site`, `Origin`) (D44).
 - **Database** (`db.rs`): MariaDB or MySQL: users and sessions, invitations, memory cards (each user's own, per console), save states (with their screenshots), each game's chosen BIOS and cards, and verification hashes. The server creates its tables (D9, D48).
@@ -87,7 +88,7 @@ The emulators run entirely in the browser: the server serves the web app, the BI
 The player runs a console in workers:
 
 - **Emulation worker** (`worker.ts`): the PS1 or PS2 core (WebAssembly, D1, D26), paced by its audio (D3); the disc is read from the server sector by sector (`crates/web-disc`, D2). The cores compile their CPUs' code to WebAssembly modules as it runs (D30, D49).
-- **Drawing**: where the browser has WebGPU, the cores' drawing runs on the GPU (`crates/ps1-gpu`, `crates/ps2-gpu`, D28, D29, D37, D39); the PS1's scaled drawing otherwise runs in software in a draw worker (`draw-worker.ts`), on another core (D40).
+- **Drawing**: where the browser has WebGPU, the cores' drawing runs on the GPU (`crates/ps1-gpu`, `crates/ps2-gpu`, D28, D29, D37, D39); the PS1's scaled drawing otherwise runs in software in a draw worker (`draw-worker.ts`), on another core (D40). Pictures drawn in software are shown through WebGL 2 (`paint.ts`): the PS1's as its VRAM holds them, read from the module's memory and unpacked by a shader, the PS2's as RGBA; on a 2D canvas where there is no WebGL 2 (D64).
 - **Audio**: samples go to an audio worklet (`audio-worklet.ts`) through a ring in a `SharedArrayBuffer`.
 - **VU1 worker** (`vu1-worker.ts`, PS2): VU1 and VIF1 run beside the EE, fed through pipes in `SharedArrayBuffer`s, when the page is cross-origin isolated and the machine has four cores or more (D57).
 
@@ -182,6 +183,8 @@ The GS on the GPU (`crates/ps2-gpu`, with wgpu: Vulkan, Metal or DirectX 12 nati
 The compilers and VU1's worker are checked in WebAssembly with Node.js (in `frontend`, after `pnpm run wasm`), each failing unless both machines reach the same state every second:
 
 ```sh
+node scripts/check-ps1-compiler.mjs BIOS DISC.cue [SECONDS]              # the PlayStation's CPU compiled and interpreted
+node scripts/check-ps1-lockstep.mjs BIOS DISC.cue [CYCLES]               # the same, in step: where they part, if they do
 node scripts/check-ps2-compiler.mjs PS2-BIOS [SECONDS] [DISC.iso STATE]   # the EE's code compiled and interpreted
 node scripts/check-ps2-vu.mjs PS2-BIOS DISC.iso STATE [SECONDS]          # the VUs' microprograms compiled and interpreted
 node scripts/check-ps2-vu1-worker.mjs PS2-BIOS SECONDS DISC.iso STATE      # VU1 inline and in a worker

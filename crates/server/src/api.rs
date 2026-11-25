@@ -77,6 +77,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/games/{id}", get(game_detail))
         .route("/games/{id}/files/{index}", get(game_file))
         .route("/games/{id}/sbi", get(game_sbi))
+        .route("/games/{id}/codes", get(game_codes))
         .route("/games/{id}/images/{kind}", get(game_image))
         .route(
             "/games/{id}/cards",
@@ -319,8 +320,12 @@ struct GameJson {
     #[serde(flatten)]
     identity: Identity,
     error: Option<String>,
-    /// Every disc of a multi-disc game, this one included; empty otherwise.
+    /// Every disc of a multi-disc game in the library, this one included;
+    /// empty otherwise.
     discs: Vec<crate::state::DiscRef>,
+    /// The numbers of its other discs that Redump lists, not in the
+    /// library.
+    missing_discs: Vec<u32>,
 }
 
 async fn game_json(state: &AppState, g: &Game, groups: &HashMap<String, DiscGroup>) -> GameJson {
@@ -332,6 +337,7 @@ async fn game_json(state: &AppState, g: &Game, groups: &HashMap<String, DiscGrou
         identity: state.identify(g).await,
         error: g.error.clone(),
         discs: groups.get(&g.id).map(|gr| gr.discs.clone()).unwrap_or_default(),
+        missing_discs: groups.get(&g.id).map(|gr| gr.missing.clone()).unwrap_or_default(),
     }
 }
 
@@ -449,6 +455,18 @@ async fn game_detail(State(state): AppStateRef, viewer: Viewer, Path(id): Path<S
         overrides_error: g.overrides_error.clone(),
     })
     .into_response()
+}
+
+/// A PlayStation game's cheat and patch codes (see `codes`).
+async fn game_codes(State(state): AppStateRef, viewer: Viewer, Path(id): Path<String>) -> Response {
+    if !viewer.may_read(&state, Some(&id), None) {
+        return forbidden();
+    }
+    let lib = state.library.read().await.clone();
+    let Some(game) = lib.game(&id) else {
+        return not_found("game");
+    };
+    Json(crate::codes::for_game(&state, game).await).into_response()
 }
 
 /// The SBI file of a protected disc, for the emulator.
@@ -816,6 +834,7 @@ async fn rescan(State(state): AppStateRef, _: Admin) -> StatusCode {
             if s.refresh_dats(false).await {
                 s.rescan().await;
             }
+            crate::codes::refresh(&s).await;
         });
     }
     StatusCode::NO_CONTENT

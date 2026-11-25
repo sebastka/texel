@@ -1,0 +1,10 @@
+# Dragon Ball - Final Bout (Europe). No patch yet: what other releases' patches do, and
+# why they were not ported, so that nobody looks again for nothing.
+; Serials: SLES-03735
+;
+; Skipped: "Widescreen 16:9" (Spain, SLES-03685, by PeterDelta, in DuckStation's
+; database). It sets two halfwords of 0x1000 (1.0) to 0x1555 (4/3) and 0x0C00 (3/4), at
+; 8002F988 and 8003BD80 in the Spanish build. They are data, or code loaded from the disc
+; while the game runs (the boot executable holds a table there); the European build has
+; 0x1000 at both addresses too, but setting them changes nothing on screen (checked in a
+; fight), and the lines alone do not tell which values they are elsewhere.

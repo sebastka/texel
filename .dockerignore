@@ -2,6 +2,7 @@
 *
 !Cargo.toml
 !Cargo.lock
+!.cargo/
 !rust-toolchain.toml
 !crates/
 !frontend/

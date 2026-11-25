@@ -4,7 +4,7 @@ import type { Console, GameDetail } from "./api";
 import { createRing } from "./audio";
 import workletUrl from "./audio-worklet.ts?worker&url";
 import { Input } from "./input";
-import type { FromWorker, NetStatus, Ports, RoomSnapshot, Slots, SplitView, StartMessage, ToWorker } from "./protocol";
+import type { CodeSet, FromWorker, NetStatus, Ports, RoomSnapshot, Slots, SplitView, StartMessage, ToWorker } from "./protocol";
 
 interface Callbacks {
   onStatus: (s: string) => void;
@@ -14,7 +14,10 @@ interface Callbacks {
   /** The first controller's analog mode changed (by the user or the game). */
   onAnalog: (analog: boolean) => void;
   /** Running: with what renderer (WebGPU, or null for software). */
-  onStarted?: (renderer: string | null) => void;
+  /** precise: precise geometry can be shown. */
+  onStarted?: (renderer: string | null, precise: boolean) => void;
+  /** Codes the emulator refused, and why. */
+  onCodesRefused?: (refused: [string, string][]) => void;
   /** The room's game, as this player runs it. */
   onNet?: (status: NetStatus) => void;
   /** A message for the room. */
@@ -93,9 +96,9 @@ export class Player {
   private resize: ResizeObserver | null = null;
   /** Smooth (bilinear) scaling, rather than sharp pixels. */
   smooth = loadSmooth();
-  /** PlayStation enhancements: precise geometry (on by default: it only
-   * changes the picture), widescreen (off: it changes the game). */
-  precise = loadFlag(PRECISE_KEY, true);
+  /** PlayStation enhancements, off unless chosen: precise geometry (it
+   * only changes the picture), widescreen (it changes the game). */
+  precise = loadFlag(PRECISE_KEY, false);
   widescreen = loadFlag(WIDESCREEN_KEY, false);
   /** Internal resolution multiplier. */
   scale = loadScale();
@@ -116,7 +119,7 @@ export class Player {
 
   /** Starts a game with the user's memory `cards`; with `room`, as that
    * netplay room's game (a guest then gets the host's cards). */
-  async start(biosId: string, game: GameDetail, cards: Slots, room: RoomSnapshot | null = null) {
+  async start(biosId: string, game: GameDetail, cards: Slots, room: RoomSnapshot | null = null, codes: CodeSet | null = null) {
     await this.launch({
       console: "ps1",
       biosId,
@@ -126,7 +129,13 @@ export class Player {
       files: game.files,
       sbi: game.sbi,
       room,
+      codes,
     });
+  }
+
+  /** The cheat and patch codes enabled from now on. */
+  setCodes(set: CodeSet | null) {
+    this.send({ type: "codes", set: set ?? { codes: [], overclock: 100, ramMiB: 2, wide: false, noGteWidescreen: false } });
   }
 
   /** A console: its BIOS, to its menu, or for the PS2 with a game's disc
@@ -141,10 +150,11 @@ export class Player {
       files: game?.files ?? [],
       sbi: false,
       room: null,
+      codes: null,
     });
   }
 
-  private async launch(what: Pick<StartMessage, "console" | "biosId" | "gameId" | "cards" | "cue" | "files" | "sbi" | "room">) {
+  private async launch(what: Pick<StartMessage, "console" | "biosId" | "gameId" | "cards" | "cue" | "files" | "sbi" | "room" | "codes">) {
     const canvas = document.createElement("canvas");
     canvas.width = 640;
     canvas.height = 480;
@@ -218,12 +228,15 @@ export class Player {
 
   private onMessage(msg: FromWorker) {
     switch (msg.type) {
+      case "codes-refused":
+        this.cb.onCodesRefused?.(msg.refused);
+        break;
       case "started":
         this.pal = msg.pal;
         this.renderer = msg.renderer;
         this.send({ type: "precise", on: this.precise });
         this.send({ type: "widescreen", on: this.widescreen });
-        this.cb.onStarted?.(msg.renderer);
+        this.cb.onStarted?.(msg.renderer, msg.precise);
         this.cb.onStatus("Running");
         break;
       case "stats":

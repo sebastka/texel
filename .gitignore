@@ -1,5 +1,6 @@
 # Everything starting with a dot is ignored, except what is listed below.
 .*
+!.cargo
 !.github
 !.dockerignore
 !.envrc

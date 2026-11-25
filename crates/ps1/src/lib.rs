@@ -6,6 +6,7 @@
 
 pub mod bus;
 mod cdrom;
+pub mod cheats;
 pub mod cpu;
 mod dma;
 mod gpu;
@@ -22,6 +23,7 @@ pub mod jit;
 
 pub use bios::{BiosInfo, Region};
 pub use cdrom::DiscImage;
+pub use gpu::Picture;
 /// What the GPU records for another renderer (see `System::set_gpu_recording`).
 pub mod gpu_record {
     pub use crate::gpu::replay::Replay;
@@ -123,10 +125,15 @@ pub struct System {
     bus: Bus,
     bios_info: BiosInfo,
     exe: Option<Vec<u8>>,
+    /// The last frame, RGBA8888, made when asked for (`frame`): renderers
+    /// that take VRAM's colours (`picture`) do without.
     frame: Vec<u8>,
     frame_size: (usize, usize),
+    frame_stale: bool,
     /// The CPU's code compiled to WebAssembly (browsers), when set.
     jit: Option<Box<jit::Jit>>,
+    /// Cheat and patch codes enabled (see `set_codes`).
+    cheats: cheats::Cheats,
     /// Enhancements on (see `set_precise_geometry`, `set_widescreen`): kept
     /// across resets and restored states.
     precise: bool,
@@ -145,7 +152,9 @@ impl System {
             exe: None,
             frame: Vec::new(),
             frame_size: (0, 0),
+            frame_stale: false,
             jit: None,
+            cheats: cheats::Cheats::default(),
             precise: false,
             widescreen: false,
         })
@@ -224,8 +233,12 @@ impl System {
     /// Runs until the GPU starts its next vertical blank.
     pub fn run_frame(&mut self) {
         self.bus.gpu.frame_ready = false;
+        if !self.cheats.is_empty() {
+            let pad = self.cheat_pad();
+            self.cheats.run(cheats::Activation::StartFrame, &mut self.bus, pad);
+        }
         // A frame is ~570k cycles; bail out after two in case video is off.
-        let mut budget = 2 * CPU_CLOCK / 50;
+        let mut budget = 2 * CPU_CLOCK / 50 * self.bus.overclock() / 100;
         while !self.bus.gpu.frame_ready && budget > 0 {
             // A compiled block counts its cycles into `pending` itself.
             let compiled = self.exe.is_none()
@@ -236,7 +249,7 @@ impl System {
             let cycles = if compiled { 0 } else { self.cpu.step(&mut self.bus) };
             self.bus.pending += cycles;
             // Peripherals also catch up on every I/O access (see Bus::sync).
-            if self.bus.pending >= 64 {
+            if self.bus.pending >= self.bus.deadline {
                 budget = budget.saturating_sub(self.bus.pending);
                 self.bus.sync();
             }
@@ -246,12 +259,134 @@ impl System {
                 self.start_exe(&exe);
             }
         }
-        self.frame_size = self.bus.gpu.render_display(&mut self.frame);
+        if !self.cheats.is_empty() {
+            let pad = self.cheat_pad();
+            self.cheats.run(cheats::Activation::EndFrame, &mut self.bus, pad);
+        }
+        self.frame_size = self.bus.gpu.display_dims();
+        self.frame_stale = true;
+        // The blocks compiled this frame, installed.
+        if let Some(jit) = &mut self.jit {
+            jit.end_frame();
+        }
+    }
+
+    /// Diagnostics: one turn of `run_frame`'s loop (a compiled block, or
+    /// an instruction, then the peripherals when due): the cycles run so
+    /// far. Two machines stepped so can be compared where their cycle
+    /// counts meet (the compiler against the interpreter).
+    #[doc(hidden)]
+    pub fn debug_step(&mut self) -> u64 {
+        let compiled = self.exe.is_none()
+            && self
+                .jit
+                .as_mut()
+                .is_some_and(|jit| jit.run(&mut self.cpu, &mut self.bus));
+        let cycles = if compiled { 0 } else { self.cpu.step(&mut self.bus) };
+        self.bus.pending += cycles;
+        if self.bus.pending >= self.bus.deadline {
+            self.bus.sync();
+        }
+        self.bus.elapsed + u64::from(self.bus.pending)
+    }
+
+    /// Diagnostics: how many cycles the CPU runs between the peripherals'
+    /// catching up (the default: [`bus::SLICE`]).
+    #[doc(hidden)]
+    pub fn debug_set_slice(&mut self, cycles: u32) {
+        self.bus.slice = cycles.max(1);
+        self.bus.deadline = self.bus.slice;
+    }
+
+    /// Diagnostics: the CPU's pc (cheap, unlike `debug_cpu`).
+    #[doc(hidden)]
+    pub fn debug_pc(&self) -> u32 {
+        self.cpu.pc
+    }
+
+    /// Diagnostics: the CPU's state, field by field.
+    #[doc(hidden)]
+    pub fn debug_cpu_fields(&self) -> Vec<(&'static str, String)> {
+        self.cpu.debug_fields()
+    }
+
+    /// Diagnostics: a checksum of the CPU's state (registers, COP0, the
+    /// GTE), and its pc.
+    #[doc(hidden)]
+    pub fn debug_cpu(&self) -> (u64, u32) {
+        let bytes = postcard::to_stdvec(&self.cpu).unwrap_or_default();
+        (fnv1a(&bytes), self.cpu.pc)
+    }
+
+    /// The cheat and patch codes enabled from now on, in order (see
+    /// `cheats`): (name, body with options filled in, activation). Those
+    /// no longer enabled put back what they replaced. Returns the codes
+    /// refused, and why. They change what the console computes: netplay
+    /// peers must enable the same at the same frames.
+    pub fn set_codes(&mut self, codes: &[(String, String, cheats::Activation)]) -> Vec<(String, String)> {
+        let mut ok = Vec::new();
+        let mut refused = Vec::new();
+        for (name, body, activation) in codes {
+            match cheats::Code::parse(name, body, *activation) {
+                Ok(code) => ok.push(code),
+                Err(e) => refused.push((name.clone(), e)),
+            }
+        }
+        let pad = self.cheat_pad();
+        self.cheats.set(ok, &mut self.bus, pad);
+        refused
+    }
+
+    /// Port 1's controller, as codes read it (jokers).
+    fn cheat_pad(&self) -> cheats::Pad {
+        let p = &self.bus.sio.pads[0];
+        cheats::Pad {
+            buttons: p.buttons,
+            axes: p.axes,
+        }
+    }
+
+    /// RAM's size: 2 MiB, or 8 MiB as development consoles (some patches
+    /// need it). Compiled code is dropped: it knows RAM's place and size.
+    pub fn set_ram_size(&mut self, bytes: usize) {
+        let bytes = if bytes > bus::RAM_SIZE {
+            bus::RAM_MAX
+        } else {
+            bus::RAM_SIZE
+        };
+        if bytes != self.bus.ram.len() {
+            self.bus.set_ram_size(bytes);
+            if let Some(jit) = &mut self.jit {
+                jit.clear();
+            }
+        }
+    }
+
+    /// The CPU's speed, in percent (100: the console's; some patches need
+    /// more).
+    pub fn set_overclock(&mut self, percent: u32) {
+        self.bus.set_overclock(percent);
     }
 
     /// The last frame, RGBA8888, and its size.
-    pub fn frame(&self) -> (&[u8], usize, usize) {
+    pub fn frame(&mut self) -> (&[u8], usize, usize) {
+        if std::mem::take(&mut self.frame_stale) {
+            self.frame_size = self.bus.gpu.render_display(&mut self.frame);
+        }
         (&self.frame, self.frame_size.0, self.frame_size.1)
+    }
+
+    /// The last frame's size (without making it).
+    pub fn frame_size(&self) -> (usize, usize) {
+        self.frame_size
+    }
+
+    /// The last frame as VRAM holds it (15-bit colours), for a renderer
+    /// that converts them itself; `None` when only `frame` has it (24-bit
+    /// pictures, the display off, drawing recorded). `wrapped`: room for a
+    /// picture wrapping around VRAM's edges.
+    pub fn picture<'a>(&'a self, wrapped: &'a mut Vec<u16>) -> Option<Picture<'a>> {
+        self.bus.gpu.picture(wrapped)
     }
 
     /// Sets the internal resolution multiplier (1 to 4): polygons are

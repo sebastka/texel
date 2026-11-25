@@ -80,11 +80,20 @@ enum Exception {
 /// Reset vector, in the BIOS.
 pub const RESET_PC: u32 = 0xbfc0_0000;
 
+/// Saves a field that only holds the instruction being executed (every
+/// step sets it before reading it) as its default: kept in the save states'
+/// format, but the state between instructions no longer depends on how the
+/// last one ran (interpreted or compiled), so the two compare equal.
+fn scratch<T: Default + serde::Serialize, S: serde::Serializer>(_: &T, s: S) -> Result<S::Ok, S::Error> {
+    T::default().serialize(s)
+}
+
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct Cpu {
     pub pc: u32,
     pub(crate) next_pc: u32,
     /// Address of the instruction being executed, for EPC.
+    #[serde(serialize_with = "scratch")]
     current_pc: u32,
     pub(crate) regs: [u32; 32],
     /// The same as `regs` between instructions: kept for the save states'
@@ -103,6 +112,7 @@ pub struct Cpu {
     hi: u32,
     lo: u32,
     pub(crate) branch: bool,
+    #[serde(serialize_with = "scratch")]
     delay_slot: bool,
     // Coprocessor 0.
     pub(crate) sr: u32,
@@ -129,10 +139,12 @@ pub struct Cpu {
     pub watch: Option<u32>,
     #[serde(skip)]
     pub watched: Vec<(u32, u32, u32)>,
+    #[serde(serialize_with = "scratch")]
     current_instruction: u32,
     /// Cycles elapsed since reset.
     pub cycles: u64,
     /// Extra cycles of the instruction being executed (memory, stalls).
+    #[serde(serialize_with = "scratch")]
     extra: u32,
     /// When the multiplier/divider and the GTE have their results ready.
     hilo_ready: u64,
@@ -192,6 +204,48 @@ fn data_access_cycles(addr: u32) -> u32 {
 }
 
 impl Cpu {
+    /// Diagnostics: the state, field by field.
+    #[doc(hidden)]
+    pub fn debug_fields(&self) -> Vec<(&'static str, String)> {
+        let gte = postcard::to_stdvec(&self.gte).unwrap_or_default();
+        let gte = gte.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| {
+            (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+        });
+        vec![
+            ("pc", format!("{:08x}", self.pc)),
+            ("next_pc", format!("{:08x}", self.next_pc)),
+            ("current_pc", format!("{:08x}", self.current_pc)),
+            ("regs", format!("{:08x?}", self.regs)),
+            ("out_regs", format!("{:08x?}", self.out_regs)),
+            ("load", format!("{:?}", self.load)),
+            ("hi/lo", format!("{:08x} {:08x}", self.hi, self.lo)),
+            ("branch", format!("{}", self.branch)),
+            ("delay_slot", format!("{}", self.delay_slot)),
+            (
+                "sr/cause/epc/bad",
+                format!(
+                    "{:08x} {:08x} {:08x} {:08x}",
+                    self.sr, self.cause, self.epc, self.bad_vaddr
+                ),
+            ),
+            ("gte", format!("{gte:016x}")),
+            ("current_instruction", format!("{:08x}", self.current_instruction)),
+            ("cycles", format!("{}", self.cycles)),
+            ("extra", format!("{}", self.extra)),
+            (
+                "hilo_ready/gte_ready",
+                format!("{} {}", self.hilo_ready, self.gte_ready),
+            ),
+            ("icache", {
+                let valid = self.icache.iter().filter(|&&t| t != 0).count();
+                let h = self.icache.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &t| {
+                    (h ^ u64::from(t)).wrapping_mul(0x0100_0000_01b3)
+                });
+                format!("{valid} valid, {h:016x}")
+            }),
+        ]
+    }
+
     pub fn new() -> Self {
         Self {
             pc: RESET_PC,

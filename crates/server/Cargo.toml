@@ -42,6 +42,8 @@ tower = { version = "0.5.3", default-features = false, features = ["util"] }
 tower-http = { version = "0.7.1", default-features = false, features = ["fs", "set-header", "trace", "limit"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["std", "fmt", "ansi", "env-filter", "json"] }
+# DuckStation's hash of a disc's build, which picks its cheat files (codes.rs).
+xxhash-rust = { version = "0.8.19", default-features = false, features = ["xxh64"] }
 zip = { version = "9.8.1", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
 # posix_fadvise (pagecache.rs).

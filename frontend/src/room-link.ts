@@ -4,7 +4,7 @@
 // host starts. While a game runs, the player's worker runs it in step
 // (netplay.ts): the room relays the game's messages, both ways.
 
-import type { ChatLine, Ports, RoomSnapshot, SplitView } from "./protocol";
+import type { ChatLine, CodeSet, Ports, RoomSnapshot, SplitView } from "./protocol";
 
 export interface RoomMember {
   id: number;
@@ -18,6 +18,8 @@ export interface RoomMember {
 export interface RoomGame {
   game: string;
   bios: string;
+  /** The cheat and patch codes the host plays with: everyone's. */
+  codes?: CodeSet | null;
 }
 
 export interface RoomEvents {
@@ -121,7 +123,7 @@ export class Room {
 
   /** Host: plays this game, or none (everyone follows). */
   load(game: RoomGame | null) {
-    if (this.isHost) this.sendText({ type: "load", game: game?.game ?? null, bios: game?.bios ?? null });
+    if (this.isHost) this.sendText({ type: "load", game: game?.game ?? null, bios: game?.bios ?? null, codes: game?.codes ?? null });
   }
 
   /** This member left the game (not the room): nobody waits for it. */
@@ -190,7 +192,7 @@ export class Room {
         this.me = Number(msg.you);
         this.host = Number(msg.host);
         this.epoch = Number(msg.epoch);
-        this.game = typeof msg.game === "string" ? { game: msg.game, bios: String(msg.bios) } : null;
+        this.game = typeof msg.game === "string" ? { game: msg.game, bios: String(msg.bios), codes: (msg.codes as CodeSet | null) ?? null } : null;
         this.ports = [[this.host], []];
         for (const m of msg.members as { id: number; name: string; registered: boolean }[]) {
           this.members.set(m.id, { ...m, rtt: null });
@@ -244,7 +246,7 @@ export class Room {
         break;
       case "game":
         this.epoch = Number(msg.epoch);
-        this.game = typeof msg.game === "string" ? { game: msg.game, bios: String(msg.bios) } : null;
+        this.game = typeof msg.game === "string" ? { game: msg.game, bios: String(msg.bios), codes: (msg.codes as CodeSet | null) ?? null } : null;
         this.on.game(this.game);
         break;
       case "view":

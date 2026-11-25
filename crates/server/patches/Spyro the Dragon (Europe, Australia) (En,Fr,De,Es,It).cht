@@ -1,0 +1,69 @@
+# Spyro the Dragon (Europe, Australia). Texel's own patches, under Texel's licence (MIT),
+# after those for the American release (SCUS-94228) in DuckStation's database: the same
+# changes, found in the European executable by what its code does.
+; Serials: SCES-01438
+
+[50 FPS]
+Description = Draws 50 pictures a second rather than 25, the game running at its usual speed.
+Author = Texel
+Type = Gameshark
+Activation = EndFrame
+OverrideCPUOverclock = 200
+; The main loop (80015E00) takes the vertical blanks since the last frame (0x8E0(gp)),
+; at least 2, as the game's time step; each screen's loop waits for 2 vertical blanks
+; (VSync(-1) - last < 2): nine of them (gameplay 800240FC, pause 80020F14, the intro's
+; scenes 80023B0C...). With a step of 1 and waits of 1, the game moves as far each
+; second, in twice as many pictures (checked: the same run to Nestor in a level).
+; 80015E00: lw v0, 0x8E0(gp) -> addiu v0, zero, 1
+A7015E00 08E00001
+A7015E02 8F822402
+; 80015E0C: slti v0, v0, 2 -> slti v0, v0, 1
+A7015E0C 00020001
+; The waits: slti v0, v0, 2 -> 1 (two per loop).
+A701E22C 00020001
+A701E260 00020001
+A7020F14 00020001
+A7020F48 00020001
+A70212E4 00020001
+A7021318 00020001
+A7021FC4 00020001
+A7021FF8 00020001
+A7023010 00020001
+A7023044 00020001
+A7023548 00020001
+A702357C 00020001
+A7023B0C 00020001
+A7023B40 00020001
+A7023D00 00020001
+A7023D34 00020001
+A70240FC 00020001
+A7024130 00020001
+
+[Widescreen 16:9]
+Description = Draws the world 16:9: more of it to each side.
+Author = Texel
+Type = Gameshark
+Activation = EndFrame
+OverrideAspectRatio = 16:9
+DisableWidescreenRendering = True
+; The camera's matrices are built at 80038ED4: the pitch matrix's first element (1.0,
+; stored at 0x10(sp) by 80038EDC, in a call's delay slot) scales the picture's X. The
+; call (jal 8001A9BC) goes to a routine in unused BIOS RAM that stores 0.75 there
+; instead, then goes on to the function (its return address unchanged); t0 is free
+; across a call.
+AA00C000 00000003
+00000000 24080C00  ; 8000C000: addiu t0, zero, 0xC00
+00000000 08006A6F  ; 8000C004: j 0x8001A9BC
+00000000 A7A80010  ; 8000C008: sh t0, 0x10(sp)
+AA038ED8 00000001
+0C006A6F 0C003000  ; 80038ED8: jal 0x8001A9BC -> jal 0x8000C000
+
+[Disable Distance-Based Terrain Subdivision]
+Description = Draws the ground unsplit at any distance (as it is drawn far away), but very near the camera.
+Author = Texel
+Type = Gameshark
+Activation = EndFrame
+; After the tests for a vertex depth below 320 (kept), the unsplit path is taken.
+; 8002BD6C: bgtz t3 -> beq zero, zero (quads); 8002C2BC: the same (triangles).
+A702BD6E 1D601000
+A702C2BE 1D601000

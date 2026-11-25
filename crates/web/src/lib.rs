@@ -19,6 +19,8 @@ use wasm_bindgen::prelude::*;
 pub struct Emulator {
     system: System,
     audio: Vec<i16>,
+    /// Room for a picture wrapping around VRAM's edges (see `picture`).
+    wrapped: Vec<u16>,
     #[cfg(target_arch = "wasm32")]
     gpu: Option<texel_ps1_gpu::GpuRenderer>,
 }
@@ -30,6 +32,7 @@ impl Emulator {
         Ok(Self {
             system: System::new(bios)?,
             audio: Vec::with_capacity(4096),
+            wrapped: Vec::new(),
             #[cfg(target_arch = "wasm32")]
             gpu: None,
         })
@@ -62,6 +65,36 @@ impl Emulator {
         }
         let _ = on;
         Ok(())
+    }
+
+    /// Diagnostics: one step (a compiled block or an instruction): the
+    /// cycles run so far.
+    #[wasm_bindgen(js_name = debugStep)]
+    pub fn debug_step(&mut self) -> f64 {
+        self.system.debug_step() as f64
+    }
+
+    /// Diagnostics: the CPU's state's checksum (hex) and pc.
+    #[wasm_bindgen(js_name = debugCpu)]
+    pub fn debug_cpu(&self) -> String {
+        let (h, pc) = self.system.debug_cpu();
+        format!("{h:016x} {pc:08x}")
+    }
+
+    /// Diagnostics: the cycles between the peripherals' catching up.
+    #[wasm_bindgen(js_name = debugSetSlice)]
+    pub fn debug_set_slice(&mut self, cycles: u32) {
+        self.system.debug_set_slice(cycles);
+    }
+
+    /// Diagnostics: the CPU's state, a field per line.
+    #[wasm_bindgen(js_name = debugCpuFields)]
+    pub fn debug_cpu_fields(&self) -> String {
+        self.system
+            .debug_cpu_fields()
+            .iter()
+            .map(|(k, v)| format!("{k}: {v}\n"))
+            .collect()
     }
 
     /// What the compiler did, for diagnostics.
@@ -146,17 +179,24 @@ impl Emulator {
 
     #[wasm_bindgen(getter, js_name = frameWidth)]
     pub fn frame_width(&self) -> usize {
-        self.system.frame().1
+        self.system.frame_size().0
     }
 
     #[wasm_bindgen(getter, js_name = frameHeight)]
     pub fn frame_height(&self) -> usize {
-        self.system.frame().2
+        self.system.frame_size().1
     }
 
-    /// The last frame, RGBA8888.
-    pub fn frame(&self) -> js_sys::Uint8ClampedArray {
+    /// The last frame, RGBA8888 (made now: `picture` is cheaper).
+    pub fn frame(&mut self) -> js_sys::Uint8ClampedArray {
         js_sys::Uint8ClampedArray::from(self.system.frame().0)
+    }
+
+    /// The last frame as VRAM holds it, to show without converting it: where
+    /// its 15-bit pixels are in this module's memory (see `layout`), or
+    /// nothing when only `frame` has it.
+    pub fn picture(&mut self) -> Option<Vec<u32>> {
+        self.system.picture(&mut self.wrapped).map(|p| layout(&p))
     }
 
     /// Interleaved stereo samples at 44.1 kHz produced since the last call.
@@ -186,6 +226,57 @@ impl Emulator {
     #[wasm_bindgen(js_name = setPreciseGeometry)]
     pub fn set_precise_geometry(&mut self, on: bool) {
         self.system.set_precise_geometry(on);
+    }
+
+    /// The cheat and patch codes enabled from now on (see `texel_ps1::cheats`):
+    /// lines of `activation<TAB>name`, then the code's lines (its `?` digits
+    /// filled), codes separated by an empty line. Returns those refused, a
+    /// line each: `name<TAB>why`.
+    #[wasm_bindgen(js_name = setCodes)]
+    pub fn set_codes(&mut self, codes: &str) -> String {
+        use texel_ps1::cheats::Activation;
+        let parsed: Vec<(String, String, Activation)> = codes
+            .split("\n\n")
+            .filter_map(|block| {
+                let (head, body) = block.split_once('\n')?;
+                let (activation, name) = head.split_once('\t')?;
+                let activation = match activation {
+                    "StartFrame" => Activation::StartFrame,
+                    "Manual" => Activation::Manual,
+                    _ => Activation::EndFrame,
+                };
+                Some((name.to_owned(), body.to_owned(), activation))
+            })
+            .collect();
+        self.system
+            .set_codes(&parsed)
+            .into_iter()
+            .map(|(name, why)| format!("{name}\t{why}\n"))
+            .collect()
+    }
+
+    /// Diagnostics: the CPU's pc.
+    #[wasm_bindgen(js_name = debugPc)]
+    pub fn debug_pc(&self) -> u32 {
+        self.system.debug_pc()
+    }
+
+    /// Diagnostics: a word of memory, as the CPU reads it.
+    #[wasm_bindgen(js_name = debugRead32)]
+    pub fn debug_read32(&mut self, addr: u32) -> u32 {
+        self.system.debug_read32(addr)
+    }
+
+    /// The CPU's speed, in percent (some patches need more than 100).
+    #[wasm_bindgen(js_name = setOverclock)]
+    pub fn set_overclock(&mut self, percent: u32) {
+        self.system.set_overclock(percent);
+    }
+
+    /// RAM, in MiB: 2, or 8 as development consoles (some patches).
+    #[wasm_bindgen(js_name = setRamSize)]
+    pub fn set_ram_size(&mut self, mib: u32) {
+        self.system.set_ram_size(mib as usize * 1024 * 1024);
     }
 
     /// Widescreen: 3D squeezed for a 16:9 picture (changes what the console
@@ -300,6 +391,21 @@ pub struct Replayer {
     display: Option<texel_ps1::gpu_record::Display>,
     frame: Vec<u8>,
     size: (usize, usize),
+    /// Room for a picture wrapping around VRAM's edges (see `picture`).
+    wrapped: Vec<u16>,
+}
+
+/// A picture's place in this module's memory, for JavaScript to read it
+/// there (a view on the memory, no copy): the address of its pixels (bytes),
+/// how many there are (16-bit), the length of their rows, and the picture's
+/// position and size in them: `[address, length, stride, x, y, w, h]`. The
+/// view is valid until the module runs again.
+fn layout(p: &texel_ps1::Picture<'_>) -> Vec<u32> {
+    // In WebAssembly, an address is an offset in the memory.
+    [p.pixels.as_ptr() as usize, p.pixels.len(), p.stride, p.x, p.y, p.w, p.h]
+        .iter()
+        .map(|&v| v as u32)
+        .collect()
 }
 
 #[wasm_bindgen]
@@ -311,6 +417,7 @@ impl Replayer {
             display: None,
             frame: Vec::new(),
             size: (0, 0),
+            wrapped: Vec::new(),
         }
     }
 
@@ -344,6 +451,14 @@ impl Replayer {
     /// The last picture rendered, RGBA8888.
     pub fn frame(&self) -> js_sys::Uint8ClampedArray {
         js_sys::Uint8ClampedArray::from(&self.frame[..])
+    }
+
+    /// The displayed picture as the scaled VRAM holds it, to show without
+    /// converting it (see `Emulator::picture`); nothing when only `render`
+    /// and `frame` give it.
+    pub fn picture(&mut self) -> Option<Vec<u32>> {
+        let d = self.display?;
+        self.replay.picture(d, &mut self.wrapped).map(|p| layout(&p))
     }
 }
 

@@ -2,7 +2,7 @@
 //! they run as interpreted is checked in a browser's engine: see
 //! `frontend/scripts/check-ps1-compiler.mjs`).
 
-use super::compile::{Layout, compile};
+use super::compile::{Layout, batch, compile};
 use crate::bus::Bus;
 use crate::cpu::Cpu;
 
@@ -13,8 +13,12 @@ fn check(pc: u32, words: &[u32], icache: bool) -> u32 {
     let ram = (pc & 0x1fff_ffff < 0x0080_0000).then_some((pc & 0x1f_ffff, (pc & 0x1f_ffff) + 4 * words.len() as u32));
     let c = compile(pc, words, icache, ram, 7, &layout).expect("a block");
     let mut v = wasmparser::Validator::new();
-    if let Err(e) = v.validate_all(&c.module) {
-        panic!("invalid module: {e}");
+    // Alone, and in a batch with others.
+    for module in [batch(&[&c.code]), batch(&[&c.code, &c.code, &c.code])] {
+        if let Err(e) = v.validate_all(&module) {
+            panic!("invalid module: {e}");
+        }
+        v = wasmparser::Validator::new();
     }
     c.len
 }
