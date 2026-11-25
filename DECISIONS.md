@@ -550,3 +550,20 @@ Netplay's messages go over a WebSocket, so TCP: a lost packet holds back everyth
 - **A real certificate**: browsers accept the endpoint's certificate as any site's (not `serverCertificateHashes`, which needs short-lived self-signed ones, renewed and handed out). Texel reads a PEM certificate and key (e.g. cert-manager's, for the Ingress's name) and reads them again when they change, for new sessions; it listens on its own UDP port (`TEXEL_WEBTRANSPORT_LISTEN`), which a load balancer may expose as 443 (`TEXEL_WEBTRANSPORT_PORT`).
 - **Behind an administrators' setting**, off by default; the administration page says when the server does not listen. A member gets a token for its session in the room's `welcome` (only then, and only when on), and opens it at the page's host name and that port.
 - **Checked**: a server test opens two members' sessions over QUIC (a self-signed certificate, a client without validation): a datagram from one reaches the other, stamped; a token that is no member's is refused.
+
+## D70. The EE's compiled blocks in batches, compiled in the background
+
+The EE's compiler gave the browser one WebAssembly module per block. A browser's costs are per module: Firefox's grow with their number, and the PlayStation's compiler, which did the same, made Firefox crawl and run out of memory past about 16000 modules (D63). Jak and Daxter compiles about 54000 blocks in its first seconds in the jungle.
+
+- **64 blocks to a module**, as the PlayStation's (`batch`): hot blocks are compiled to function bodies and queued; the queue goes to the browser when 64 are in it, and at the end of each frame. About 850 modules for Jak rather than 54000.
+- **Compiled in the background** (`WebAssembly.compile`), so a frame no longer waits for the browser's compiler: until its module is ready, a block stays interpreted (it runs the same either way). A block whose code is written meanwhile is dropped when its module arrives: its lines are watched from when it is queued, and a ticket tells it from a later compilation of the same address.
+- **1024 new blocks a frame at most** (the PlayStation's 256 would take Jak's 54000 four seconds to compile; at 1024, its first ten seconds in the jungle run at 12.0 frames per second rather than 11.1, and 11.3 before the batches, in Node).
+- **Checked**: Jak's jungle, compiled and interpreted, the same for 10 seconds of console time.
+
+## D71. The DualShock 2's pressure-sensitive buttons
+
+The PS2 used the PlayStation's DualShock, which has no pressures: a game asking for them (command 0x4F, with a mask of the poll's bytes it wants) got nothing it understood, and some games refuse to start then.
+
+- **A DualShock 2 around the DualShock** (`dualshock2.rs`): it answers the commands the DualShock 2 adds in configuration mode (0x40, 0x41: the poll's bytes, 0x4F: choose them) and polls in pressure mode (mode 0x79: the buttons, the sticks, then twelve pressures, those the mask chose), and lets the DualShock see every byte, so rumble, modes and configuration work as before. Setting the mode, or the Analog button, ends pressure mode.
+- **Pressures from the buttons**: 255 pressed, 0 not; keyboards and most gamepads' face buttons have nothing in between. A game reading how hard a button is pressed sees it fully pressed.
+- **Save states**: the DualShock is serialised as before, and the PlayStation's states are unchanged; the PS2's format 3 adds the two masks after the machine, and format 2's states still load, pressures off.

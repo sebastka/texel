@@ -60,6 +60,8 @@ async function run(inWorker) {
     if (f === Math.floor(frames / 2) + 1) half = performance.now();
     emu.runFrame();
     if (f % 60 === 0) hashes.push(emu.stateHash());
+    // The EE's compiled modules come in the background: let them in.
+    await new Promise((resolve) => setImmediate(resolve));
   }
   const now = performance.now();
   const fps = (frames * 1000) / (now - started);

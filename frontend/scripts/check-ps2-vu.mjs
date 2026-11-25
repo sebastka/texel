@@ -62,6 +62,7 @@ async function console_(vuCompiled) {
     const held = presses.filter(([at]) => f >= at && f < at + Math.round(fps / 5)).reduce((m, [, b]) => m | b, 0);
     emu.setButtons(0, held);
     emu.runFrame();
+    await new Promise((resolve) => setImmediate(resolve));
   }
   emu.setButtons(0, 0);
   writeFileSync(statePath, await emu.saveState());
@@ -79,6 +80,8 @@ async function run(vuCompiled) {
   for (let f = 1; f <= seconds * fps; f++) {
     emu.runFrame();
     if (f % fps === 0) hashes.push(emu.stateHash());
+    // The EE's compiled modules come in the background: let them in.
+    await new Promise((resolve) => setImmediate(resolve));
   }
   const secs = (performance.now() - started) / 1000;
   const steps = emu.vu1Steps() - steps0;

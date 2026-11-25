@@ -1,6 +1,7 @@
 //! Compiled EE blocks and VU1 programs in the browser: modules are compiled
-//! and instantiated with this module's own memory and function table, their
-//! functions added to the table, and called from there.
+//! (the EE's in batches, in the background) and instantiated with this
+//! module's own memory and function table, their functions added to the
+//! table, and called from there.
 //!
 //! The workspace's only unsafe code is here, and only on wasm32: compiled
 //! blocks get the EE and the bus as addresses in this module's memory
@@ -8,6 +9,9 @@
 //! interpreter with them; Rust calls a block through its function-table
 //! index, which is what a function pointer is in WebAssembly.
 #![allow(unsafe_code)]
+
+use std::cell::RefCell;
+use std::rc::Rc;
 
 use js_sys::{Object, Reflect, Uint8Array, WebAssembly};
 use texel_ps2::bus::Bus;
@@ -18,6 +22,7 @@ use texel_ps2::gs::Gs;
 use texel_ps2::vu::Vu;
 use texel_ps2::vu_jit::{VuBackend, helpers as vu_helpers};
 use wasm_bindgen::{JsCast, JsValue};
+use wasm_bindgen_futures::JsFuture;
 
 type Block = extern "C" fn(*mut Ee, *mut Bus, u32) -> u32;
 type Exec = extern "C" fn(*mut Ee, *mut Bus, u32, u32, u32) -> u32;
@@ -27,8 +32,18 @@ type Lower = extern "C" fn(*mut Vu, *mut Gif, *mut Gs, u32, u32);
 pub struct WebBackend {
     table: WebAssembly::Table,
     imports: Object,
-    /// Table slots of blocks dropped, to reuse.
+    /// Shared with the compilations under way.
+    shared: Rc<RefCell<Shared>>,
+    /// The next module's number.
+    next: u32,
+}
+
+#[derive(Default)]
+struct Shared {
+    /// Table slots of functions dropped, to reuse.
     free: Vec<u32>,
+    /// Modules compiled: their numbers and functions (see `Backend::ready`).
+    done: Vec<(u32, Option<Vec<u32>>)>,
 }
 
 impl WebBackend {
@@ -42,30 +57,73 @@ impl WebBackend {
         Ok(Self {
             table,
             imports,
-            free: Vec::new(),
+            shared: Rc::default(),
+            next: 0,
         })
     }
-}
 
-impl Backend for WebBackend {
-    fn install(&mut self, module: &[u8]) -> Option<u32> {
+    /// Compiles a module exporting one function, `block`, at once: a VU
+    /// program, needed now.
+    fn install_now(&mut self, module: &[u8]) -> Option<u32> {
         let module = WebAssembly::Module::new(&Uint8Array::from(module).into()).ok()?;
         let instance = WebAssembly::Instance::new(&module, &self.imports).ok()?;
         let block = Reflect::get(&instance.exports(), &"block".into()).ok()?;
-        let index = match self.free.pop() {
+        let reused = self.shared.borrow_mut().free.pop();
+        let index = match reused {
             Some(i) => i,
             None => self.table.grow(1).ok()?,
         };
         self.table.set(index, block.unchecked_ref()).ok()?;
         Some(index)
     }
+}
+
+impl Backend for WebBackend {
+    fn submit(&mut self, module: &[u8], count: usize) -> u32 {
+        let number = self.next;
+        self.next = self.next.wrapping_add(1);
+        let bytes: JsValue = Uint8Array::from(module).into();
+        let (table, imports, shared) = (self.table.clone(), self.imports.clone(), self.shared.clone());
+        // Compiled off the emulation's way (WebAssembly.compile), put in
+        // the table when ready; `ready` hands the slots over.
+        wasm_bindgen_futures::spawn_local(async move {
+            let funcs = async {
+                let module = JsFuture::from(WebAssembly::compile(&bytes)).await.ok()?;
+                let instance = WebAssembly::Instance::new(module.unchecked_ref(), &imports).ok()?;
+                let exports = instance.exports();
+                let mut slots = {
+                    let free = &mut shared.borrow_mut().free;
+                    let reused = count.min(free.len());
+                    free.split_off(free.len() - reused)
+                };
+                if slots.len() < count {
+                    // The table grown once for the rest.
+                    let more = (count - slots.len()) as u32;
+                    let first = table.grow(more).ok()?;
+                    slots.extend(first..first + more);
+                }
+                for (k, &slot) in slots.iter().enumerate() {
+                    let block = Reflect::get(&exports, &format!("b{k}").into()).ok()?;
+                    table.set(slot, block.unchecked_ref()).ok()?;
+                }
+                Some(slots)
+            }
+            .await;
+            shared.borrow_mut().done.push((number, funcs));
+        });
+        number
+    }
+
+    fn ready(&mut self) -> Vec<(u32, Option<Vec<u32>>)> {
+        std::mem::take(&mut self.shared.borrow_mut().done)
+    }
 
     fn release(&mut self, func: u32) {
-        self.free.push(func);
+        self.shared.borrow_mut().free.push(func);
     }
 
     fn call(&mut self, func: u32, ee: &mut Ee, bus: &mut Bus, left: u32) -> u32 {
-        // SAFETY: `func` is the table index `install` gave a block's
+        // SAFETY: `func` is the table index `ready` gave a block's
         // function, whose type is `Block`; in WebAssembly a function
         // pointer is its table index.
         let block = unsafe { std::mem::transmute::<usize, Block>(func as usize) };
@@ -88,11 +146,11 @@ extern "C" fn exec(ee: *mut Ee, bus: *mut Bus, instr: u32, pc: u32, flags: u32) 
 
 impl VuBackend for WebBackend {
     fn install(&mut self, module: &[u8]) -> Option<u32> {
-        Backend::install(self, module)
+        self.install_now(module)
     }
 
     fn release(&mut self, func: u32) {
-        self.free.push(func);
+        self.shared.borrow_mut().free.push(func);
     }
 
     fn call(&mut self, func: u32, vu: &mut Vu, gif: &mut Gif, gs: &mut Gs) -> u32 {

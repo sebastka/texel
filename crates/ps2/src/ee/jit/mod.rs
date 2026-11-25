@@ -8,6 +8,10 @@
 //! slots the EE stops in, blocks that would run past the end of a slice. So
 //! timing, exceptions and interrupts are the interpreter's exactly, and a
 //! console runs the same with blocks compiled or not.
+//!
+//! Blocks go to the browser in batches (`BATCH` to a module, see `flush`),
+//! compiled in the background: until their module is ready, they stay
+//! interpreted.
 
 mod compile;
 #[cfg(test)]
@@ -20,7 +24,7 @@ use std::hash::{BuildHasherDefault, Hasher};
 use super::Ee;
 use crate::bus::{Bus, CODE_LINE};
 
-pub use compile::{Compiled, Layout, MAX_LEN, Source, compile, idle_candidate};
+pub use compile::{Compiled, Layout, MAX_LEN, Source, batch, compile, idle_candidate};
 
 /// The type index of `exec` in compiled modules.
 const EXEC_TYPE: u32 = 1;
@@ -28,19 +32,32 @@ const EXEC_TYPE: u32 = 1;
 /// Runs a block before compiling it this many times.
 const HOT: u32 = 2;
 
+/// Blocks compiled together, in one module (see `Jit::flush`).
+const BATCH: usize = 64;
+
+/// Blocks compiled in a frame, at most: when a game loads much code at
+/// once, the rest stay interpreted a few frames longer rather than one
+/// frame taking long.
+const PER_FRAME: u32 = 1024;
+
 /// What compiles modules and runs their function: the browser, through
 /// the module running the emulator (where the little unsafe code calling
 /// into compiled blocks, and back, lives).
 pub trait Backend {
-    /// Compiles `module` (which exports its function as "block") and
-    /// returns a handle to the function, or `None` if it failed.
-    fn install(&mut self, module: &[u8]) -> Option<u32>;
+    /// Starts compiling `module`, which exports `count` functions (`b0`,
+    /// `b1`..., see `batch`), in the background: its number, which `ready`
+    /// gives back with the functions.
+    fn submit(&mut self, module: &[u8], count: usize) -> u32;
 
-    /// Runs function `func` (from `install`) on `ee` and `bus`, for at
+    /// The modules compiled since the last call: their numbers and their
+    /// functions' handles, in order (`None`: it failed).
+    fn ready(&mut self) -> Vec<(u32, Option<Vec<u32>>)>;
+
+    /// Runs function `func` (from `ready`) on `ee` and `bus`, for at
     /// most `left` instructions: returns the number it ran.
     fn call(&mut self, func: u32, ee: &mut Ee, bus: &mut Bus, left: u32) -> u32;
 
-    /// Function `func` (from `install`) will not be called again: its
+    /// Function `func` (from `ready`) will not be called again: its
     /// handle may be given to another.
     fn release(&mut self, func: u32);
 
@@ -57,6 +74,9 @@ enum Entry {
     /// Compiled: at physical address `pa`, needing `len` instructions left
     /// to start.
     Compiled { pa: u32, len: u32, func: u32 },
+    /// Compiled, waiting for its batch's module (interpreted meanwhile);
+    /// the ticket tells it from a later compilation of the same address.
+    Queued(u64),
     /// Left to the interpreter (nothing to compile there).
     Interpreted,
 }
@@ -72,6 +92,8 @@ pub struct Stats {
     pub interpreted: u64,
     /// Blocks run.
     pub runs: u64,
+    /// Instructions interpreted while their block's module compiled.
+    pub queued: u64,
     /// Why instructions were interpreted: in a delay slot, the block did
     /// not fit in the slice, not compiled yet, left to the interpreter.
     pub delay: u64,
@@ -129,7 +151,23 @@ pub struct Jit {
     blocks: Map<Entry>,
     /// The blocks compiled from each line of RAM (`CODE_LINE` bytes).
     lines: Map<Vec<u32>>,
+    /// Blocks compiled, not sent to the browser yet; and those sent, by
+    /// their module's number.
+    queue: Vec<Pending>,
+    compiling: HashMap<u32, Vec<Pending>>,
+    next_ticket: u64,
+    /// Blocks compiled in this frame (see `PER_FRAME`).
+    this_frame: u32,
     pub stats: Stats,
+}
+
+/// A block compiled, waiting for its batch's module.
+struct Pending {
+    va: u32,
+    pa: u32,
+    len: u32,
+    ticket: u64,
+    compiled: Compiled,
 }
 
 impl Jit {
@@ -139,7 +177,72 @@ impl Jit {
             slots: vec![Slot::default(); SLOTS].into_boxed_slice(),
             blocks: Map::default(),
             lines: Map::default(),
+            queue: Vec::new(),
+            compiling: HashMap::new(),
+            next_ticket: 0,
+            this_frame: 0,
             stats: Stats::default(),
+        }
+    }
+
+    /// Puts the modules compiled since in use, then sends the blocks
+    /// compiled since to the browser, in one module, compiled in the
+    /// background. Called when a batch is full, and at the end of each
+    /// frame (`end_frame`).
+    pub fn flush(&mut self) {
+        self.take_ready();
+        if self.queue.is_empty() {
+            return;
+        }
+        let queue = std::mem::take(&mut self.queue);
+        let compiled: Vec<&Compiled> = queue.iter().map(|p| &p.compiled).collect();
+        let module = batch(&compiled);
+        let number = self.backend.submit(&module, queue.len());
+        self.compiling.insert(number, queue);
+    }
+
+    /// At the end of a frame: the blocks compiled in it go to the browser,
+    /// and the next frame may compile `PER_FRAME` more.
+    pub fn end_frame(&mut self) {
+        self.flush();
+        self.this_frame = 0;
+    }
+
+    /// The modules compiled since: their blocks run compiled from now on,
+    /// unless their code changed meanwhile (`invalidate` dropped them).
+    fn take_ready(&mut self) {
+        for (number, funcs) in self.backend.ready() {
+            let Some(queue) = self.compiling.remove(&number) else {
+                for func in funcs.into_iter().flatten() {
+                    self.backend.release(func);
+                }
+                continue;
+            };
+            let funcs = funcs.filter(|f| f.len() == queue.len());
+            if funcs.is_none() {
+                self.stats.failed += queue.len() as u64;
+            }
+            for (k, p) in queue.into_iter().enumerate() {
+                let current = matches!(self.blocks.get(&p.va), Some(Entry::Queued(t)) if *t == p.ticket);
+                match funcs.as_ref().map(|f| f[k]) {
+                    Some(func) if current => {
+                        self.stats.compiled += 1;
+                        self.blocks.insert(
+                            p.va,
+                            Entry::Compiled {
+                                pa: p.pa,
+                                len: p.len,
+                                func,
+                            },
+                        );
+                    }
+                    Some(func) => self.backend.release(func),
+                    None if current => {
+                        self.blocks.insert(p.va, Entry::Interpreted);
+                    }
+                    None => {}
+                }
+            }
         }
     }
 
@@ -238,6 +341,10 @@ impl Ee {
                 jit.stats.kept += 1;
                 return None;
             }
+            Entry::Queued(_) => {
+                jit.stats.queued += 1;
+                return None;
+            }
             Entry::Compiled { pa: at, len, func } if at == pa => {
                 if u64::from(len) > left {
                     jit.stats.tail += 1;
@@ -266,6 +373,11 @@ impl Ee {
             }
             Entry::Cold(n) if n + 1 < HOT => {
                 *entry = Entry::Cold(n + 1);
+                jit.stats.cold += 1;
+                return None;
+            }
+            // Hot, but enough compiled this frame: the next one.
+            Entry::Cold(_) if jit.this_frame >= PER_FRAME => {
                 jit.stats.cold += 1;
                 return None;
             }
@@ -304,16 +416,23 @@ impl Ee {
             stale_offset: (stale - base) as u32,
             status_offset: (status - base) as u32,
         };
+        jit.this_frame += 1;
         let compiled = compile(&Source { va, words, idle }, jit.backend.exec_index(), layout)?;
-        let (module, len) = (compiled.module, compiled.first);
+        let len = compiled.first;
         jit.stats.native += u64::from(compiled.native);
         jit.stats.total += u64::from(compiled.words);
-        let Some(func) = jit.backend.install(&module) else {
-            jit.stats.failed += 1;
-            return None;
-        };
-        jit.stats.compiled += 1;
-        jit.blocks.insert(va, Entry::Compiled { pa, len, func });
+        // Interpreted until its module is ready; dropped if its code
+        // changes meanwhile (its lines are watched from now on).
+        let ticket = jit.next_ticket;
+        jit.next_ticket += 1;
+        jit.blocks.insert(va, Entry::Queued(ticket));
+        jit.queue.push(Pending {
+            va,
+            pa,
+            len,
+            ticket,
+            compiled,
+        });
         if (pa as usize) < crate::bus::RAM_SIZE {
             let line = |a: u32| a / CODE_LINE as u32;
             for l in line(pa)..=line(pa + 4 * len - 1) {
@@ -321,7 +440,9 @@ impl Ee {
                 bus.watch_code(l);
             }
         }
-        // It runs the next time round.
+        if jit.queue.len() >= BATCH {
+            jit.flush();
+        }
         None
     }
 
