@@ -63,10 +63,12 @@ pub struct DiscRef {
     pub number: u32,
 }
 
-/// The discs of a multi-disc game.
+/// The discs of a multi-disc game: those in the library, and the numbers
+/// of the others Redump lists for the same version.
 #[derive(Clone)]
 pub struct DiscGroup {
     pub discs: Vec<DiscRef>,
+    pub missing: Vec<u32>,
 }
 
 /// "Final Fantasy VII (Europe) (Disc 2)" → ("Final Fantasy VII (Europe)", 2).
@@ -400,20 +402,46 @@ impl AppState {
     /// Multi-disc games: game id → its group.
     pub async fn disc_groups(&self) -> HashMap<String, DiscGroup> {
         let lib = self.library.read().await.clone();
-        let mut groups: HashMap<String, Vec<DiscRef>> = HashMap::new();
+        let mut groups: HashMap<(Console, String), Vec<DiscRef>> = HashMap::new();
         for g in &lib.games {
             if let Some((key, number)) = self.identify(g).await.name.as_deref().and_then(split_disc) {
-                groups.entry(key).or_default().push(DiscRef {
+                groups.entry((g.console, key)).or_default().push(DiscRef {
                     id: g.id.clone(),
                     number,
                 });
             }
         }
+        // Every version's discs, as Redump lists them.
+        let all = self.dats.read().await.clone();
+        let mut listed: HashMap<(Console, String), Vec<u32>> = HashMap::new();
+        for console in [Console::Ps1, Console::Ps2] {
+            for game in &all.get(console).games {
+                if let Some((key, number)) = split_disc(&game.name) {
+                    listed.entry((console, key)).or_default().push(number);
+                }
+            }
+        }
         let mut out = HashMap::new();
-        for mut discs in groups.into_values() {
+        for (key, mut discs) in groups {
             discs.sort_by_key(|d| d.number);
+            discs.dedup_by_key(|d| d.number);
+            let mut missing: Vec<u32> = listed
+                .get(&key)
+                .into_iter()
+                .flatten()
+                .copied()
+                .filter(|n| !discs.iter().any(|d| d.number == *n))
+                .collect();
+            missing.sort_unstable();
+            missing.dedup();
             for d in &discs {
-                out.insert(d.id.clone(), DiscGroup { discs: discs.clone() });
+                out.insert(
+                    d.id.clone(),
+                    DiscGroup {
+                        discs: discs.clone(),
+                        missing: missing.clone(),
+                    },
+                );
             }
         }
         out

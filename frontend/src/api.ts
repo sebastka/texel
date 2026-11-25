@@ -52,8 +52,11 @@ export interface Game {
   error: string | null;
   /** Disc number of a multi-disc game. */
   disc: number | null;
-  /** Every disc of a multi-disc game, this one included; empty otherwise. */
+  /** Every disc of a multi-disc game in the library, this one included;
+   * empty otherwise. */
   discs: { id: string; number: number }[];
+  /** The numbers of its other discs Redump lists, not in the library. */
+  missingDiscs: number[];
 }
 
 export interface Details {

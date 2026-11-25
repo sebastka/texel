@@ -319,8 +319,12 @@ struct GameJson {
     #[serde(flatten)]
     identity: Identity,
     error: Option<String>,
-    /// Every disc of a multi-disc game, this one included; empty otherwise.
+    /// Every disc of a multi-disc game in the library, this one included;
+    /// empty otherwise.
     discs: Vec<crate::state::DiscRef>,
+    /// The numbers of its other discs that Redump lists, not in the
+    /// library.
+    missing_discs: Vec<u32>,
 }
 
 async fn game_json(state: &AppState, g: &Game, groups: &HashMap<String, DiscGroup>) -> GameJson {
@@ -332,6 +336,7 @@ async fn game_json(state: &AppState, g: &Game, groups: &HashMap<String, DiscGrou
         identity: state.identify(g).await,
         error: g.error.clone(),
         discs: groups.get(&g.id).map(|gr| gr.discs.clone()).unwrap_or_default(),
+        missing_discs: groups.get(&g.id).map(|gr| gr.missing.clone()).unwrap_or_default(),
     }
 }
 

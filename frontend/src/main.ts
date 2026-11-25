@@ -346,6 +346,16 @@ function consoleTabs(page: "games" | "bios" | "cards", active: Console, count: (
 }
 
 /** Games of a console, one entry per multi-disc game. */
+/** A multi-disc game's discs, in the list: how many, or which are here
+ * when some are missing ("Disc 2 of 2"). */
+function discsTag(g: Game) {
+  const total = g.discs.length + g.missingDiscs.length;
+  if (!g.missingDiscs.length) return h("span.tag", {}, `${total} discs`);
+  const here = g.discs.map((d) => d.number).join(", ");
+  const missing = g.missingDiscs.map((n) => `Disc ${n}`).join(", ");
+  return h("span.tag", { title: `${missing}: not in the library` }, `Disc${g.discs.length > 1 ? "s" : ""} ${here} of ${total}`);
+}
+
 const gamesOf = (c: Console) => games.filter((g) => g.console === c && (!g.discs.length || g.discs[0]?.id === g.id));
 
 const VERIFY_CLASS: Record<VerifyState, string> = {
@@ -755,7 +765,7 @@ function gameRow(g: GameListItem) {
             "span.small-tags",
             {},
             ...tags.other.filter((t) => !t.tag.startsWith("Disc ")).map((t) => h("span.tag", { title: t.note ?? "" }, t.tag)),
-            g.discs.length ? h("span.tag", {}, `${g.discs.length} discs`) : null,
+            g.discs.length ? discsTag(g) : null,
           )
         : null,
       g.serial ? h("div.serial", {}, g.serial) : null,
@@ -860,10 +870,12 @@ async function renderGame(id: string) {
               ? h(
                   "span.links",
                   {},
-                  ...g.discs.flatMap((d, i) => {
-                    const link = d.id === g.id ? h("strong", {}, `Disc ${d.number}`) : h("a.external", { href: `#/game/${d.id}` }, `Disc ${d.number}`);
-                    return i ? [" · ", link] : [link];
-                  }),
+                  ...[
+                    ...g.discs.map((d) => ({ number: d.number, el: d.id === g.id ? h("strong", {}, `Disc ${d.number}`) : h("a.external", { href: `#/game/${d.id}` }, `Disc ${d.number}`) })),
+                    ...g.missingDiscs.map((n) => ({ number: n, el: h("span.muted", { title: "Not in the library" }, `Disc ${n} (missing)`) })),
+                  ]
+                    .sort((a, b) => a.number - b.number)
+                    .flatMap(({ el }, i) => (i ? [" · ", el] : [el])),
                 )
               : null,
           ),
