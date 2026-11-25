@@ -585,3 +585,10 @@ On a console, the browser (OSDSYS) reads the system configuration (language, scr
 - Compiled blocks end at a SYSCALL and leave it to the interpreter, so both run the same.
 - Saved after the machine (format 4).
 - Another language than English (the user's) would be a setting: not yet.
+
+## D74. The screen stays on while a game runs
+
+Operating systems dim, lock or sleep after a while without input, and a gamepad is not input to them (only keyboards and mice are): players with a gamepad saw the screen lock in the middle of a game.
+
+- **A screen wake lock** (the Screen Wake Lock API, `wake.ts`) is held while a game runs, released while it is paused and when it stops. The browser drops it when the page is hidden (the player pauses then); it is taken again when the game runs again.
+- Where the API is missing or the lock refused (an old browser, a page not served securely, a battery saver), the system's timers apply, and the console says so.
