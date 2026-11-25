@@ -67,40 +67,119 @@ export function codeSet(codes: GameCodes, choices: Choices): CodeSet | null {
   return enabled.length ? { codes: enabled, overclock, ramMiB, wide, noGteWidescreen } : null;
 }
 
-/** The codes panel: `onChange` gets the new set (null: none) whenever the
- * choices change. `refused`: codes the core refused, shown as such. */
+/** The codes panel: tabs for patches and cheats, each a grid of cards (by
+ * group) with a switch, a description and the code's choice. `onChange`
+ * gets the new set (null: none) whenever the choices change. */
 export function codesPanel(codes: GameCodes, onChange: (set: CodeSet | null) => void) {
   const choices: Choices = {};
-  const panel = h("div.codes-panel", { hidden: true });
   const reasons = new Map<string, string>();
-  const changed = () => onChange(codeSet(codes, choices));
+  let locked = false;
+  const tabs = [
+    { title: "Patches", prefix: "p:", list: codes.patches },
+    { title: "Cheats", prefix: "c:", list: codes.cheats },
+  ].filter((t) => t.list.length);
+  let tab = tabs[0]!;
+  let filter = "";
 
-  const row = (prefix: string, code: FileCode) => {
+  const panel = h("div.codes-panel");
+  const body = h("div.codes-body");
+  const count = h("span.codes-count.muted.small");
+  const allOff = h(
+    "button.ghost.small",
+    {
+      onclick: () => {
+        for (const k of Object.keys(choices)) delete choices[k];
+        changed();
+        renderBody();
+      },
+    },
+    "Turn all off",
+  ) as HTMLButtonElement;
+  const search = h("input.code-search", {
+    type: "search",
+    placeholder: "Filter",
+    oninput: (e: Event) => {
+      filter = (e.target as HTMLInputElement).value.trim().toLowerCase();
+      renderBody();
+    },
+  }) as HTMLInputElement;
+  const tabButtons = tabs.map((t) =>
+    h(
+      "button.codes-tab",
+      {
+        role: "tab",
+        onclick: () => {
+          tab = t;
+          renderBody();
+        },
+      },
+      t.title,
+      h("span.codes-tab-count", {}, String(t.list.length)),
+    ),
+  );
+
+  const changed = () => {
+    onChange(codeSet(codes, choices));
+    updateHead();
+  };
+  const updateHead = () => {
+    const on = Object.keys(choices).length;
+    count.textContent = on ? `${on} on` : "None on";
+    allOff.disabled = locked || on === 0;
+    tabButtons.forEach((b, k) => b.setAttribute("aria-selected", String(tabs[k] === tab)));
+    search.hidden = tab.list.length <= 12;
+  };
+
+  const card = (prefix: string, code: FileCode) => {
     const id = prefix + code.name;
     const label = code.name.split("\\").pop() ?? code.name;
     const why = unsupported(code) ?? reasons.get(id) ?? null;
-    const box = h("input", { type: "checkbox", checked: choices[id] !== undefined, disabled: !!why }) as HTMLInputElement;
+    const on = choices[id] !== undefined;
+    const box = h("input.switch", {
+      type: "checkbox",
+      checked: on,
+      disabled: !!why || locked,
+      "aria-label": label,
+    }) as HTMLInputElement;
     // Its choice, when it has one: a list, or a number in a range.
     let input: HTMLSelectElement | HTMLInputElement | null = null;
     if (code.options.length) {
       input = h(
-        "select",
-        { disabled: !!why },
+        "select.code-choice",
+        { disabled: !!why || locked },
         ...code.options.map(([name, v]) => h("option", { value: String(v), selected: choices[id] === v }, name)),
       ) as HTMLSelectElement;
     } else if (code.range) {
-      input = h("input.code-value", {
+      input = h("input.code-choice", {
         type: "number",
         min: String(code.range[0]),
         max: String(code.range[1]),
         value: String(choices[id] ?? code.range[0]),
-        disabled: !!why,
+        disabled: !!why || locked,
       }) as HTMLInputElement;
     }
     const value = () => (input ? Number(input.value) : 0);
+    const el = h(
+      `label.code-card${on ? ".on" : ""}${why ? ".unavailable" : ""}`,
+      { title: [code.description, code.author ? `By ${code.author}` : null].filter(Boolean).join("\n") || undefined },
+      h("span.code-card-top", {}, h("span.code-name", {}, label), box),
+      code.description ? h("span.code-desc", {}, code.description) : null,
+      input,
+      (() => {
+        const meta = [
+          code.overrides.cpuOverclock ? `CPU ${code.overrides.cpuOverclock}%` : null,
+          code.overrides.ramMib && code.overrides.ramMib > 2 ? `${code.overrides.ramMib} MiB RAM` : null,
+          code.overrides.aspectRatio,
+          code.author ? `by ${code.author}` : null,
+        ].filter(Boolean);
+        return meta.length ? h("span.code-meta", {}, meta.join(" · ")) : null;
+      })(),
+      why ? h("span.code-why", {}, `Not available: ${why}`) : null,
+    );
     box.onchange = () => {
       if (box.checked) choices[id] = input ? value() : defaultValue(code);
       else delete choices[id];
+      el.classList.toggle("on", box.checked);
       changed();
     };
     if (input)
@@ -109,70 +188,42 @@ export function codesPanel(codes: GameCodes, onChange: (set: CodeSet | null) => 
         choices[id] = value();
         changed();
       };
-    const settings = [
-      code.overrides.cpuOverclock ? `CPU ${code.overrides.cpuOverclock}%` : null,
-      code.overrides.ramMib && code.overrides.ramMib > 2 ? `${code.overrides.ramMib} MiB of RAM` : null,
-      code.overrides.aspectRatio ? code.overrides.aspectRatio : null,
-    ].filter(Boolean);
-    return h(
-      "label.code-row",
-      { title: [code.description, code.author ? `By ${code.author}` : null].filter(Boolean).join("\n") || undefined },
-      box,
-      h("span.code-name", {}, label),
-      input,
-      settings.length ? h("span.muted.small", {}, settings.join(" · ")) : null,
-      why ? h("span.small.code-why", {}, `Not available: ${why}`) : null,
-    );
+    return el;
   };
 
-  /** A section: its codes, in their groups (`Group\Code`). */
-  const section = (title: string, prefix: string, list: FileCode[]) => {
-    if (!list.length) return null;
+  /** The current tab's codes, in their groups (`Group\\Code`). */
+  const renderBody = () => {
     const groups = new Map<string, FileCode[]>();
-    for (const c of list) {
+    for (const c of tab.list) {
+      if (filter && !c.name.toLowerCase().includes(filter) && !(c.description ?? "").toLowerCase().includes(filter)) continue;
       const group = c.name.includes("\\") ? c.name.slice(0, c.name.lastIndexOf("\\")) : "";
       groups.set(group, [...(groups.get(group) ?? []), c]);
     }
-    const body = h("div.code-list");
-    const render = (filter: string) => {
-      body.replaceChildren(
-        ...[...groups].flatMap(([group, items]): HTMLElement[] => {
-          const shown = items.filter((c) => !filter || c.name.toLowerCase().includes(filter));
-          if (!shown.length) return [];
-          const rows = shown.map((c) => row(prefix, c));
-          return group
-            ? [h("details.code-group", { open: !!filter }, h("summary", {}, group.replaceAll("\\", " › ")), ...rows)]
-            : rows;
-        }),
-      );
-    };
-    render("");
-    const search =
-      list.length > 20
-        ? (h("input.code-search", {
-            type: "search",
-            placeholder: `Filter ${list.length} ${title.toLowerCase()}`,
-            oninput: (e: Event) => render((e.target as HTMLInputElement).value.trim().toLowerCase()),
-          }) as HTMLInputElement)
-        : null;
-    return h("section.code-section", {}, h("h3", {}, title), search, body);
+    const blocks = [...groups].map(([group, items]) =>
+      h(
+        "section.code-group",
+        {},
+        group ? h("h4.code-group-title", {}, group.replaceAll("\\", " › ")) : null,
+        h("div.code-grid", {}, ...items.map((c) => card(tab.prefix, c))),
+      ),
+    );
+    body.replaceChildren(...(blocks.length ? blocks : [h("p.muted.small", {}, "No code matches.")]));
+    updateHead();
   };
 
-  const render = () => {
-    const sections = [section("Patches", "p:", codes.patches), section("Cheats", "c:", codes.cheats)].filter(
-      (s): s is HTMLElement => s !== null,
-    );
-    panel.replaceChildren(
-      h(
-        "p.muted.small",
-        {},
-        "From DuckStation's cheat and patch database: each code is its author's. Codes change the game as it runs; " +
-          "patches may also make the emulated CPU faster or its memory larger.",
-      ),
-      ...sections,
-    );
-  };
-  render();
+  panel.replaceChildren(
+    h(
+      "div.codes-head",
+      {},
+      h("div.codes-tabs", { role: "tablist" }, ...tabButtons),
+      search,
+      h("span.codes-head-end", {}, count, allOff),
+    ),
+    body,
+    h("p.codes-credit.muted.small", {}, "From DuckStation's database: each code is its author's. Patches may make the emulated CPU faster or its memory larger."),
+  );
+  renderBody();
+
   return {
     panel,
     /** Codes the core refused: shown unavailable, and turned off. */
@@ -181,14 +232,13 @@ export function codesPanel(codes: GameCodes, onChange: (set: CodeSet | null) => 
         reasons.set(name, why);
         delete choices[name];
       }
-      if (list.length) render();
+      if (list.length) renderBody();
     },
     /** Locked (a netplay room): shown, not changed. */
-    lock(locked: boolean) {
-      for (const el of panel.querySelectorAll<HTMLInputElement | HTMLSelectElement>("input, select")) {
-        if (el.classList.contains("code-search")) continue;
-        el.disabled = locked || el.closest(".code-row")?.querySelector(".code-why") !== null;
-      }
+    lock(on: boolean) {
+      if (on === locked) return;
+      locked = on;
+      renderBody();
     },
   };
 }

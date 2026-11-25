@@ -1512,16 +1512,19 @@ function renderPlayer(id: string, biosId: string, roomGame = false, cards: Slots
     showToggle(wide, "Widescreen", on);
     screen.classList.toggle("wide", on || codesWide);
   };
-  // Cheat and patch codes: a panel under the header, when the game has some.
+  // Cheat and patch codes: a section under the controls, when the game has
+  // some (the game stays in view while they are chosen).
   let codesUi: ReturnType<typeof codesPanel> | null = null;
   const codesSlot = h("div");
+  const codesSection = h("details.codes", { hidden: true }, h("summary", {}, "Cheats and patches"), codesSlot);
   const codesButton = h(
     "button.ghost",
     {
       hidden: true,
-      title: "Cheats and patches (draw distance, 60 fps, widescreen...) for this game.",
+      title: "Cheats and patches (draw distance, 60 fps, widescreen...) for this game, under the controls.",
       onclick: () => {
-        if (codesUi) codesUi.panel.hidden = !codesUi.panel.hidden;
+        codesSection.open = true;
+        codesSection.scrollIntoView({ behavior: "smooth", block: "start" });
       },
     },
     "Codes",
@@ -1535,6 +1538,7 @@ function renderPlayer(id: string, biosId: string, roomGame = false, cards: Slots
     codesUi = null;
     codesSlot.replaceChildren();
     codesButton.hidden = true;
+    codesSection.hidden = true;
     const codes = await api.codes(gameId).catch(() => null);
     if (!codes || !(codes.patches.length || codes.cheats.length) || current !== gameId) return;
     codesUi = codesPanel(codes, (s) => {
@@ -1544,6 +1548,7 @@ function renderPlayer(id: string, biosId: string, roomGame = false, cards: Slots
     });
     codesSlot.replaceChildren(codesUi.panel);
     codesButton.hidden = false;
+    codesSection.hidden = false;
     lock();
   };
   const showCodes = (set: CodeSet | null) => {
@@ -1649,7 +1654,6 @@ function renderPlayer(id: string, biosId: string, roomGame = false, cards: Slots
             ),
           ),
           statesPanel,
-          codesSlot,
           screen,
         ),
         side,
@@ -1667,6 +1671,7 @@ function renderPlayer(id: string, biosId: string, roomGame = false, cards: Slots
             " loads it. Gamepads work too, with the standard layout; their Home button is the Analog button.",
           ),
         ),
+        codesSection,
       ),
     ),
   );
