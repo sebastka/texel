@@ -34,14 +34,23 @@ const HOT: u32 = 2;
 /// Blocks compiled together, in one module (see `Jit::flush`).
 const BATCH: usize = 64;
 
+/// Blocks compiled in a frame, at most: when a game loads much code at
+/// once, the rest stay interpreted a few frames longer rather than one
+/// frame taking long.
+const PER_FRAME: u32 = 256;
+
 /// What compiles modules and runs their function: the browser, through the
 /// module running the emulator (where the little unsafe code calling into
 /// compiled blocks, and back, lives).
 pub trait Backend {
-    /// Compiles `module`, which exports `count` functions (`b0`, `b1`...,
-    /// see `batch`), and returns handles to them, in order, or `None` if it
-    /// failed.
-    fn install(&mut self, module: &[u8], count: usize) -> Option<Vec<u32>>;
+    /// Starts compiling `module`, which exports `count` functions (`b0`,
+    /// `b1`..., see `batch`), in the background: its number, which `ready`
+    /// gives back with the functions.
+    fn submit(&mut self, module: &[u8], count: usize) -> u32;
+
+    /// The modules compiled since the last call: their numbers and their
+    /// functions' handles, in order (`None`: it failed).
+    fn ready(&mut self) -> Vec<(u32, Option<Vec<u32>>)>;
 
     /// Runs function `func` (from `install`) on `cpu` and `bus`: returns
     /// the number of instructions it ran.
@@ -131,6 +140,10 @@ pub struct Jit {
     blocks: HashMap<u32, Entry, BuildHasherDefault<PcHasher>>,
     /// Blocks compiled, for the next module.
     queue: Vec<Pending>,
+    /// Modules being compiled (in the background), by number: their blocks.
+    compiling: HashMap<u32, Vec<Pending>>,
+    /// Blocks compiled this frame (see `PER_FRAME`).
+    this_frame: u32,
     pub stats: Stats,
 }
 
@@ -140,6 +153,8 @@ impl Jit {
             backend,
             blocks: HashMap::default(),
             queue: Vec::new(),
+            compiling: HashMap::new(),
+            this_frame: 0,
             stats: Stats::default(),
         }
     }
@@ -148,6 +163,8 @@ impl Jit {
     /// is elsewhere now).
     pub fn clear(&mut self) {
         self.queue.clear();
+        // Their functions, once ready, are released (`take_ready`).
+        self.compiling.clear();
         for (_, entry) in self.blocks.drain() {
             if let Entry::Compiled { func, .. } = entry {
                 self.backend.release(func);
@@ -197,10 +214,13 @@ impl Jit {
                 *n += 1;
                 return false;
             }
+            // Hot, but enough compiled this frame: the next one.
+            Entry::Cold(_) if self.this_frame >= PER_FRAME => return false,
             Entry::Cold(_) => {}
         }
         // Hot: compile it (it runs once its batch is installed).
         *entry = Entry::Interpreted;
+        self.this_frame += 1;
         let pa = pc & 0x1fff_ffff;
         let ram = (pa as usize) < 0x0080_0000;
         let bios = (0x1fc0_0000..0x1fc8_0000).contains(&pa);
@@ -248,36 +268,63 @@ impl Jit {
         false
     }
 
-    /// Installs the blocks compiled since the last time, in one module: a
-    /// browser's costs are per module (Firefox's growing with their number,
-    /// up to a limit of about 16000), not per function. Called when a batch
-    /// is full, and at the end of each frame.
+    /// Puts the modules compiled since in use, then sends the blocks
+    /// compiled since to the browser, in one module: a browser's costs are
+    /// per module (Firefox's growing with their number, up to a limit of
+    /// about 16000), not per function. It compiles it in the background:
+    /// the blocks stay interpreted until it is ready (they run the same
+    /// either way). Called when a batch is full, and at the end of each
+    /// frame (`end_frame`).
     pub fn flush(&mut self) {
+        self.take_ready();
         if self.queue.is_empty() {
             return;
         }
         let queue = std::mem::take(&mut self.queue);
         let codes: Vec<_> = queue.iter().map(|p| &p.compiled.code).collect();
-        let funcs = self.backend.install(&batch(&codes), queue.len());
-        let Some(funcs) = funcs.filter(|f| f.len() == queue.len()) else {
-            self.stats.failed += queue.len() as u64;
-            for p in &queue {
-                self.blocks.insert(p.pc, Entry::Interpreted);
+        let module = batch(&codes);
+        let number = self.backend.submit(&module, queue.len());
+        self.compiling.insert(number, queue);
+    }
+
+    /// At the end of a frame: the blocks compiled in it go to the browser,
+    /// and the next frame may compile `PER_FRAME` more.
+    pub fn end_frame(&mut self) {
+        self.flush();
+        self.this_frame = 0;
+    }
+
+    /// The modules compiled since: their blocks run compiled from now on
+    /// (their code is checked against RAM's first, as always).
+    fn take_ready(&mut self) {
+        for (number, funcs) in self.backend.ready() {
+            let Some(queue) = self.compiling.remove(&number) else {
+                // From before `clear`: not needed.
+                for func in funcs.into_iter().flatten() {
+                    self.backend.release(func);
+                }
+                continue;
+            };
+            let Some(funcs) = funcs.filter(|f| f.len() == queue.len()) else {
+                self.stats.failed += queue.len() as u64;
+                for p in &queue {
+                    self.blocks.insert(p.pc, Entry::Interpreted);
+                }
+                continue;
+            };
+            self.stats.compiled += queue.len() as u64;
+            for (p, func) in queue.into_iter().zip(funcs) {
+                self.blocks.insert(
+                    p.pc,
+                    Entry::Compiled {
+                        func,
+                        pa: p.pa,
+                        code: p.code,
+                        writes: p.writes,
+                        icache: p.icache,
+                    },
+                );
             }
-            return;
-        };
-        self.stats.compiled += queue.len() as u64;
-        for (p, func) in queue.into_iter().zip(funcs) {
-            self.blocks.insert(
-                p.pc,
-                Entry::Compiled {
-                    func,
-                    pa: p.pa,
-                    code: p.code,
-                    writes: p.writes,
-                    icache: p.icache,
-                },
-            );
         }
     }
 }

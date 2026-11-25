@@ -255,7 +255,7 @@ impl System {
         self.frame_stale = true;
         // The blocks compiled this frame, installed.
         if let Some(jit) = &mut self.jit {
-            jit.flush();
+            jit.end_frame();
         }
     }
 

@@ -43,7 +43,7 @@ const frames = 50 * Number(secondsArg ?? 20);
 // EVERY=1: compare every frame (finds the first frame they differ).
 const every = Number(process.env.EVERY ?? 50);
 
-function run(compiled) {
+async function run(compiled) {
   const emu = new mod.Emulator(bios);
   emu.insertDisc(cue, names, sizes, read, undefined);
   emu.setCompiler(compiled);
@@ -55,15 +55,17 @@ function run(compiled) {
     emu.runFrame();
     emu.takeAudio();
     if (f % every === 0) sums.push(emu.stateChecksum());
+    // Compiled modules come in the background: let them in.
+    if (f % 10 === 0) await new Promise((resolve) => setImmediate(resolve));
   }
   const fps = (frames * 1000) / (performance.now() - started);
   console.log(`${compiled ? "compiled" : "interpreted"}: ${fps.toFixed(1)} frames per second; ${emu.compilerStats()}`);
   return sums;
 }
 
-const compiled = run(true);
+const compiled = await run(true);
 if (!process.env.COMPILED_ONLY) {
-  const interpreted = run(false);
+  const interpreted = await run(false);
   let same = true;
   interpreted.forEach((h, i) => {
     const ok = h === compiled[i];

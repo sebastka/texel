@@ -117,8 +117,51 @@ function joinRoom(room: RoomSnapshot) {
 /**
  * Reads bytes of a disc image file. Synchronous: the core reads sectors in
  * the middle of an instruction. Allowed in workers; the core caches chunks.
+ * The chunk after each is read ahead, in the background: games stream their
+ * discs, and a chunk read when needed stalls emulation as long as the
+ * server takes (it may unzip the image).
  */
 function readFile(file: number, offset: number, length: number): Uint8Array {
+  const key = `${gameId ?? ""} ${file} ${offset} ${length}`;
+  const ready = readAhead.get(key);
+  readAhead.delete(key);
+  const data = ready ?? readNow(file, offset, length);
+  readNext(file, offset + length, length);
+  return data;
+}
+
+/** Chunks read ahead (see `readFile`), by game, file, offset and length;
+ * and those under way. */
+const readAhead = new Map<string, Uint8Array>();
+const readingAhead = new Set<string>();
+/** Chunks read ahead and not asked for are dropped past this many. */
+const READ_AHEAD_KEPT = 8;
+
+function readNext(file: number, offset: number, length: number) {
+  const id = gameId ?? "";
+  const key = `${id} ${file} ${offset} ${length}`;
+  if (readAhead.has(key) || readingAhead.has(key)) return;
+  readingAhead.add(key);
+  // Past the file's end, or at its shorter last chunk: nothing kept (the
+  // core reads it when it needs it).
+  fetch(`/api/games/${encodeURIComponent(id)}/files/${file}`, {
+    headers: { Range: `bytes=${offset}-${offset + length - 1}` },
+  })
+    .then(async (resp) => {
+      const data = new Uint8Array(await resp.arrayBuffer());
+      if (resp.status !== 206 || data.length !== length) return;
+      readAhead.set(key, data);
+      // The oldest first (a Map keeps insertion order).
+      for (const old of readAhead.keys()) {
+        if (readAhead.size <= READ_AHEAD_KEPT) break;
+        readAhead.delete(old);
+      }
+    })
+    .catch(() => {})
+    .finally(() => readingAhead.delete(key));
+}
+
+function readNow(file: number, offset: number, length: number): Uint8Array {
   const xhr = new XMLHttpRequest();
   xhr.open("GET", `/api/games/${encodeURIComponent(gameId ?? "")}/files/${file}`, false);
   xhr.responseType = "arraybuffer";
@@ -307,8 +350,12 @@ function tick() {
       // As many frames as fit in a slice of time, then the page's turn.
       while (performance.now() - now < FAST_SLICE_MS && advance()) ran++;
     } else if (ring && audioRunning) {
-      // Keep the audio queue filled; the audio clock paces emulation.
-      while (ring.available() < AUDIO_TARGET && ran < 4 && advance()) ran++;
+      // Keep the audio queue filled; the audio clock paces emulation. A
+      // frame a tick, each shown (the next tick is 4 ms away); several, of
+      // which only the last is shown, only to catch up when the queue runs
+      // low.
+      const most = ring.available() < AUDIO_TARGET / 2 ? 4 : 1;
+      while (ring.available() < AUDIO_TARGET && ran < most && advance()) ran++;
     } else {
       while (now >= nextFrameAt && ran < 4 && advance()) {
         nextFrameAt += frameInterval();

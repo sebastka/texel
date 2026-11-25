@@ -66,6 +66,8 @@ while (ca < max) {
   if (recent.length > 12) recent.shift();
   while (cb < ca) cb = interpreted.debugStep();
   steps++;
+  // Compiled modules come in the background: let them in.
+  if (steps % 5000 === 0) await new Promise((resolve) => setImmediate(resolve));
   if (cb !== ca) continue;
   met++;
   if (compiled.debugCpu() !== interpreted.debugCpu()) differs("CPU");
