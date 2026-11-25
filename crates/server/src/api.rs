@@ -77,6 +77,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/games/{id}", get(game_detail))
         .route("/games/{id}/files/{index}", get(game_file))
         .route("/games/{id}/sbi", get(game_sbi))
+        .route("/games/{id}/codes", get(game_codes))
         .route("/games/{id}/images/{kind}", get(game_image))
         .route(
             "/games/{id}/cards",
@@ -456,6 +457,18 @@ async fn game_detail(State(state): AppStateRef, viewer: Viewer, Path(id): Path<S
     .into_response()
 }
 
+/// A PlayStation game's cheat and patch codes (see `codes`).
+async fn game_codes(State(state): AppStateRef, viewer: Viewer, Path(id): Path<String>) -> Response {
+    if !viewer.may_read(&state, Some(&id), None) {
+        return forbidden();
+    }
+    let lib = state.library.read().await.clone();
+    let Some(game) = lib.game(&id) else {
+        return not_found("game");
+    };
+    Json(crate::codes::for_game(&state, game).await).into_response()
+}
+
 /// The SBI file of a protected disc, for the emulator.
 async fn game_sbi(State(state): AppStateRef, viewer: Viewer, Path(id): Path<String>, req: Request) -> Response {
     if !viewer.may_read(&state, Some(&id), None) {
@@ -821,6 +834,7 @@ async fn rescan(State(state): AppStateRef, _: Admin) -> StatusCode {
             if s.refresh_dats(false).await {
                 s.rescan().await;
             }
+            crate::codes::refresh(&s).await;
         });
     }
     StatusCode::NO_CONTENT

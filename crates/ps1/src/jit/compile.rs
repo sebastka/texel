@@ -20,7 +20,7 @@
 //! friends, and accesses elsewhere.
 
 use super::wasm::{self, Code, FuncType, I32, I64, op};
-use crate::bus::{Bus, RAM_PAGE_BITS, RAM_SIZE};
+use crate::bus::{Bus, RAM_PAGE_BITS};
 use crate::cpu::{BIOS_ACCESS, Cpu, ICACHE_FILL, IO_ACCESS, RAM_ACCESS};
 
 /// Instructions per block, at most.
@@ -47,6 +47,8 @@ pub struct Layout {
     deadline: u32,
     scratchpad: u32,
     ram: u32,
+    /// RAM's addresses' mask (its size less one: see `Bus::ram_mask`).
+    ram_mask: u32,
     ram_writes: u32,
     icache: u32,
 }
@@ -70,6 +72,7 @@ impl Layout {
             deadline: at(&bus.deadline as *const u32 as usize, b),
             scratchpad: at(bus.scratchpad.as_ptr() as usize, b),
             ram: bus.ram.as_ptr() as usize as u32,
+            ram_mask: bus.ram_mask(),
             ram_writes: bus.ram_writes.as_ptr() as usize as u32,
             icache: cpu.icache.as_ptr() as usize as u32,
         }
@@ -637,7 +640,7 @@ pub fn compile(
                         e.c.op(op::END);
                         // The offset in RAM or the scratchpad, and its base.
                         e.c.local_get(KIND).i32_const(1).op(op::I32_EQ).if_i32();
-                        e.c.local_get(ADDR).i32_const(RAM_SIZE as i32 - 1).op(op::I32_AND);
+                        e.c.local_get(ADDR).i32_const(layout.ram_mask as i32).op(op::I32_AND);
                         e.c.i32_const(layout.ram as i32).op(op::I32_ADD).op(op::ELSE);
                         e.c.local_get(ADDR)
                             .i32_const(0x3ff)
@@ -659,7 +662,7 @@ pub fn compile(
                                 smc = true;
                                 e.c.local_get(KIND).i32_const(1).op(op::I32_EQ);
                                 e.c.local_get(ADDR)
-                                    .i32_const(RAM_SIZE as i32 - 1)
+                                    .i32_const(layout.ram_mask as i32)
                                     .op(op::I32_AND)
                                     .local_set(ADDR);
                                 e.c.local_get(ADDR)
@@ -676,7 +679,7 @@ pub fn compile(
                             // `Bus::ram_writes`).
                             e.c.local_get(KIND).i32_const(1).op(op::I32_EQ).if_();
                             e.c.local_get(ADDR)
-                                .i32_const(RAM_SIZE as i32 - 1)
+                                .i32_const(layout.ram_mask as i32)
                                 .op(op::I32_AND)
                                 .i32_const(RAM_PAGE_BITS as i32)
                                 .op(op::I32_SHR_U)

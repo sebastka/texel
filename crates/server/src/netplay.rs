@@ -59,11 +59,17 @@ const OPENER: u8 = 0;
 #[derive(Default)]
 pub struct Rooms(Mutex<HashMap<String, Room>>);
 
-/// A game a room plays, and its BIOS: what the room's code grants.
+/// A game a room plays, and its BIOS: what the room's code grants; and the
+/// cheat and patch codes the host plays it with, which everyone runs (they
+/// change what the game computes), as the host sent them.
 struct Playing {
     game: String,
     bios: String,
+    codes: Value,
 }
+
+/// The codes a room plays with, at most (as JSON).
+const MAX_CODES: usize = 256 << 10;
 
 struct Room {
     /// None while the host chooses.
@@ -239,6 +245,7 @@ fn welcome(code: &str, you: u8, room: &Room) -> Value {
         "host": room.host,
         "game": room.playing.as_ref().map(|p| &p.game),
         "bios": room.playing.as_ref().map(|p| &p.bios),
+        "codes": room.playing.as_ref().map(|p| &p.codes),
         "epoch": room.epoch,
         "members": room.roster(),
         "chat": room.chat,
@@ -367,9 +374,15 @@ fn leave(state: &AppState, code: &str, id: u8) {
 /// everyone follows, in a new epoch.
 async fn load(state: &AppState, code: &str, from: u8, msg: &serde_json::Map<String, Value>) -> Vec<u8> {
     let field = |k: &str| msg.get(k).and_then(Value::as_str).map(str::to_owned);
+    let codes = msg
+        .get("codes")
+        .filter(|c| c.to_string().len() <= MAX_CODES)
+        .cloned()
+        .unwrap_or(Value::Null);
     let playing = field("game").map(|game| Playing {
         game,
         bios: field("bios").unwrap_or_default(),
+        codes,
     });
     let ok = match &playing {
         Some(p) => playable(&state.library.read().await.clone(), &p.game, &p.bios),
@@ -395,7 +408,8 @@ async fn load(state: &AppState, code: &str, from: u8, msg: &serde_json::Map<Stri
     let game = room.playing.as_ref().map(|p| p.game.as_str());
     tracing::info!(%code, game = game.unwrap_or("none"), "netplay game changed");
     let bios = room.playing.as_ref().map(|p| p.bios.as_str());
-    let change = json!({ "type": "game", "game": game, "bios": bios, "epoch": room.epoch });
+    let codes = room.playing.as_ref().map(|p| &p.codes);
+    let change = json!({ "type": "game", "game": game, "bios": bios, "codes": codes, "epoch": room.epoch });
     room.broadcast(None, &text(&change))
 }
 

@@ -4,7 +4,7 @@ import type { Console, GameDetail } from "./api";
 import { createRing } from "./audio";
 import workletUrl from "./audio-worklet.ts?worker&url";
 import { Input } from "./input";
-import type { FromWorker, NetStatus, Ports, RoomSnapshot, Slots, SplitView, StartMessage, ToWorker } from "./protocol";
+import type { CodeSet, FromWorker, NetStatus, Ports, RoomSnapshot, Slots, SplitView, StartMessage, ToWorker } from "./protocol";
 
 interface Callbacks {
   onStatus: (s: string) => void;
@@ -16,6 +16,8 @@ interface Callbacks {
   /** Running: with what renderer (WebGPU, or null for software). */
   /** precise: precise geometry can be shown. */
   onStarted?: (renderer: string | null, precise: boolean) => void;
+  /** Codes the emulator refused, and why. */
+  onCodesRefused?: (refused: [string, string][]) => void;
   /** The room's game, as this player runs it. */
   onNet?: (status: NetStatus) => void;
   /** A message for the room. */
@@ -117,7 +119,7 @@ export class Player {
 
   /** Starts a game with the user's memory `cards`; with `room`, as that
    * netplay room's game (a guest then gets the host's cards). */
-  async start(biosId: string, game: GameDetail, cards: Slots, room: RoomSnapshot | null = null) {
+  async start(biosId: string, game: GameDetail, cards: Slots, room: RoomSnapshot | null = null, codes: CodeSet | null = null) {
     await this.launch({
       console: "ps1",
       biosId,
@@ -127,7 +129,13 @@ export class Player {
       files: game.files,
       sbi: game.sbi,
       room,
+      codes,
     });
+  }
+
+  /** The cheat and patch codes enabled from now on. */
+  setCodes(set: CodeSet | null) {
+    this.send({ type: "codes", set: set ?? { codes: [], overclock: 100, ramMiB: 2, wide: false, noGteWidescreen: false } });
   }
 
   /** A console: its BIOS, to its menu, or for the PS2 with a game's disc
@@ -142,10 +150,11 @@ export class Player {
       files: game?.files ?? [],
       sbi: false,
       room: null,
+      codes: null,
     });
   }
 
-  private async launch(what: Pick<StartMessage, "console" | "biosId" | "gameId" | "cards" | "cue" | "files" | "sbi" | "room">) {
+  private async launch(what: Pick<StartMessage, "console" | "biosId" | "gameId" | "cards" | "cue" | "files" | "sbi" | "room" | "codes">) {
     const canvas = document.createElement("canvas");
     canvas.width = 640;
     canvas.height = 480;
@@ -219,6 +228,9 @@ export class Player {
 
   private onMessage(msg: FromWorker) {
     switch (msg.type) {
+      case "codes-refused":
+        this.cb.onCodesRefused?.(msg.refused);
+        break;
       case "started":
         this.pal = msg.pal;
         this.renderer = msg.renderer;

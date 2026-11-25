@@ -10,6 +10,8 @@ use crate::spu::Spu;
 use crate::timers::Timers;
 
 pub const RAM_SIZE: usize = 2 * 1024 * 1024;
+/// RAM expanded (`Bus::set_ram_size`), as development consoles had.
+pub const RAM_MAX: usize = 8 * 1024 * 1024;
 pub const BIOS_SIZE: usize = 512 * 1024;
 
 /// Strips the segment (KUSEG, KSEG0, KSEG1) from a virtual address.
@@ -45,6 +47,12 @@ pub struct Bus {
     /// sync (see [`Bus::sync`]).
     #[serde(skip, default = "slice")]
     pub deadline: u32,
+    /// The CPU's speed, in percent of its own (see `set_overclock`), and
+    /// the CPU cycles left over from the last conversion (hundredths).
+    #[serde(skip, default = "hundred")]
+    overclock: u32,
+    #[serde(skip)]
+    overclock_frac: u32,
     /// Diagnostics: the deadline every sync sets.
     #[serde(skip, default = "slice")]
     pub slice: u32,
@@ -84,6 +92,8 @@ impl Bus {
             cache_ctrl: 0,
             pending: 0,
             deadline: SLICE,
+            overclock: 100,
+            overclock_frac: 0,
             ram_writes: ram_pages(),
             slice: SLICE,
             elapsed: 0,
@@ -110,9 +120,48 @@ impl Bus {
     pub fn sync(&mut self) {
         while self.pending > 0 {
             let cycles = std::mem::take(&mut self.pending);
+            let cycles = self.peripheral_cycles(cycles);
             self.tick(cycles);
         }
-        self.deadline = self.next_event();
+        self.deadline = self.next_deadline();
+    }
+
+    /// The CPU overclocked (some patches need it: see `cheats`), as a
+    /// percentage of its speed: it runs this much faster than the
+    /// peripherals, which see fewer cycles for as many of the CPU's.
+    pub fn set_overclock(&mut self, percent: u32) {
+        self.overclock = percent.max(100);
+        self.overclock_frac = 0;
+    }
+
+    pub fn overclock(&self) -> u32 {
+        self.overclock
+    }
+
+    /// When the next sync is due, in the CPU's cycles (see `next_event`).
+    fn next_deadline(&mut self) -> u32 {
+        let next = self.next_event();
+        self.to_cpu_cycles(next)
+    }
+
+    /// The peripherals' cycles for the CPU's.
+    fn peripheral_cycles(&mut self, cpu: u32) -> u32 {
+        if self.overclock == 100 {
+            return cpu;
+        }
+        let total = u64::from(cpu) * 100 + u64::from(self.overclock_frac);
+        let oc = u64::from(self.overclock);
+        self.overclock_frac = (total % oc) as u32;
+        (total / oc) as u32
+    }
+
+    /// The CPU's cycles for the peripherals' (rounded up: no sooner).
+    fn to_cpu_cycles(&self, peripheral: u32) -> u32 {
+        if self.overclock == 100 {
+            return peripheral;
+        }
+        let need = (u64::from(peripheral) * u64::from(self.overclock)).saturating_sub(u64::from(self.overclock_frac));
+        need.div_ceil(100).clamp(1, u64::from(u32::MAX)) as u32
     }
 
     /// The CPU cycles from the last sync until a peripheral may raise an
@@ -148,7 +197,7 @@ impl Bus {
     pub fn fetch(&mut self, addr: u32) -> u32 {
         let p = physical(addr);
         if p < 0x0080_0000 {
-            let o = (p as usize) & (RAM_SIZE - 1);
+            let o = (p & self.ram_mask()) as usize;
             read_u32(&self.ram, o)
         } else if (0x1fc0_0000..0x1fc8_0000).contains(&p) {
             read_u32(&self.bios, (p - 0x1fc0_0000) as usize)
@@ -160,7 +209,7 @@ impl Bus {
     pub fn load32(&mut self, addr: u32) -> u32 {
         let p = physical(addr);
         match p {
-            0x0000_0000..=0x007f_ffff => read_u32(&self.ram, (p as usize) & (RAM_SIZE - 1)),
+            0x0000_0000..=0x007f_ffff => read_u32(&self.ram, (p & self.ram_mask()) as usize),
             0x1f80_0000..=0x1f80_03ff => read_u32(&self.scratchpad, (p & 0x3ff) as usize),
             0x1fc0_0000..=0x1fc7_ffff => read_u32(&self.bios, (p - 0x1fc0_0000) as usize),
             0x1f80_1000..=0x1f80_1fff => self.io_read(p, 4),
@@ -172,7 +221,7 @@ impl Bus {
     pub fn load16(&mut self, addr: u32) -> u16 {
         let p = physical(addr);
         match p {
-            0x0000_0000..=0x007f_ffff => read_u16(&self.ram, (p as usize) & (RAM_SIZE - 1)),
+            0x0000_0000..=0x007f_ffff => read_u16(&self.ram, (p & self.ram_mask()) as usize),
             0x1f80_0000..=0x1f80_03ff => read_u16(&self.scratchpad, (p & 0x3ff) as usize),
             0x1fc0_0000..=0x1fc7_ffff => read_u16(&self.bios, (p - 0x1fc0_0000) as usize),
             0x1f80_1000..=0x1f80_1fff => self.io_read(p, 2) as u16,
@@ -183,11 +232,30 @@ impl Bus {
     pub fn load8(&mut self, addr: u32) -> u8 {
         let p = physical(addr);
         match p {
-            0x0000_0000..=0x007f_ffff => self.ram[(p as usize) & (RAM_SIZE - 1)],
+            0x0000_0000..=0x007f_ffff => self.ram[(p & self.ram_mask()) as usize],
             0x1f80_0000..=0x1f80_03ff => self.scratchpad[(p & 0x3ff) as usize],
             0x1fc0_0000..=0x1fc7_ffff => self.bios[(p - 0x1fc0_0000) as usize],
             0x1f80_1000..=0x1f80_1fff => self.io_read(p, 1) as u8,
             _ => 0xff,
+        }
+    }
+
+    /// RAM's addresses' mask: its size (2 MiB, or 8 MiB expanded: see
+    /// `set_ram_size`), less one; RAM's 8 MiB window mirrors it.
+    #[inline]
+    pub fn ram_mask(&self) -> u32 {
+        self.ram.len() as u32 - 1
+    }
+
+    /// Expands RAM to 8 MiB (development consoles' size, which some
+    /// patches use: see `cheats`), or back to 2 MiB; what it holds stays,
+    /// as far as it fits.
+    pub fn set_ram_size(&mut self, size: usize) {
+        if size != self.ram.len() {
+            let mut ram = vec![0; size].into_boxed_slice();
+            let n = size.min(self.ram.len());
+            ram[..n].copy_from_slice(&self.ram[..n]);
+            self.ram = ram;
         }
     }
 
@@ -202,7 +270,7 @@ impl Bus {
         let p = physical(addr);
         match p {
             0x0000_0000..=0x007f_ffff => {
-                let o = (p as usize) & (RAM_SIZE - 1);
+                let o = (p & self.ram_mask()) as usize;
                 self.wrote_ram(o);
                 write_u32(&mut self.ram, o, v);
             }
@@ -217,7 +285,7 @@ impl Bus {
         let p = physical(addr);
         match p {
             0x0000_0000..=0x007f_ffff => {
-                let o = (p as usize) & (RAM_SIZE - 1);
+                let o = (p & self.ram_mask()) as usize;
                 self.wrote_ram(o);
                 write_u16(&mut self.ram, o, v);
             }
@@ -231,7 +299,7 @@ impl Bus {
         let p = physical(addr);
         match p {
             0x0000_0000..=0x007f_ffff => {
-                let o = (p as usize) & (RAM_SIZE - 1);
+                let o = (p & self.ram_mask()) as usize;
                 self.wrote_ram(o);
                 self.ram[o] = v;
             }
@@ -244,7 +312,7 @@ impl Bus {
     fn io_read(&mut self, p: u32, size: u32) -> u32 {
         self.sync();
         let v = self.io_read_at(p, size);
-        self.deadline = self.next_event();
+        self.deadline = self.next_deadline();
         v
     }
 
@@ -285,7 +353,7 @@ impl Bus {
     fn io_write(&mut self, p: u32, v: u32, size: u32) {
         self.sync();
         self.io_write_at(p, v, size);
-        self.deadline = self.next_event();
+        self.deadline = self.next_deadline();
     }
 
     fn io_write_at(&mut self, p: u32, v: u32, size: u32) {
@@ -355,7 +423,8 @@ impl Bus {
         let ch = self.dma.channel(port);
         let to_ram = !ch.is_from_ram();
         let step: u32 = if ch.decrement() { 0u32.wrapping_sub(4) } else { 4 };
-        let mut addr = ch.base & 0x1f_fffc;
+        let ram = self.ram_mask() & !3;
+        let mut addr = ch.base & ram;
         let mut dma_words = ch.word_count();
         let mut last_drawing = 0;
         if ch.sync_mode() == 2 {
@@ -372,16 +441,16 @@ impl Bus {
                 let v = if n == words - 1 {
                     0x00ff_ffff
                 } else {
-                    addr.wrapping_sub(4) & 0x1f_ffff
+                    addr.wrapping_sub(4) & self.ram_mask()
                 };
                 self.wrote_ram(addr as usize);
                 write_u32(&mut self.ram, addr as usize, v);
-                addr = addr.wrapping_sub(4) & 0x1f_fffc;
+                addr = addr.wrapping_sub(4) & ram;
             }
         } else {
             let words = ch.word_count();
             for _ in 0..words {
-                let a = (addr & 0x1f_fffc) as usize;
+                let a = (addr & ram) as usize;
                 if to_ram {
                     let v = match port {
                         Port::MdecOut => self.mdec.read_data(),
@@ -404,7 +473,7 @@ impl Bus {
                 addr = addr.wrapping_add(step);
             }
             if ch.sync_mode() == 1 {
-                self.dma.channel_mut(port).base = addr & 0x1f_fffc;
+                self.dma.channel_mut(port).base = addr & ram;
             }
         }
         // The CPU is halted while the DMA controller owns the bus. A
@@ -442,17 +511,18 @@ impl Bus {
             // At its end already.
             return (0, 0);
         }
+        let ram = self.ram_mask() & !3;
         // A second walker, at half speed: the first meets it again in a
         // loop (Floyd's cycle detection: no memory of the nodes needed).
         let mut slow = addr;
         // Bounded too, as the walk is.
         for step in 0..0x10_0000u32 {
-            let header = read_u32(&self.ram, (addr & 0x1f_fffc) as usize);
+            let header = read_u32(&self.ram, (addr & ram) as usize);
             let words = header >> 24;
             total += words + 1;
             let before = self.gpu.drawing();
             for n in 1..=words {
-                let a = (addr.wrapping_add(n * 4) & 0x1f_fffc) as usize;
+                let a = (addr.wrapping_add(n * 4) & ram) as usize;
                 self.gpu.gp0(read_u32(&self.ram, a));
             }
             if words > 0 {
@@ -461,11 +531,11 @@ impl Bus {
             if header & 0x0080_0000 != 0 {
                 break;
             }
-            addr = header & 0x1f_fffc;
+            addr = header & ram;
             if step % 2 == 1 {
-                slow = read_u32(&self.ram, (slow & 0x1f_fffc) as usize) & 0x1f_fffc;
+                slow = read_u32(&self.ram, (slow & ram) as usize) & ram;
             }
-            if addr == slow & 0x1f_fffc {
+            if addr == slow & ram {
                 break;
             }
         }
@@ -529,11 +599,15 @@ fn slice() -> u32 {
     SLICE
 }
 
+fn hundred() -> u32 {
+    100
+}
+
 /// RAM's pages for `Bus::ram_writes`: 256 bytes.
 pub const RAM_PAGE_BITS: u32 = 8;
 
 fn ram_pages() -> Box<[u32]> {
-    vec![0; RAM_SIZE >> RAM_PAGE_BITS].into_boxed_slice()
+    vec![0; RAM_MAX >> RAM_PAGE_BITS].into_boxed_slice()
 }
 
 pub fn read_u32(mem: &[u8], o: usize) -> u32 {

@@ -9,6 +9,8 @@
 //
 // PRESS="600:start,800:cross": hold a button for 6 frames from a frame.
 // COMPILED_ONLY=1 runs only the compiled console (to measure it).
+// OVERCLOCK=200 (the CPU's speed, %), RAM=8 (MiB), CODES=file (cheat and
+// patch codes, as `setCodes` takes them): both consoles with them.
 import { fstatSync, openSync, readFileSync, readSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -47,6 +49,12 @@ async function run(compiled) {
   const emu = new mod.Emulator(bios);
   emu.insertDisc(cue, names, sizes, read, undefined);
   emu.setCompiler(compiled);
+  if (process.env.OVERCLOCK) emu.setOverclock(Number(process.env.OVERCLOCK));
+  if (process.env.RAM) emu.setRamSize(Number(process.env.RAM));
+  if (process.env.CODES) {
+    const refused = emu.setCodes(readFileSync(process.env.CODES, "utf8"));
+    if (refused) console.log(`codes refused:\n${refused}`);
+  }
   const sums = [];
   const started = performance.now();
   for (let f = 1; f <= frames; f++) {

@@ -23,7 +23,7 @@ pub mod wasm;
 use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
 
-use crate::bus::{Bus, RAM_PAGE_BITS, RAM_SIZE};
+use crate::bus::{Bus, RAM_PAGE_BITS};
 use crate::cpu::{Cpu, CpuBus};
 
 pub use compile::{Compiled, Layout, MAX_LEN, batch, compile};
@@ -234,7 +234,7 @@ impl Jit {
         let layout = Layout::new(cpu, bus);
         let icache = bus.icache_enabled();
         let ram_range = ram.then(|| {
-            let start = pa & (RAM_SIZE as u32 - 1);
+            let start = pa & bus.ram_mask();
             (start, start + 4 * words.len() as u32)
         });
         let Some(compiled) = compile(pc, &words, icache, ram_range, self.backend.exec_index(), &layout) else {
@@ -244,7 +244,7 @@ impl Jit {
         self.stats.total += u64::from(compiled.len);
         // The code it was compiled from, as it must still be (RAM only:
         // the BIOS does not change).
-        let pa = if ram { pa & (RAM_SIZE as u32 - 1) } else { u32::MAX };
+        let pa = if ram { pa & bus.ram_mask() } else { u32::MAX };
         let code = if ram {
             code_at(bus, pa, 4 * compiled.len as usize)
                 .map(<[u8]>::to_vec)
@@ -336,7 +336,7 @@ fn page_writes(bus: &Bus, pa: u32, len: usize) -> [u32; 2] {
         return [0; 2];
     }
     let first = pa as usize >> RAM_PAGE_BITS;
-    let last = ((pa as usize + len - 1) & (RAM_SIZE - 1)) >> RAM_PAGE_BITS;
+    let last = ((pa as usize + len - 1) & bus.ram_mask() as usize) >> RAM_PAGE_BITS;
     [bus.ram_writes[first], bus.ram_writes[last]]
 }
 

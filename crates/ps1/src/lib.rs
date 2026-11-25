@@ -6,6 +6,7 @@
 
 pub mod bus;
 mod cdrom;
+pub mod cheats;
 pub mod cpu;
 mod dma;
 mod gpu;
@@ -131,6 +132,8 @@ pub struct System {
     frame_stale: bool,
     /// The CPU's code compiled to WebAssembly (browsers), when set.
     jit: Option<Box<jit::Jit>>,
+    /// Cheat and patch codes enabled (see `set_codes`).
+    cheats: cheats::Cheats,
     /// Enhancements on (see `set_precise_geometry`, `set_widescreen`): kept
     /// across resets and restored states.
     precise: bool,
@@ -151,6 +154,7 @@ impl System {
             frame_size: (0, 0),
             frame_stale: false,
             jit: None,
+            cheats: cheats::Cheats::default(),
             precise: false,
             widescreen: false,
         })
@@ -229,8 +233,12 @@ impl System {
     /// Runs until the GPU starts its next vertical blank.
     pub fn run_frame(&mut self) {
         self.bus.gpu.frame_ready = false;
+        if !self.cheats.is_empty() {
+            let pad = self.cheat_pad();
+            self.cheats.run(cheats::Activation::StartFrame, &mut self.bus, pad);
+        }
         // A frame is ~570k cycles; bail out after two in case video is off.
-        let mut budget = 2 * CPU_CLOCK / 50;
+        let mut budget = 2 * CPU_CLOCK / 50 * self.bus.overclock() / 100;
         while !self.bus.gpu.frame_ready && budget > 0 {
             // A compiled block counts its cycles into `pending` itself.
             let compiled = self.exe.is_none()
@@ -250,6 +258,10 @@ impl System {
             {
                 self.start_exe(&exe);
             }
+        }
+        if !self.cheats.is_empty() {
+            let pad = self.cheat_pad();
+            self.cheats.run(cheats::Activation::EndFrame, &mut self.bus, pad);
         }
         self.frame_size = self.bus.gpu.display_dims();
         self.frame_stale = true;
@@ -298,6 +310,56 @@ impl System {
     pub fn debug_cpu(&self) -> (u64, u32) {
         let bytes = postcard::to_stdvec(&self.cpu).unwrap_or_default();
         (fnv1a(&bytes), self.cpu.pc)
+    }
+
+    /// The cheat and patch codes enabled from now on, in order (see
+    /// `cheats`): (name, body with options filled in, activation). Those
+    /// no longer enabled put back what they replaced. Returns the codes
+    /// refused, and why. They change what the console computes: netplay
+    /// peers must enable the same at the same frames.
+    pub fn set_codes(&mut self, codes: &[(String, String, cheats::Activation)]) -> Vec<(String, String)> {
+        let mut ok = Vec::new();
+        let mut refused = Vec::new();
+        for (name, body, activation) in codes {
+            match cheats::Code::parse(name, body, *activation) {
+                Ok(code) => ok.push(code),
+                Err(e) => refused.push((name.clone(), e)),
+            }
+        }
+        let pad = self.cheat_pad();
+        self.cheats.set(ok, &mut self.bus, pad);
+        refused
+    }
+
+    /// Port 1's controller, as codes read it (jokers).
+    fn cheat_pad(&self) -> cheats::Pad {
+        let p = &self.bus.sio.pads[0];
+        cheats::Pad {
+            buttons: p.buttons,
+            axes: p.axes,
+        }
+    }
+
+    /// RAM's size: 2 MiB, or 8 MiB as development consoles (some patches
+    /// need it). Compiled code is dropped: it knows RAM's place and size.
+    pub fn set_ram_size(&mut self, bytes: usize) {
+        let bytes = if bytes > bus::RAM_SIZE {
+            bus::RAM_MAX
+        } else {
+            bus::RAM_SIZE
+        };
+        if bytes != self.bus.ram.len() {
+            self.bus.set_ram_size(bytes);
+            if let Some(jit) = &mut self.jit {
+                jit.clear();
+            }
+        }
+    }
+
+    /// The CPU's speed, in percent (100: the console's; some patches need
+    /// more).
+    pub fn set_overclock(&mut self, percent: u32) {
+        self.bus.set_overclock(percent);
     }
 
     /// The last frame, RGBA8888, and its size.

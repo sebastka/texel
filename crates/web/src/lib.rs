@@ -228,6 +228,51 @@ impl Emulator {
         self.system.set_precise_geometry(on);
     }
 
+    /// The cheat and patch codes enabled from now on (see `texel_ps1::cheats`):
+    /// lines of `activation<TAB>name`, then the code's lines (its `?` digits
+    /// filled), codes separated by an empty line. Returns those refused, a
+    /// line each: `name<TAB>why`.
+    #[wasm_bindgen(js_name = setCodes)]
+    pub fn set_codes(&mut self, codes: &str) -> String {
+        use texel_ps1::cheats::Activation;
+        let parsed: Vec<(String, String, Activation)> = codes
+            .split("\n\n")
+            .filter_map(|block| {
+                let (head, body) = block.split_once('\n')?;
+                let (activation, name) = head.split_once('\t')?;
+                let activation = match activation {
+                    "StartFrame" => Activation::StartFrame,
+                    "Manual" => Activation::Manual,
+                    _ => Activation::EndFrame,
+                };
+                Some((name.to_owned(), body.to_owned(), activation))
+            })
+            .collect();
+        self.system
+            .set_codes(&parsed)
+            .into_iter()
+            .map(|(name, why)| format!("{name}\t{why}\n"))
+            .collect()
+    }
+
+    /// Diagnostics: a word of memory, as the CPU reads it.
+    #[wasm_bindgen(js_name = debugRead32)]
+    pub fn debug_read32(&mut self, addr: u32) -> u32 {
+        self.system.debug_read32(addr)
+    }
+
+    /// The CPU's speed, in percent (some patches need more than 100).
+    #[wasm_bindgen(js_name = setOverclock)]
+    pub fn set_overclock(&mut self, percent: u32) {
+        self.system.set_overclock(percent);
+    }
+
+    /// RAM, in MiB: 2, or 8 as development consoles (some patches).
+    #[wasm_bindgen(js_name = setRamSize)]
+    pub fn set_ram_size(&mut self, mib: u32) {
+        self.system.set_ram_size(mib as usize * 1024 * 1024);
+    }
+
     /// Widescreen: 3D squeezed for a 16:9 picture (changes what the console
     /// computes: not in netplay).
     #[wasm_bindgen(js_name = setWidescreen)]

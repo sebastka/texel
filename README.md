@@ -7,7 +7,7 @@ PlayStation and PlayStation 2 emulators that run in the browser, with a self-hos
 
 Point the server at your BIOS images and disc images: it identifies and verifies them against Redump, finds their artwork and descriptions, and serves a web app where each signed-in user plays them, keeps their own memory cards and save states, and plays together with friends in rooms. The emulators run in the browser (Rust compiled to WebAssembly); the server serves the files and keeps the saves.
 
-- **PlayStation**: commercial games run at full speed, with FMVs, CD audio and reverb; upscaling (to 4×, on the GPU through WebGPU), precise geometry without wobbling polygons, widescreen; DualShock with rumble, keyboard or gamepads.
+- **PlayStation**: commercial games run at full speed, with FMVs, CD audio and reverb; upscaling (to 4×, on the GPU through WebGPU), precise geometry without wobbling polygons, widescreen; cheats and patches (draw distance, 60 fps) from DuckStation's database; DualShock with rumble, keyboard or gamepads.
 - **PlayStation 2**: in progress. Retail BIOSes boot, and many games reach their menus or play (Jak and Daxter, GTA San Andreas's intro, Grooverider…), some slowly; others stop early. Movies, sound, memory cards and save states work.
 - **Library**: CUE/BIN, ISO, CHD, PBP, and zips of these, read without unpacking; games verified against Redump in the background; box art, screenshots and descriptions (libretro-thumbnails, Wikipedia, Wikidata, optionally IGDB).
 - **Saves**: memory cards and save states per user, in a database, with screenshots; cards are managed (renamed, copied, their saves moved between cards) in the web app.
@@ -118,7 +118,7 @@ Environment variables (or the server's options of the same names: `texel --help`
 | `TEXEL_WEB` | `/usr/share/texel/web` | The built web app |
 | `TEXEL_LISTEN` | `0.0.0.0:8080` | Listen address |
 | `TEXEL_PUBLIC_URL` | | The address users reach Texel at (`https://texel.example.com`): OpenID Connect's redirect, secure cookies, the same-origin check. Without it, the request's host, over http |
-| `TEXEL_FETCH_METADATA` | `true` | Fetch DATs, artwork and game details |
+| `TEXEL_FETCH_METADATA` | `true` | Fetch DATs, artwork, game details, and DuckStation's cheat and patch database |
 | `TEXEL_FETCH_OPEN_BIOS` | `true` | Download the open-source BIOSes (OpenBIOS, OpenPS2BIOS) when a newer one is published (checked at start) |
 | `TEXEL_VERIFY` | `true` | Hash games in the background to verify them against Redump |
 | `TEXEL_RESCAN_MINUTES` | `30` | Rescan the library periodically (0: off) |
@@ -150,7 +150,7 @@ A game's page has its Play button, with the memory cards to use (the game's last
 
 - **Keyboard**, split like the controller: WASD or the arrow keys for the D-pad, I △, J □, K ✕, L ○, Q/E L1/R1, 1/3 L2/R2, Enter Start, Backspace or Right Shift Select; F5 saves a state to slot 1, F9 loads it.
 - **Gamepads** use the browser's standard layout, with both sticks; their Home button is the DualShock's Analog button. A pad the browser does not know shows "Set up gamepad" in the player's toolbar, to record its layout one control at a time.
-- **The player's toolbar** has save states (4 slots per disc, with screenshots), disc changes, Analog, Resolution (1× to 4×), Precise geometry, Widescreen, Smooth, Fast-forward and Fullscreen.
+- **The player's toolbar** has save states (4 slots per disc, with screenshots), disc changes, Analog, Resolution (1× to 4×), Precise geometry, Widescreen, Smooth, Fast-forward and Fullscreen; and Codes, for a PlayStation game with cheats or patches: each opt-in, remembered per game (a room plays with its host's).
 
 **Playing together**: Play together, in the header, opens a room; friends join with its code (Join) or its link, signed in or not (then the room's code only lets them load its game). The game the host starts is the room's: everyone's browser runs it in step. Two people play, on the console's two controllers, handed out by the host (several people on one controller share it); the others watch. The host may hide each player's half of the screen from the other. While others are in the room, resets, save states and disc changes are off. When the host leaves, the first member with an account takes over.
 

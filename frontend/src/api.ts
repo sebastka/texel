@@ -228,6 +228,34 @@ export interface SaveState {
 /** A card's image: what the emulator inserts and writes back. */
 export const cardUrl = (id: number) => `/api/cards/${id}/data`;
 
+/** A code as DuckStation's database gives it (the server parses it). */
+export interface FileCode {
+  /** Its name, `\\` separating groups. */
+  name: string;
+  description: string | null;
+  author: string | null;
+  activation: string;
+  /** "Gameshark" (supported) or "Assembly" (not). */
+  kind: string;
+  /** Named choices for its `?` digits, or a range. */
+  options: [string, number][];
+  range: [number, number] | null;
+  overrides: {
+    aspectRatio: string | null;
+    cpuOverclock: number | null;
+    ramMib: number | null;
+    disableWidescreen: boolean;
+  };
+  body: string;
+}
+
+export interface GameCodes {
+  /** The database is on the server (downloaded with the DATs). */
+  available: boolean;
+  patches: FileCode[];
+  cheats: FileCode[];
+}
+
 export const api = {
   /** The signed-in user, or null. */
   me: async (): Promise<User | null> => {
@@ -272,6 +300,8 @@ export const api = {
   firmware: () => json<Firmware[]>("/api/firmware"),
   games: () => json<GameListItem[]>("/api/games"),
   game: (id: string) => json<GameDetail>(`/api/games/${encodeURIComponent(id)}`),
+  /** A PlayStation game's cheat and patch codes (DuckStation's database). */
+  codes: (id: string) => json<GameCodes>(`/api/games/${encodeURIComponent(id)}/codes`),
   room: (code: string) =>
     json<{ game: string | null; bios: string | null; full: boolean }>(`/api/netplay/rooms/${encodeURIComponent(code)}`),
   /** Records the BIOS a game is started with, preselected next time. */

@@ -4,6 +4,8 @@ import { accountMenu } from "./account-menu";
 import { renderAdmin } from "./admin";
 import { api, gameRegion, image, type Bios, type Console, type Firmware, type Game, type GameDetail, type GameListItem, type SaveState, type User } from "./api";
 import { renderCards } from "./cards";
+import { codesPanel } from "./codes";
+import type { CodeSet } from "./protocol";
 import {
   REDUMP_EXPLAINED,
   VERIFY_LABELS,
@@ -1504,9 +1506,31 @@ function renderPlayer(id: string, biosId: string, roomGame = false, cards: Slots
     },
     "",
   ) as HTMLButtonElement;
+  // Patches can render 16:9 themselves: the picture is then shown so.
+  let codesWide = false;
   const setWide = (on: boolean) => {
     showToggle(wide, "Widescreen", on);
-    screen.classList.toggle("wide", on);
+    screen.classList.toggle("wide", on || codesWide);
+  };
+  // Cheat and patch codes: a panel under the header, when the game has some.
+  let codesUi: ReturnType<typeof codesPanel> | null = null;
+  const codesSlot = h("div");
+  const codesButton = h(
+    "button.ghost",
+    {
+      hidden: true,
+      title: "Cheats and patches (draw distance, 60 fps, widescreen...) for this game.",
+      onclick: () => {
+        if (codesUi) codesUi.panel.hidden = !codesUi.panel.hidden;
+      },
+    },
+    "Codes",
+  ) as HTMLButtonElement;
+  const showCodes = (set: CodeSet | null) => {
+    codesWide = !!set?.wide;
+    // A patch doing its own widescreen: not the GTE's too.
+    if (set?.noGteWidescreen && player?.widescreen) setWide(player.setWidescreen(false));
+    else setWide(player?.widescreen ?? false);
   };
   const fast = fastToggle();
   fast.hidden = guest;
@@ -1531,6 +1555,8 @@ function renderPlayer(id: string, biosId: string, roomGame = false, cards: Slots
     fast.disabled = inRoom;
     if (inRoom && player?.widescreen) setWide(player.setWidescreen(false));
     wide.disabled = inRoom;
+    // Codes change the game: the room's are the host's, as it started it.
+    codesUi?.lock(inRoom);
     if (locked) statesPanel.hidden = true;
     if (discPicker) discPicker.disabled = inRoom;
   };
@@ -1590,6 +1616,7 @@ function renderPlayer(id: string, biosId: string, roomGame = false, cards: Slots
               fast,
               reset,
               statesButton,
+              codesButton,
               analog,
               resolution,
               precise,
@@ -1600,6 +1627,7 @@ function renderPlayer(id: string, biosId: string, roomGame = false, cards: Slots
             ),
           ),
           statesPanel,
+          codesSlot,
           screen,
         ),
         side,
@@ -1630,6 +1658,7 @@ function renderPlayer(id: string, biosId: string, roomGame = false, cards: Slots
       precise.disabled = !shown;
       if (!shown) precise.title += " Not available here: it needs WebGPU, or a spare processor core for drawing.";
     },
+    onCodesRefused: (refused) => codesUi?.refused(refused),
     onAnalog: (on) => {
       analog.textContent = on ? "Analog: on" : "Analog: off";
       analog.setAttribute("aria-pressed", String(on));
@@ -1653,7 +1682,7 @@ function renderPlayer(id: string, biosId: string, roomGame = false, cards: Slots
   setWide(room ? player.setWidescreen(false) : player.widescreen);
   const started = player;
   void api.game(id).then(
-    (g) => {
+    async (g) => {
       // A guest without an account has no library to name the game from.
       if (!now.textContent) {
         now.textContent = g.title;
@@ -1662,13 +1691,32 @@ function renderPlayer(id: string, biosId: string, roomGame = false, cards: Slots
       if (player !== started) return;
       if (guest && room) {
         attach(room);
-        // The host's cards come with its state.
-        return started.start(biosId, g, [null, null], room.snapshot());
+        // The host's codes, as everyone's; its cards come with its state.
+        const set = room.game?.codes ?? null;
+        showCodes(set);
+        return started.start(biosId, g, [null, null], room.snapshot(), set);
       }
-      const done = started.start(biosId, g, cards ?? g.lastCards);
+      // The game's codes, those chosen before enabled from the start.
+      const codes = await api.codes(id).catch(() => null);
+      if (player !== started) return;
+      let set: CodeSet | null = null;
+      if (codes && (codes.patches.length || codes.cheats.length)) {
+        codesUi = codesPanel(id, codes, (s) => {
+          showCodes(s);
+          player?.setCodes(s);
+          if (playing) playing.codes = s;
+        });
+        codesSlot.replaceChildren(codesUi.panel);
+        codesButton.hidden = false;
+        set = codesUi.initial;
+        lock();
+      }
+      showCodes(set);
+      if (playing) playing.codes = set;
+      const done = started.start(biosId, g, cards ?? g.lastCards, null, set);
       // A host's game is the room's: everyone follows (see the room's
-      // `game` event).
-      if (room?.isHost && room.state === "open") room.load({ game: id, bios: biosId });
+      // `game` event), with its codes.
+      if (room?.isHost && room.state === "open") room.load({ game: id, bios: biosId, codes: set });
       return done;
     },
     (e: unknown) => (status.textContent = String(e)),

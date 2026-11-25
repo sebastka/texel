@@ -11,7 +11,7 @@ import type { ToVu1 } from "./vu1-worker";
 import { type Painter, painter as makePainter } from "./paint";
 import { Session } from "./netplay";
 import { cardUrl } from "./api";
-import type { Axes, FromWorker, RoomSnapshot, Slots, StartMessage, ToWorker } from "./protocol";
+import type { Axes, CodeSet, FromWorker, RoomSnapshot, Slots, StartMessage, ToWorker } from "./protocol";
 
 const scope = self as unknown as DedicatedWorkerGlobalScope;
 const post = (msg: FromWorker) => scope.postMessage(msg);
@@ -293,6 +293,8 @@ async function start(msg: StartMessage) {
       (msg.sbi ? await fetchSbi(gameId) : undefined) ?? undefined,
     );
   }
+  // Codes from the start (a netplay room's, for everyone the same).
+  if (msg.codes) applyCodes(msg.codes);
   // A guest gets the host's memory cards with the game's state.
   const guest = msg.room !== null && msg.room.me !== msg.room.host;
   ownCards = !guest;
@@ -338,6 +340,31 @@ const FAST_SLICE_MS = 15;
 
 function frameInterval(): number {
   return 1000 / (emu?.isPal ? 49.76 : 59.83);
+}
+
+/** Applies cheat and patch codes (the PlayStation's: the PS2's module has
+ * none): their settings first (CPU speed, RAM size), then the codes;
+ * those refused are reported. */
+function applyCodes(set: CodeSet | null) {
+  const e = emu as {
+    setCodes?: (codes: string) => string;
+    setOverclock?: (percent: number) => void;
+    setRamSize?: (mib: number) => void;
+  } | null;
+  if (!e?.setCodes) return;
+  e.setOverclock?.(set?.overclock ?? 100);
+  e.setRamSize?.(set?.ramMiB ?? 2);
+  // A code a block: its activation and name, then its lines.
+  const text = (set?.codes ?? []).map((c) => `${c.activation}\t${c.name}\n${c.body}`).join("\n\n");
+  const refused = e
+    .setCodes(text)
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => {
+      const [name = "", why = ""] = line.split("\t");
+      return [name, why] as [string, string];
+    });
+  if (refused.length) post({ type: "codes-refused", refused });
 }
 
 /** Whether precise geometry can be shown: its triangles are recorded, for
@@ -654,6 +681,9 @@ scope.onmessage = (e: MessageEvent<ToWorker>) => {
       audioRunning = msg.running;
       // Switching to the timer: start counting from now.
       nextFrameAt = performance.now();
+      break;
+    case "codes":
+      applyCodes(msg.set);
       break;
     case "precise":
       // The PlayStation's only (the PS2's module has none).

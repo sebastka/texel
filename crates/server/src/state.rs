@@ -22,6 +22,8 @@ pub struct AppState {
     pub http: reqwest::Client,
     pub library: RwLock<Arc<Library>>,
     pub dats: RwLock<Arc<AllDats>>,
+    /// Cheat and patch codes (see `codes`).
+    pub codes: RwLock<Arc<crate::codes::CodeDb>>,
     pub hashes: RwLock<HashCache>,
     /// Saves, settings and hashes.
     pub db: crate::db::Db,
@@ -205,6 +207,7 @@ impl AppState {
             http,
             library: RwLock::new(Arc::new(Library::default())),
             dats: RwLock::new(Arc::new(AllDats::default())),
+            codes: RwLock::new(Arc::default()),
             igdb,
             images: Arc::default(),
             ready: AtomicBool::new(false),
