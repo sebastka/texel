@@ -28,8 +28,9 @@ let emu: Emulator | null = null;
  * frames go to the canvas through WebGPU. */
 let gpu: { present(width: number, height: number, smooth: boolean, hidden: number): void; readonly renderer: string | undefined } | null =
   null;
-/** The PS2's EE code is compiled to WebAssembly. */
-let compiled = false;
+/** What is compiled to WebAssembly (the PS2's EE and VUs, the PlayStation's
+ * CPU), for the player's status; null: all interpreted. */
+let compiled: string | null = null;
 /** A PS2 game's disc is in the drive (inserted by its own path). */
 let ps2Disc = false;
 let ring: Ring | null = null;
@@ -141,10 +142,10 @@ function fetchSbi(id: string): Promise<Uint8Array | null> {
   return fetchBytes(`/api/games/${encodeURIComponent(id)}/sbi`);
 }
 
-/** What the PS2 runs on, for the player's status: the GS on the GPU, the
- * EE's code compiled. */
+/** What the console runs on, for the player's status: drawing on the GPU,
+ * code compiled. */
 function renderer(): string | null {
-  const parts = [gpu ? (gpu.renderer ? `WebGPU (${gpu.renderer})` : "WebGPU") : null, compiled ? "EE and VUs compiled" : null];
+  const parts = [gpu ? (gpu.renderer ? `WebGPU (${gpu.renderer})` : "WebGPU") : null, compiled];
   const shown = parts.filter((p) => p !== null);
   return shown.length > 0 ? shown.join(" · ") : null;
 }
@@ -174,7 +175,7 @@ function startVu1Worker(ps2emu: Ps2Emulator) {
   const ops = Pipe.create(OPS_BYTES);
   const records = Pipe.create(RECORDS_BYTES);
   const worker = new Worker(new URL("./vu1-worker.ts", import.meta.url), { type: "module" });
-  worker.postMessage({ ops, records, compiler: compiled } satisfies ToVu1);
+  worker.postMessage({ ops, records, compiler: compiled !== null } satisfies ToVu1);
   const link = new Vu1Link(ops, records);
   ps2emu.setVu1Worker(
     (batch: Uint8Array) => link.send(batch),
@@ -201,7 +202,7 @@ async function start(msg: StartMessage) {
     try {
       ps2emu.setCompiler(true);
       ps2emu.setVuCompiler(true);
-      compiled = true;
+      compiled = "EE and VUs compiled";
     } catch (e) {
       console.warn("The EE's and VUs' compilers are not available, interpreting:", e);
     }
@@ -226,6 +227,15 @@ async function start(msg: StartMessage) {
     const onGpu = (await webgpu()) ? await Emulator.withGpu(bios, msg.canvas).catch(gpuFailed) : null;
     gpu = onGpu;
     emu = onGpu ?? new Emulator(bios);
+    // The CPU's code compiled to WebAssembly as it runs (it runs exactly as
+    // interpreted: netplay peers may differ); interpreted if this browser
+    // will not make modules.
+    try {
+      emu.setCompiler(true);
+      compiled = "CPU compiled";
+    } catch (e) {
+      console.warn("The CPU's compiler is not available, interpreting:", e);
+    }
     gameId = msg.gameId;
   }
   if (gameId && !ps2Disc) {

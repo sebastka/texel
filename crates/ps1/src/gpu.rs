@@ -284,7 +284,7 @@ impl Gpu {
         self.display_mode & 0x20 != 0
     }
 
-    fn dot_divider(&self) -> u32 {
+    pub(crate) fn dot_divider(&self) -> u32 {
         if self.display_mode & 0x40 != 0 {
             7
         } else {
@@ -1058,6 +1058,28 @@ impl Gpu {
         if self.is_pal() { 314 } else { 263 }
     }
 
+    /// The CPU cycles until `lines` more lines have started (see `tick`).
+    pub fn cycles_to_lines(&self, lines: u32) -> u32 {
+        let line_len: u32 = if self.is_pal() { 3406 } else { 3413 } * 7;
+        let need = (u64::from(lines) * u64::from(line_len)).saturating_sub(u64::from(self.line_frac));
+        need.div_ceil(11).clamp(1, u64::from(u32::MAX)) as u32
+    }
+
+    /// The CPU cycles until the vertical blank starts (see `tick`).
+    pub fn cycles_to_vblank(&self) -> u32 {
+        let lines = self.lines_per_frame();
+        let vblank = self.v_range.1.clamp(self.v_range.0 + 1, lines - 1);
+        let s = self.scanline;
+        let to = if s < vblank {
+            vblank - s
+        } else if s < lines {
+            lines - s + vblank
+        } else {
+            1 + vblank
+        };
+        self.cycles_to_lines(to)
+    }
+
     /// Advances video timing by `cycles` CPU cycles.
     pub fn tick(&mut self, cycles: u32) -> GpuTick {
         self.queue_drawing();
@@ -1334,37 +1356,57 @@ impl Raster<'_> {
                 self.touch([xs + lo as i32, y, xs + hi as i32, y]);
                 let first = xs + lo as i32;
                 let mut steps = DitherSteps::new(first, self.scale);
-                // The last texel, reused while the coordinates stay (the
-                // scaled pass, reading the native VRAM it does not write).
-                let mut last: Option<(i32, i32, u16)> = None;
-                let reuse = self.tex.is_some();
-                for x in first..=xs + hi as i32 {
-                    let (r, g, b) = if SHADED {
-                        ((attr[0] >> 16) as i32, (attr[1] >> 16) as i32, (attr[2] >> 16) as i32)
-                    } else {
-                        flat
+                if !TEX && !SHADED && !prim.semi && !self.check_mask {
+                    // One colour, or four (dithered): the row filled, as
+                    // `pixel` would (vectorised where it can be).
+                    let colour = |d: i32| {
+                        let c = |v: i32| ((v + d).clamp(0, 255) >> 3) as u16;
+                        c(flat.0) | (c(flat.1) << 5) | (c(flat.2) << 10) | (u16::from(self.set_mask) << 15)
                     };
-                    let (u, v) = if TEX {
-                        ((attr[3] >> 16) as i32, (attr[4] >> 16) as i32)
-                    } else {
-                        (0, 0)
-                    };
-                    let dither = dither_row.map_or(0, |d| d[steps.column()]);
-                    steps.step();
-                    let t = if TEX {
-                        self.texel_reusing(&mut last, reuse, u, v, prim)
-                    } else {
-                        0
-                    };
-                    self.pixel::<TEX>(base + x as usize, dither, r, g, b, t, prim);
-                    if SHADED {
-                        for k in 0..3 {
-                            attr[k] += planes[k].1;
+                    let row = &mut self.target[base + first as usize..=base + (xs + hi as i32) as usize];
+                    match dither_row {
+                        None => row.fill(colour(0)),
+                        Some(d) => {
+                            let colours = [colour(d[0]), colour(d[1]), colour(d[2]), colour(d[3])];
+                            for p in row {
+                                *p = colours[steps.column()];
+                                steps.step();
+                            }
                         }
                     }
-                    if TEX {
-                        attr[3] += planes[3].1;
-                        attr[4] += planes[4].1;
+                } else {
+                    // The last texel, reused while the coordinates stay (the
+                    // scaled pass, reading the native VRAM it does not write).
+                    let mut last: Option<(i32, i32, u16)> = None;
+                    let reuse = self.tex.is_some();
+                    for x in first..=xs + hi as i32 {
+                        let (r, g, b) = if SHADED {
+                            ((attr[0] >> 16) as i32, (attr[1] >> 16) as i32, (attr[2] >> 16) as i32)
+                        } else {
+                            flat
+                        };
+                        let (u, v) = if TEX {
+                            ((attr[3] >> 16) as i32, (attr[4] >> 16) as i32)
+                        } else {
+                            (0, 0)
+                        };
+                        let dither = dither_row.map_or(0, |d| d[steps.column()]);
+                        steps.step();
+                        let t = if TEX {
+                            self.texel_reusing(&mut last, reuse, u, v, prim)
+                        } else {
+                            0
+                        };
+                        self.pixel::<TEX>(base + x as usize, dither, r, g, b, t, prim);
+                        if SHADED {
+                            for k in 0..3 {
+                                attr[k] += planes[k].1;
+                            }
+                        }
+                        if TEX {
+                            attr[3] += planes[3].1;
+                            attr[4] += planes[4].1;
+                        }
                     }
                 }
             }

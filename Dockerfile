@@ -10,6 +10,7 @@ RUN apk add --no-cache binaryen \
  && rustup target add wasm32-unknown-unknown
 WORKDIR /src
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY .cargo ./.cargo
 COPY crates ./crates
 
 # wasm-bindgen-cli must be exactly the version of the wasm-bindgen crate.
@@ -27,7 +28,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
  && cargo build --profile wasm --locked --target wasm32-unknown-unknown -p texel-web -p texel-web-ps2 \
  && for m in texel_web texel_web_ps2; do \
       /opt/wasm-bindgen/bin/wasm-bindgen --target web --out-dir /wasm "target/wasm32-unknown-unknown/wasm/$m.wasm" \
-      && wasm-opt -O3 --enable-bulk-memory --enable-nontrapping-float-to-int --enable-sign-ext --enable-mutable-globals \
+      && wasm-opt -O3 --enable-simd --enable-bulk-memory --enable-nontrapping-float-to-int --enable-sign-ext --enable-mutable-globals \
            -o "/wasm/${m}_bg.wasm" "/wasm/${m}_bg.wasm"; \
     done
 

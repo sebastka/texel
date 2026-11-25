@@ -64,6 +64,36 @@ impl Emulator {
         Ok(())
     }
 
+    /// Diagnostics: one step (a compiled block or an instruction): the
+    /// cycles run so far.
+    #[wasm_bindgen(js_name = debugStep)]
+    pub fn debug_step(&mut self) -> f64 {
+        self.system.debug_step() as f64
+    }
+
+    /// Diagnostics: the CPU's state's checksum (hex) and pc.
+    #[wasm_bindgen(js_name = debugCpu)]
+    pub fn debug_cpu(&self) -> String {
+        let (h, pc) = self.system.debug_cpu();
+        format!("{h:016x} {pc:08x}")
+    }
+
+    /// Diagnostics: the cycles between the peripherals' catching up.
+    #[wasm_bindgen(js_name = debugSetSlice)]
+    pub fn debug_set_slice(&mut self, cycles: u32) {
+        self.system.debug_set_slice(cycles);
+    }
+
+    /// Diagnostics: the CPU's state, a field per line.
+    #[wasm_bindgen(js_name = debugCpuFields)]
+    pub fn debug_cpu_fields(&self) -> String {
+        self.system
+            .debug_cpu_fields()
+            .iter()
+            .map(|(k, v)| format!("{k}: {v}\n"))
+            .collect()
+    }
+
     /// What the compiler did, for diagnostics.
     #[wasm_bindgen(js_name = compilerStats)]
     pub fn compiler_stats(&self) -> String {

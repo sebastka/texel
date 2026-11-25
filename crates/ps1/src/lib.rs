@@ -236,7 +236,7 @@ impl System {
             let cycles = if compiled { 0 } else { self.cpu.step(&mut self.bus) };
             self.bus.pending += cycles;
             // Peripherals also catch up on every I/O access (see Bus::sync).
-            if self.bus.pending >= 64 {
+            if self.bus.pending >= self.bus.deadline {
                 budget = budget.saturating_sub(self.bus.pending);
                 self.bus.sync();
             }
@@ -247,6 +247,47 @@ impl System {
             }
         }
         self.frame_size = self.bus.gpu.render_display(&mut self.frame);
+    }
+
+    /// Diagnostics: one turn of `run_frame`'s loop (a compiled block, or
+    /// an instruction, then the peripherals when due): the cycles run so
+    /// far. Two machines stepped so can be compared where their cycle
+    /// counts meet (the compiler against the interpreter).
+    #[doc(hidden)]
+    pub fn debug_step(&mut self) -> u64 {
+        let compiled = self.exe.is_none()
+            && self
+                .jit
+                .as_mut()
+                .is_some_and(|jit| jit.run(&mut self.cpu, &mut self.bus));
+        let cycles = if compiled { 0 } else { self.cpu.step(&mut self.bus) };
+        self.bus.pending += cycles;
+        if self.bus.pending >= self.bus.deadline {
+            self.bus.sync();
+        }
+        self.bus.elapsed + u64::from(self.bus.pending)
+    }
+
+    /// Diagnostics: how many cycles the CPU runs between the peripherals'
+    /// catching up (the default: [`bus::SLICE`]).
+    #[doc(hidden)]
+    pub fn debug_set_slice(&mut self, cycles: u32) {
+        self.bus.slice = cycles.max(1);
+        self.bus.deadline = self.bus.slice;
+    }
+
+    /// Diagnostics: the CPU's state, field by field.
+    #[doc(hidden)]
+    pub fn debug_cpu_fields(&self) -> Vec<(&'static str, String)> {
+        self.cpu.debug_fields()
+    }
+
+    /// Diagnostics: a checksum of the CPU's state (registers, COP0, the
+    /// GTE), and its pc.
+    #[doc(hidden)]
+    pub fn debug_cpu(&self) -> (u64, u32) {
+        let bytes = postcard::to_stdvec(&self.cpu).unwrap_or_default();
+        (fnv1a(&bytes), self.cpu.pc)
     }
 
     /// The last frame, RGBA8888, and its size.

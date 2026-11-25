@@ -9,7 +9,7 @@
 //! issued lands (the load delay slot, resolved here: the next instruction
 //! is known); its cycles counted, into the CPU's and the bus's pending
 //! ones. The block stops where `step`'s caller would do anything but run
-//! the next instruction: at 64 cycles pending (the peripherals catch up),
+//! the next instruction: at the bus's deadline (the peripherals catch up),
 //! after the interpreter ran something beyond the CPU; and leaves the CPU
 //! as `step` would have.
 //!
@@ -20,7 +20,7 @@
 //! friends, and accesses elsewhere.
 
 use super::wasm::{self, Code, FuncType, I32, I64, op};
-use crate::bus::{Bus, RAM_SIZE};
+use crate::bus::{Bus, RAM_PAGE_BITS, RAM_SIZE};
 use crate::cpu::{BIOS_ACCESS, Cpu, ICACHE_FILL, IO_ACCESS, RAM_ACCESS};
 
 /// Instructions per block, at most.
@@ -44,8 +44,10 @@ pub struct Layout {
     cycles: u32,
     sr: u32,
     pending: u32,
+    deadline: u32,
     scratchpad: u32,
     ram: u32,
+    ram_writes: u32,
     icache: u32,
 }
 
@@ -65,8 +67,10 @@ impl Layout {
             cycles: at(&cpu.cycles as *const u64 as usize, c),
             sr: at(&cpu.sr as *const u32 as usize, c),
             pending: at(&bus.pending as *const u32 as usize, b),
+            deadline: at(&bus.deadline as *const u32 as usize, b),
             scratchpad: at(bus.scratchpad.as_ptr() as usize, b),
             ram: bus.ram.as_ptr() as usize as u32,
+            ram_writes: bus.ram_writes.as_ptr() as usize as u32,
             icache: cpu.icache.as_ptr() as usize as u32,
         }
     }
@@ -94,6 +98,10 @@ const RET: u32 = 10;
 const SMC: u32 = 11;
 /// Two locals for loaded values, alternating: one landing, one in flight.
 const LOADED: [u32; 2] = [12, 13];
+/// In a loop: the pending cycles when the round began, and whether one
+/// round was done (see `idle_loop`).
+const START: u32 = 14;
+const ROUNDS: u32 = 15;
 
 /// Where the CPU stands after an instruction, for leaving the block there.
 #[derive(Clone, Copy)]
@@ -229,8 +237,8 @@ impl Emitter<'_> {
             .local_set(EXTRA);
     }
 
-    /// Counts the instruction's cycles (1 + EXTRA), then leaves when 64 are
-    /// pending (and, for a store, when it wrote the block's own code).
+    /// Counts the instruction's cycles (1 + EXTRA), then leaves when the bus's
+    /// deadline is reached (and, for a store, when it wrote the block's own code).
     fn commit(&mut self, after: After, load: Option<(usize, u32)>, smc: bool) {
         self.c.local_get(EXTRA).i32_const(1).op(op::I32_ADD).local_set(RET);
         self.c.local_get(PEND).local_get(RET).op(op::I32_ADD).local_set(PEND);
@@ -241,7 +249,11 @@ impl Emitter<'_> {
             .op(op::I64_ADD)
             .local_set(CYC);
         self.c.local_get(N).i32_const(1).op(op::I32_ADD).local_set(N);
-        self.c.local_get(PEND).i32_const(64).op(op::I32_GE_U);
+        self.c
+            .local_get(PEND)
+            .local_get(BUS)
+            .mem(op::I32_LOAD, 2, self.l.deadline)
+            .op(op::I32_GE_U);
         if smc {
             self.c.local_get(SMC).op(op::I32_OR);
         }
@@ -254,7 +266,7 @@ impl Emitter<'_> {
 
     /// Runs the instruction through the interpreter (`in_delay`: in a delay
     /// slot, taken when TAKEN is set), with the load landing after it;
-    /// leaves the block when it says to, or when 64 cycles are pending.
+    /// leaves the block when it says to, or at the bus's deadline.
     /// `stop`: it always says to.
     fn interpret(&mut self, instr: u32, pc: u32, in_delay: bool, landing: Option<(usize, u32)>, exec: u32, stop: bool) {
         let l = self.l;
@@ -307,10 +319,85 @@ impl Emitter<'_> {
         self.c.local_get(RET).i32_const(31).op(op::I32_SHR_U);
         self.c
             .local_get(PEND)
-            .i32_const(64)
+            .local_get(BUS)
+            .mem(op::I32_LOAD, 2, l.deadline)
             .op(op::I32_GE_U)
             .op(op::I32_OR)
             .br_if(self.depth);
+    }
+}
+
+/// Whether a loop (`words`: its instructions, the branch back to the first
+/// and its delay slot last) does the same every round from its second, as
+/// long as memory does not change: only instructions compiled to
+/// WebAssembly, no stores, no link register written, no load landing after
+/// it, and every register it reads either not written in it, or written
+/// before in the same round (a load's from the second instruction after
+/// it). A wait for a vertical blank's counter, for instance.
+fn idle_loop(words: &[u32]) -> bool {
+    /// Registers an instruction reads, and the one it writes (and whether
+    /// by a load).
+    type Regs = ([usize; 2], Option<(usize, bool)>);
+    // `None` when the instruction disqualifies the loop.
+    fn regs(i: u32) -> Option<Regs> {
+        let rs = ((i >> 21) & 0x1f) as usize;
+        let rt = ((i >> 16) & 0x1f) as usize;
+        let rd = ((i >> 11) & 0x1f) as usize;
+        Some(match i >> 26 {
+            0x00 => match i & 0x3f {
+                0x00 | 0x02 | 0x03 => ([rt, 0], Some((rd, false))),
+                0x04 | 0x06 | 0x07 | 0x21 | 0x23..=0x27 | 0x2a | 0x2b => ([rs, rt], Some((rd, false))),
+                0x08 => ([rs, 0], None),
+                _ => return None,
+            },
+            0x01 if (i >> 17) & 0xf != 0x8 => ([rs, 0], None),
+            0x02 => ([0, 0], None),
+            0x04 | 0x05 => ([rs, rt], None),
+            0x06 | 0x07 => ([rs, 0], None),
+            0x09..=0x0e => ([rs, 0], Some((rt, false))),
+            0x0f => ([0, 0], Some((rt, false))),
+            0x20 | 0x21 | 0x23 | 0x24 | 0x25 => ([rs, 0], Some((rt, true))),
+            _ => return None,
+        })
+    }
+    let mut written = 0u32;
+    for &i in words {
+        match regs(i) {
+            Some((_, Some((r, _)))) => written |= 1u32 << r,
+            Some(_) => {}
+            None => return false,
+        }
+    }
+    written &= !1;
+    let mut ready = 0u32;
+    let mut landing = None;
+    for &i in words {
+        let Some((reads, write)) = regs(i) else {
+            return false;
+        };
+        if reads.iter().any(|&r| written & !ready & (1u32 << r) != 0) {
+            return false;
+        }
+        if let Some(r) = landing.take() {
+            ready |= 1u32 << r;
+        }
+        match write {
+            Some((r, true)) => landing = Some(r),
+            Some((r, false)) => ready |= 1 << r,
+            None => {}
+        }
+    }
+    landing.is_none()
+}
+
+/// Where a branch or jump at `at` goes, when that is known when compiling
+/// (not for register jumps).
+fn branch_target(i: u32, at: u32) -> Option<u32> {
+    let delay = at.wrapping_add(4);
+    match i >> 26 {
+        0x02 | 0x03 => Some((delay & 0xf000_0000) | ((i & 0x3ff_ffff) << 2)),
+        0x01 | 0x04..=0x07 => Some(delay.wrapping_add(((i & 0xffff) as i16 as i32 as u32) << 2)),
+        _ => None,
     }
 }
 
@@ -389,17 +476,29 @@ pub fn compile(
     if len == 0 {
         return None;
     }
+    // A block ending with a branch back to its start (a loop) runs again
+    // while it is taken, without returning: as `step`'s caller would, as
+    // nothing outside the CPU could have changed (the block leaves for
+    // that: at the bus's deadline, an I/O access, a store to its code).
+    let back = len >= 2 && class(words[len - 2]) == Class::Branch && {
+        let at = pc.wrapping_add(4 * (len as u32 - 2));
+        branch_target(words[len - 2], at) == Some(pc)
+    };
+    let idle = back && idle_loop(&words[..len]);
     let mut e = Emitter {
         c: Code::default(),
         l: layout,
-        depth: 0,
+        // Inside the function's block and the loop.
+        depth: 1,
     };
     let mut native = 0;
     // The function: a block its exits branch out of, then the pending
     // cycles and the CPU's cycles written back, and the count returned.
     e.c.local_get(BUS).mem(op::I32_LOAD, 2, layout.pending).local_set(PEND);
     e.c.local_get(CPU).mem(op::I64_LOAD, 3, layout.cycles).local_set(CYC);
+    e.c.local_get(PEND).local_set(START);
     e.c.block();
+    e.c.loop_();
     // The load landing after the current instruction: register, local.
     let mut landing: Option<(usize, u32)> = None;
     let mut in_delay = false;
@@ -572,6 +671,26 @@ pub fn compile(
                                     .op(op::I32_AND);
                                 e.c.local_set(SMC);
                             }
+                            // Counted, as the bus counts RAM writes (see
+                            // `Bus::ram_writes`).
+                            e.c.local_get(KIND).i32_const(1).op(op::I32_EQ).if_();
+                            e.c.local_get(ADDR)
+                                .i32_const(RAM_SIZE as i32 - 1)
+                                .op(op::I32_AND)
+                                .i32_const(RAM_PAGE_BITS as i32)
+                                .op(op::I32_SHR_U)
+                                .i32_const(2)
+                                .op(op::I32_SHL)
+                                .i32_const(layout.ram_writes as i32)
+                                .op(op::I32_ADD)
+                                .local_set(ADDR);
+                            e.c.local_get(ADDR)
+                                .local_get(ADDR)
+                                .mem(op::I32_LOAD, 2, 0)
+                                .i32_const(1)
+                                .op(op::I32_ADD)
+                                .mem(op::I32_STORE, 2, 0);
+                            e.c.op(op::END);
                         } else {
                             let (o, a) = match opcode {
                                 0x20 => (op::I32_LOAD8_S, 0),
@@ -685,7 +804,49 @@ pub fn compile(
     } else {
         After::Plain { pc: last }
     };
+    // Back to the start, the branch taken (and no load in flight: a block
+    // starts with none).
+    if back && in_delay && landing.is_none() {
+        if idle {
+            // A loop that does the same every round (waiting for memory
+            // to change: only something outside the CPU can, at the bus's
+            // deadline): the whole rounds left before the deadline at
+            // once, as long as the last (the second or a later one: the
+            // first may have filled the instruction cache).
+            e.c.local_get(TAKEN).if_();
+            e.c.local_get(ROUNDS).if_();
+            // RET: the round's cycles; ADDR: how many more fit.
+            e.c.local_get(PEND).local_get(START).op(op::I32_SUB).local_set(RET);
+            e.c.local_get(BUS)
+                .mem(op::I32_LOAD, 2, layout.deadline)
+                .local_get(PEND)
+                .op(op::I32_SUB)
+                .local_get(RET)
+                .op(op::I32_DIV_U)
+                .local_set(ADDR);
+            e.c.local_get(ADDR).local_get(RET).op(op::I32_MUL).local_set(RET);
+            e.c.local_get(PEND).local_get(RET).op(op::I32_ADD).local_set(PEND);
+            e.c.local_get(CYC)
+                .local_get(RET)
+                .op(op::I64_EXTEND_I32_U)
+                .op(op::I64_ADD)
+                .local_set(CYC);
+            e.c.local_get(N)
+                .local_get(ADDR)
+                .i32_const(len as i32)
+                .op(op::I32_MUL)
+                .op(op::I32_ADD)
+                .local_set(N);
+            e.c.op(op::END);
+            e.c.i32_const(1).local_set(ROUNDS);
+            e.c.local_get(PEND).local_set(START);
+            e.c.op(op::END);
+        }
+        e.c.local_get(TAKEN).br_if(0);
+    }
     e.leave(end, landing);
+    // The loop's end, then the block's.
+    e.c.op(op::END);
     e.c.op(op::END);
     e.c.local_get(BUS).local_get(PEND).mem(op::I32_STORE, 2, layout.pending);
     e.c.local_get(CPU).local_get(CYC).mem(op::I64_STORE, 3, layout.cycles);
@@ -700,10 +861,59 @@ pub fn compile(
             results: &[I32],
         },
     ];
-    let module = wasm::module(&types, &[(2, I32), (1, I64), (9, I32)], &e.c);
+    let module = wasm::module(&types, &[(2, I32), (1, I64), (11, I32)], &e.c);
     Some(Compiled {
         module,
         len: len as u32,
         native,
     })
+}
+
+#[cfg(test)]
+mod idle_tests {
+    use super::idle_loop;
+
+    const NOP: u32 = 0;
+
+    fn lw(rt: u32, base: u32) -> u32 {
+        (0x23 << 26) | (base << 21) | (rt << 16)
+    }
+
+    fn slt(rd: u32, rs: u32, rt: u32) -> u32 {
+        (rs << 21) | (rt << 16) | (rd << 11) | 0x2a
+    }
+
+    fn bne(rs: u32, rt: u32) -> u32 {
+        (0x05 << 26) | (rs << 21) | (rt << 16) | 0xfffc
+    }
+
+    fn addiu(rt: u32, rs: u32, imm: i16) -> u32 {
+        (0x09 << 26) | (rs << 21) | (rt << 16) | u32::from(imm as u16)
+    }
+
+    fn sw(rt: u32, base: u32) -> u32 {
+        (0x2b << 26) | (base << 21) | (rt << 16)
+    }
+
+    #[test]
+    fn a_wait_for_memory_is_idle() {
+        // lw v0, 0(gp); nop; slt v0, v0, a0; bne v0, zero, start; nop
+        assert!(idle_loop(&[lw(2, 28), NOP, slt(2, 2, 4), bne(2, 0), NOP]));
+    }
+
+    #[test]
+    fn a_countdown_is_not() {
+        assert!(!idle_loop(&[addiu(8, 8, -1), bne(8, 0), NOP]));
+    }
+
+    #[test]
+    fn a_store_is_not() {
+        assert!(!idle_loop(&[lw(2, 28), sw(2, 29), bne(2, 0), NOP]));
+    }
+
+    #[test]
+    fn a_read_in_the_load_delay_is_not() {
+        // The branch sees the last round's value.
+        assert!(!idle_loop(&[lw(2, 28), bne(2, 0), NOP]));
+    }
 }

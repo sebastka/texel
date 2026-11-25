@@ -1,0 +1,4 @@
+# WebAssembly builds use SIMD (128-bit vectors: in every current browser),
+# which the compiler uses where it can (the drawing's loops, mostly).
+[target.wasm32-unknown-unknown]
+rustflags = ["-C", "target-feature=+simd128"]

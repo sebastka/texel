@@ -9,6 +9,7 @@ pub const I64: u8 = 0x7E;
 /// Instruction opcodes used by the compiler.
 pub mod op {
     pub const BLOCK: u8 = 0x02;
+    pub const LOOP: u8 = 0x03;
     pub const IF: u8 = 0x04;
     pub const ELSE: u8 = 0x05;
     pub const END: u8 = 0x0B;
@@ -54,6 +55,7 @@ pub mod op {
     pub const I32_ADD: u8 = 0x6A;
     pub const I32_SUB: u8 = 0x6B;
     pub const I32_MUL: u8 = 0x6C;
+    pub const I32_DIV_U: u8 = 0x6E;
     pub const I32_AND: u8 = 0x71;
     pub const I32_OR: u8 = 0x72;
     pub const I32_XOR: u8 = 0x73;
@@ -173,6 +175,11 @@ impl Code {
     /// `block` with no result.
     pub fn block(&mut self) -> &mut Self {
         self.op(op::BLOCK).op(0x40)
+    }
+
+    /// `loop` with no result.
+    pub fn loop_(&mut self) -> &mut Self {
+        self.op(op::LOOP).op(0x40)
     }
 
     pub fn br(&mut self, depth: u32) -> &mut Self {

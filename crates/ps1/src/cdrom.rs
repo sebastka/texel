@@ -577,6 +577,21 @@ impl CdRom {
         vec![q[1], q[2], q[3], q[4], q[5], q[7], q[8], q[9]]
     }
 
+    /// The CPU cycles until the drive does something: delivers its next
+    /// response (once the last is acknowledged), or the next sector.
+    pub fn next_event(&self) -> Option<u32> {
+        let response = self
+            .events
+            .front()
+            .filter(|_| self.flags & 0x1f == 0)
+            .map(|e| e.delay.max(1));
+        let sector = (self.state != State::Idle).then_some(self.timer.max(1));
+        match (response, sector) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
+
     pub fn tick(&mut self, cycles: u32, irq: &mut Irq, spu: &mut Spu) {
         // Deliver the next response once the previous one is acknowledged.
         if let Some(e) = self.events.front_mut() {

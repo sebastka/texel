@@ -41,6 +41,22 @@ pub struct Bus {
     /// Cycles the CPU ran (or DMA took) that the peripherals have not caught
     /// up with yet; see [`Bus::sync`].
     pub pending: u32,
+    /// When `pending` reaches this, the peripherals catch up: set by each
+    /// sync (see [`Bus::sync`]).
+    #[serde(skip, default = "slice")]
+    pub deadline: u32,
+    /// Diagnostics: the deadline every sync sets.
+    #[serde(skip, default = "slice")]
+    pub slice: u32,
+    /// Writes to RAM, by 256-byte page (wrapping): compiled blocks compare
+    /// their code with RAM only when its pages' counts changed (see
+    /// `jit`). Not saved: restoring a state drops the compiled blocks.
+    #[serde(skip, default = "ram_pages")]
+    pub ram_writes: Box<[u32]>,
+    /// Cycles the peripherals have caught up with, since the start
+    /// (diagnostics: with `pending`, the time so far).
+    #[serde(skip)]
+    pub elapsed: u64,
     /// A GPU command list transferred, its transfer ending when the GPU
     /// has drawn all but its last commands (see `tick`): the drawing they
     /// leave. Saved apart (`crate::Timing`); older states end it at once
@@ -67,6 +83,10 @@ impl Bus {
             ram_size: 0,
             cache_ctrl: 0,
             pending: 0,
+            deadline: SLICE,
+            ram_writes: ram_pages(),
+            slice: SLICE,
+            elapsed: 0,
             gpu_list: None,
             irq: Irq::default(),
             dma: Dma::default(),
@@ -92,6 +112,36 @@ impl Bus {
             let cycles = std::mem::take(&mut self.pending);
             self.tick(cycles);
         }
+        self.deadline = self.next_event();
+    }
+
+    /// The CPU cycles from the last sync until a peripheral may raise an
+    /// interrupt or end a frame, at most `slice`: when the next sync is
+    /// due. Worked out again after every I/O access, which may start
+    /// something.
+    fn next_event(&mut self) -> u32 {
+        let mut next = self.slice.min(self.gpu.cycles_to_vblank());
+        let mut at = |n: Option<u32>| {
+            if let Some(n) = n {
+                next = next.min(n);
+            }
+        };
+        if self.gpu.irq_raised {
+            at(Some(1));
+        }
+        if let Some(last) = self.gpu_list {
+            let left = self.gpu.drawing().saturating_sub(last);
+            at(Some(left.clamp(1, u64::from(u32::MAX)) as u32));
+        }
+        at(self.timers.next_event(&self.gpu));
+        at(self.cdrom.next_event());
+        at(self.spu.next_event());
+        at(self.sio.next_event());
+        // Transfers waiting for their device's data are retried at syncs.
+        if self.dma.pending(Port::MdecOut) || self.dma.pending(Port::CdRom) {
+            at(Some(RETRY));
+        }
+        next.max(1)
     }
 
     /// Instruction fetch: only RAM and BIOS hold code.
@@ -141,10 +191,21 @@ impl Bus {
         }
     }
 
+    /// Counts a write at `o` in RAM (see `ram_writes`).
+    #[inline]
+    fn wrote_ram(&mut self, o: usize) {
+        let n = &mut self.ram_writes[o >> RAM_PAGE_BITS];
+        *n = n.wrapping_add(1);
+    }
+
     pub fn store32(&mut self, addr: u32, v: u32) {
         let p = physical(addr);
         match p {
-            0x0000_0000..=0x007f_ffff => write_u32(&mut self.ram, (p as usize) & (RAM_SIZE - 1), v),
+            0x0000_0000..=0x007f_ffff => {
+                let o = (p as usize) & (RAM_SIZE - 1);
+                self.wrote_ram(o);
+                write_u32(&mut self.ram, o, v);
+            }
             0x1f80_0000..=0x1f80_03ff => write_u32(&mut self.scratchpad, (p & 0x3ff) as usize, v),
             0x1f80_1000..=0x1f80_1fff => self.io_write(p, v, 4),
             0xfffe_0130 => self.cache_ctrl = v,
@@ -155,7 +216,11 @@ impl Bus {
     pub fn store16(&mut self, addr: u32, v: u16) {
         let p = physical(addr);
         match p {
-            0x0000_0000..=0x007f_ffff => write_u16(&mut self.ram, (p as usize) & (RAM_SIZE - 1), v),
+            0x0000_0000..=0x007f_ffff => {
+                let o = (p as usize) & (RAM_SIZE - 1);
+                self.wrote_ram(o);
+                write_u16(&mut self.ram, o, v);
+            }
             0x1f80_0000..=0x1f80_03ff => write_u16(&mut self.scratchpad, (p & 0x3ff) as usize, v),
             0x1f80_1000..=0x1f80_1fff => self.io_write(p, u32::from(v), 2),
             _ => {}
@@ -165,7 +230,11 @@ impl Bus {
     pub fn store8(&mut self, addr: u32, v: u8) {
         let p = physical(addr);
         match p {
-            0x0000_0000..=0x007f_ffff => self.ram[(p as usize) & (RAM_SIZE - 1)] = v,
+            0x0000_0000..=0x007f_ffff => {
+                let o = (p as usize) & (RAM_SIZE - 1);
+                self.wrote_ram(o);
+                self.ram[o] = v;
+            }
             0x1f80_0000..=0x1f80_03ff => self.scratchpad[(p & 0x3ff) as usize] = v,
             0x1f80_1000..=0x1f80_1fff => self.io_write(p, u32::from(v), 1),
             _ => {}
@@ -174,6 +243,12 @@ impl Bus {
 
     fn io_read(&mut self, p: u32, size: u32) -> u32 {
         self.sync();
+        let v = self.io_read_at(p, size);
+        self.deadline = self.next_event();
+        v
+    }
+
+    fn io_read_at(&mut self, p: u32, size: u32) -> u32 {
         let off = p - 0x1f80_1000;
         match off {
             0x000..=0x023 => self.mem_ctrl[(off / 4) as usize] >> ((off & 3) * 8),
@@ -209,6 +284,11 @@ impl Bus {
 
     fn io_write(&mut self, p: u32, v: u32, size: u32) {
         self.sync();
+        self.io_write_at(p, v, size);
+        self.deadline = self.next_event();
+    }
+
+    fn io_write_at(&mut self, p: u32, v: u32, size: u32) {
         let off = p - 0x1f80_1000;
         match off {
             0x000..=0x023 => self.mem_ctrl[(off / 4) as usize] = v,
@@ -294,6 +374,7 @@ impl Bus {
                 } else {
                     addr.wrapping_sub(4) & 0x1f_ffff
                 };
+                self.wrote_ram(addr as usize);
                 write_u32(&mut self.ram, addr as usize, v);
                 addr = addr.wrapping_sub(4) & 0x1f_fffc;
             }
@@ -309,6 +390,7 @@ impl Bus {
                         Port::Spu => self.spu.dma_read(),
                         _ => 0xffff_ffff,
                     };
+                    self.wrote_ram(a);
                     write_u32(&mut self.ram, a, v);
                 } else {
                     let v = read_u32(&self.ram, a);
@@ -402,6 +484,7 @@ impl Bus {
     }
 
     pub fn tick(&mut self, cycles: u32) {
+        self.elapsed += u64::from(cycles);
         let gpu = self.gpu.tick(cycles);
         // A command list's transfer ends when the GPU is drawing its last
         // commands.
@@ -433,6 +516,24 @@ impl Bus {
             }
         }
     }
+}
+
+/// The cycles the CPU runs before the peripherals catch up, at most (when
+/// none has anything to do sooner: see `Bus::next_event`).
+pub const SLICE: u32 = 1 << 15;
+
+/// How soon a transfer waiting for its device's data is tried again.
+const RETRY: u32 = 64;
+
+fn slice() -> u32 {
+    SLICE
+}
+
+/// RAM's pages for `Bus::ram_writes`: 256 bytes.
+pub const RAM_PAGE_BITS: u32 = 8;
+
+fn ram_pages() -> Box<[u32]> {
+    vec![0; RAM_SIZE >> RAM_PAGE_BITS].into_boxed_slice()
 }
 
 pub fn read_u32(mem: &[u8], o: usize) -> u32 {

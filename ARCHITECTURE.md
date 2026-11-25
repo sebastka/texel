@@ -182,6 +182,8 @@ The GS on the GPU (`crates/ps2-gpu`, with wgpu: Vulkan, Metal or DirectX 12 nati
 The compilers and VU1's worker are checked in WebAssembly with Node.js (in `frontend`, after `pnpm run wasm`), each failing unless both machines reach the same state every second:
 
 ```sh
+node scripts/check-ps1-compiler.mjs BIOS DISC.cue [SECONDS]              # the PlayStation's CPU compiled and interpreted
+node scripts/check-ps1-lockstep.mjs BIOS DISC.cue [CYCLES]               # the same, in step: where they part, if they do
 node scripts/check-ps2-compiler.mjs PS2-BIOS [SECONDS] [DISC.iso STATE]   # the EE's code compiled and interpreted
 node scripts/check-ps2-vu.mjs PS2-BIOS DISC.iso STATE [SECONDS]          # the VUs' microprograms compiled and interpreted
 node scripts/check-ps2-vu1-worker.mjs PS2-BIOS SECONDS DISC.iso STATE      # VU1 inline and in a worker

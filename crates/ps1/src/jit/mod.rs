@@ -21,8 +21,9 @@ mod tests;
 pub mod wasm;
 
 use std::collections::HashMap;
+use std::hash::{BuildHasherDefault, Hasher};
 
-use crate::bus::{Bus, RAM_SIZE};
+use crate::bus::{Bus, RAM_PAGE_BITS, RAM_SIZE};
 use crate::cpu::{Cpu, CpuBus};
 
 pub use compile::{Layout, MAX_LEN, compile};
@@ -55,12 +56,15 @@ enum Entry {
     /// Run this many times by the interpreter so far.
     Cold(u32),
     /// Compiled: its function, its code (to check it is still there: RAM
-    /// may have been rewritten, by the CPU or DMA), and whether the
-    /// instruction cache was on (as its timing assumes).
+    /// may have been rewritten, by the CPU or DMA) and the write counts of
+    /// its first and last pages when it was last checked (it is compared
+    /// again only when they changed), and whether the instruction cache
+    /// was on (as its timing assumes).
     Compiled {
         func: u32,
         pa: u32,
         code: Vec<u8>,
+        writes: [u32; 2],
         icache: bool,
     },
     /// Left to the interpreter (nothing to compile there).
@@ -83,10 +87,31 @@ pub struct Stats {
     pub total: u64,
 }
 
+/// Hashes the blocks' addresses: a multiplication (the default hasher's
+/// cost showed in profiles: a lookup per block run).
+#[derive(Default)]
+struct PcHasher(u64);
+
+impl Hasher for PcHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = (self.0 << 8 | u64::from(b)).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        }
+    }
+
+    fn write_u32(&mut self, pc: u32) {
+        self.0 = u64::from(pc).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    }
+}
+
 pub struct Jit {
     backend: Box<dyn Backend>,
     /// By the address of their first instruction.
-    blocks: HashMap<u32, Entry>,
+    blocks: HashMap<u32, Entry, BuildHasherDefault<PcHasher>>,
     pub stats: Stats,
 }
 
@@ -94,7 +119,7 @@ impl Jit {
     pub fn new(backend: Box<dyn Backend>) -> Self {
         Self {
             backend,
-            blocks: HashMap::new(),
+            blocks: HashMap::default(),
             stats: Stats::default(),
         }
     }
@@ -120,13 +145,22 @@ impl Jit {
         let entry = self.blocks.entry(pc).or_insert(Entry::Cold(0));
         match entry {
             Entry::Interpreted => return false,
-            Entry::Compiled { func, pa, code, icache } => {
-                let current = code_at(bus, *pa, code.len());
-                if current != Some(&code[..]) {
-                    self.backend.release(*func);
-                    *entry = Entry::Cold(0);
-                    self.stats.invalidated += 1;
-                    return false;
+            Entry::Compiled {
+                func,
+                pa,
+                code,
+                writes,
+                icache,
+            } => {
+                let now = page_writes(bus, *pa, code.len());
+                if now != *writes {
+                    if code_at(bus, *pa, code.len()) != Some(&code[..]) {
+                        self.backend.release(*func);
+                        *entry = Entry::Cold(0);
+                        self.stats.invalidated += 1;
+                        return false;
+                    }
+                    *writes = now;
                 }
                 if *icache != bus.icache_enabled() {
                     return false;
@@ -182,9 +216,30 @@ impl Jit {
         } else {
             Vec::new()
         };
-        self.blocks.insert(pc, Entry::Compiled { func, pa, code, icache });
+        let writes = page_writes(bus, pa, code.len());
+        self.blocks.insert(
+            pc,
+            Entry::Compiled {
+                func,
+                pa,
+                code,
+                writes,
+                icache,
+            },
+        );
         false
     }
+}
+
+/// The write counts of the first and last RAM pages of `len` bytes at `pa`
+/// (`u32::MAX`: not RAM: none).
+fn page_writes(bus: &Bus, pa: u32, len: usize) -> [u32; 2] {
+    if pa == u32::MAX || len == 0 {
+        return [0; 2];
+    }
+    let first = pa as usize >> RAM_PAGE_BITS;
+    let last = ((pa as usize + len - 1) & (RAM_SIZE - 1)) >> RAM_PAGE_BITS;
+    [bus.ram_writes[first], bus.ram_writes[last]]
 }
 
 /// RAM's bytes at `pa` (`u32::MAX`: not RAM: nothing to check).
