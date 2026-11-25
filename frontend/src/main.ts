@@ -1526,6 +1526,26 @@ function renderPlayer(id: string, biosId: string, roomGame = false, cards: Slots
     },
     "Codes",
   ) as HTMLButtonElement;
+  /** A disc's codes in the panel (each disc has its own), none enabled:
+   * those of the disc before turned off. */
+  const loadCodes = async (gameId: string) => {
+    player?.setCodes(null);
+    showCodes(null);
+    if (playing) playing.codes = null;
+    codesUi = null;
+    codesSlot.replaceChildren();
+    codesButton.hidden = true;
+    const codes = await api.codes(gameId).catch(() => null);
+    if (!codes || !(codes.patches.length || codes.cheats.length) || current !== gameId) return;
+    codesUi = codesPanel(codes, (s) => {
+      showCodes(s);
+      player?.setCodes(s);
+      if (playing) playing.codes = s;
+    });
+    codesSlot.replaceChildren(codesUi.panel);
+    codesButton.hidden = false;
+    lock();
+  };
   const showCodes = (set: CodeSet | null) => {
     codesWide = !!set?.wide;
     // A patch doing its own widescreen: not the GTE's too.
@@ -1579,6 +1599,8 @@ function renderPlayer(id: string, biosId: string, roomGame = false, cards: Slots
               const target = (e.target as HTMLSelectElement).value;
               current = target;
               playing = { game: target, bios: biosId };
+              // The disc's own codes, none enabled.
+              void loadCodes(target);
               void api.game(target).then((d) => player?.swapDisc(d));
             },
           },
@@ -1696,27 +1718,14 @@ function renderPlayer(id: string, biosId: string, roomGame = false, cards: Slots
         showCodes(set);
         return started.start(biosId, g, [null, null], room.snapshot(), set);
       }
-      // The game's codes, those chosen before enabled from the start.
-      const codes = await api.codes(id).catch(() => null);
+      // The game's codes: none enabled when it starts.
+      await loadCodes(id);
       if (player !== started) return;
-      let set: CodeSet | null = null;
-      if (codes && (codes.patches.length || codes.cheats.length)) {
-        codesUi = codesPanel(id, codes, (s) => {
-          showCodes(s);
-          player?.setCodes(s);
-          if (playing) playing.codes = s;
-        });
-        codesSlot.replaceChildren(codesUi.panel);
-        codesButton.hidden = false;
-        set = codesUi.initial;
-        lock();
-      }
-      showCodes(set);
-      if (playing) playing.codes = set;
-      const done = started.start(biosId, g, cards ?? g.lastCards, null, set);
+      const done = started.start(biosId, g, cards ?? g.lastCards);
       // A host's game is the room's: everyone follows (see the room's
-      // `game` event), with its codes.
-      if (room?.isHost && room.state === "open") room.load({ game: id, bios: biosId, codes: set });
+      // `game` event), with the codes it enables meanwhile (before others
+      // are in: then they are locked).
+      if (room?.isHost && room.state === "open") room.load({ game: id, bios: biosId, codes: null });
       return done;
     },
     (e: unknown) => (status.textContent = String(e)),

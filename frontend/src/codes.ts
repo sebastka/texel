@@ -1,34 +1,16 @@
 // Cheat and patch codes in the player: the game's codes (DuckStation's
-// database, served by the server), chosen in a panel, remembered per game,
-// and turned into what the emulation worker runs (a `CodeSet`).
+// database, served by the server), chosen in a panel (off when a game
+// starts: nothing is remembered), and turned into what the emulation
+// worker runs (a `CodeSet`).
 
 import type { FileCode, GameCodes } from "./api";
 import { h } from "./dom";
 import type { CodeSet, EnabledCode } from "./protocol";
 
-/** What the player chose for a game: each enabled code (`p:` patches, `c:`
- * cheats, then its name) and the value for its `?` digits. */
+/** What the player chose this session: each enabled code (`p:` patches,
+ * `c:` cheats, then its name) and the value for its `?` digits. Not kept:
+ * every game starts with none. */
 type Choices = Record<string, number>;
-
-const key = (gameId: string) => `texel.codes.${gameId}`;
-
-export function loadChoices(gameId: string): Choices {
-  try {
-    const saved = localStorage.getItem(key(gameId));
-    return saved ? (JSON.parse(saved) as Choices) : {};
-  } catch {
-    return {};
-  }
-}
-
-function saveChoices(gameId: string, choices: Choices) {
-  try {
-    if (Object.keys(choices).length) localStorage.setItem(key(gameId), JSON.stringify(choices));
-    else localStorage.removeItem(key(gameId));
-  } catch {
-    // Not remembered (private browsing): still applied.
-  }
-}
 
 /** Fills each line's run of `?` digits with `value`, in hexadecimal (as the
  * core's `fill`). */
@@ -87,14 +69,11 @@ export function codeSet(codes: GameCodes, choices: Choices): CodeSet | null {
 
 /** The codes panel: `onChange` gets the new set (null: none) whenever the
  * choices change. `refused`: codes the core refused, shown as such. */
-export function codesPanel(gameId: string, codes: GameCodes, onChange: (set: CodeSet | null) => void) {
-  const choices = loadChoices(gameId);
+export function codesPanel(codes: GameCodes, onChange: (set: CodeSet | null) => void) {
+  const choices: Choices = {};
   const panel = h("div.codes-panel", { hidden: true });
   const reasons = new Map<string, string>();
-  const changed = () => {
-    saveChoices(gameId, choices);
-    onChange(codeSet(codes, choices));
-  };
+  const changed = () => onChange(codeSet(codes, choices));
 
   const row = (prefix: string, code: FileCode) => {
     const id = prefix + code.name;
@@ -196,18 +175,13 @@ export function codesPanel(gameId: string, codes: GameCodes, onChange: (set: Cod
   render();
   return {
     panel,
-    /** The set for the choices remembered (to start with). */
-    initial: codeSet(codes, choices),
     /** Codes the core refused: shown unavailable, and turned off. */
     refused(list: [string, string][]) {
       for (const [name, why] of list) {
         reasons.set(name, why);
         delete choices[name];
       }
-      if (list.length) {
-        saveChoices(gameId, choices);
-        render();
-      }
+      if (list.length) render();
     },
     /** Locked (a netplay room): shown, not changed. */
     lock(locked: boolean) {
