@@ -1,6 +1,6 @@
 //! Shared server state: the library, the DATs, hashes and HTTP client.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -73,11 +73,89 @@ pub struct DiscGroup {
 
 /// "Final Fantasy VII (Europe) (Disc 2)" → ("Final Fantasy VII (Europe)", 2).
 pub fn split_disc(name: &str) -> Option<(String, u32)> {
+    let (before, number, after) = disc_parts(name)?;
+    Some((format!("{before}{after}"), number))
+}
+
+/// "Gran Turismo 2 (Europe) (Disc 2) (Gran Turismo Mode)" → ("Gran Turismo
+/// 2 (Europe)", 2, " (Gran Turismo Mode)"): what comes before the disc's
+/// number, the number, what comes after.
+fn disc_parts(name: &str) -> Option<(&str, u32, &str)> {
     let start = name.find(" (Disc ")?;
     let rest = &name[start + 7..];
     let end = rest.find(')')?;
     let number = rest[..end].trim().parse().ok()?;
-    Some((format!("{}{}", &name[..start], &rest[end + 1..]), number))
+    Some((&name[..start], number, &rest[end + 1..]))
+}
+
+/// What follows a disc's number in Redump's name: its subtitle, if any,
+/// then the edition's tags, from the first that marks a revision, a beta, a
+/// prototype, a demo, a sample, an alternate dump, a version or a date
+/// (" (Arcade Mode) (Beta) (1999-12-22)" → (" (Arcade Mode)", " (Beta)
+/// (1999-12-22)")).
+fn split_edition(after: &str) -> (&str, &str) {
+    let edition = |tag: &str| {
+        ["Rev ", "Beta", "Proto", "Demo", "Sample", "Alt", "Debug"]
+            .iter()
+            .any(|m| tag.starts_with(m))
+            || (tag.starts_with('v') && tag[1..].starts_with(|c: char| c.is_ascii_digit()))
+            || (tag.len() == 10 && tag.as_bytes()[4] == b'-' && tag[..4].bytes().all(|b| b.is_ascii_digit()))
+    };
+    let mut at = 0;
+    while let Some(open) = after[at..].find(" (") {
+        let start = at + open;
+        let Some(close) = after[start..].find(')') else { break };
+        if edition(&after[start + 2..start + close]) {
+            return after.split_at(start);
+        }
+        at = start + close + 1;
+    }
+    (after, "")
+}
+
+/// What groups the discs of a game: Redump's name without the disc's
+/// number, and without the disc's subtitle when the edition's discs have
+/// one each (see `disc_subtitled`).
+fn disc_key(console: Console, name: &str, subtitled: &HashSet<(Console, String, String)>) -> Option<(String, u32)> {
+    let (before, number, after) = disc_parts(name)?;
+    let (_, edition) = split_edition(after);
+    let key = if subtitled.contains(&(console, before.to_owned(), edition.to_owned())) {
+        format!("{before}{edition}")
+    } else {
+        format!("{before}{after}")
+    };
+    Some((key, number))
+}
+
+/// The games' editions (what comes before "(Disc n)" in Redump's names,
+/// and the edition's tags after it) whose discs are named after their
+/// content: "(Disc 1) (Arcade Mode)", "(Disc 2) (Gran Turismo Mode)". The
+/// subtitles are told by each naming one disc, a different one each; tags
+/// every disc of an edition shares ("(Premium Box)") are not subtitles.
+fn disc_subtitled<'a>(names: impl IntoIterator<Item = (Console, &'a str)>) -> HashSet<(Console, String, String)> {
+    let mut subtitles: HashMap<(Console, &str, &str), HashMap<&str, HashSet<u32>>> = HashMap::new();
+    for (console, name) in names {
+        if let Some((before, number, after)) = disc_parts(name) {
+            let (subtitle, edition) = split_edition(after);
+            subtitles
+                .entry((console, before, edition))
+                .or_default()
+                .entry(subtitle)
+                .or_default()
+                .insert(number);
+        }
+    }
+    subtitles
+        .into_iter()
+        .filter(|(_, by_subtitle)| {
+            let mut numbers = HashSet::new();
+            by_subtitle.len() > 1
+                && by_subtitle
+                    .values()
+                    .all(|n| n.len() == 1 && n.iter().all(|&k| numbers.insert(k)))
+        })
+        .map(|((console, before, edition), _)| (console, before.to_owned(), edition.to_owned()))
+        .collect()
 }
 
 pub async fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
@@ -402,9 +480,18 @@ impl AppState {
     /// Multi-disc games: game id → its group.
     pub async fn disc_groups(&self) -> HashMap<String, DiscGroup> {
         let lib = self.library.read().await.clone();
+        let all = self.dats.read().await.clone();
+        let consoles = [Console::Ps1, Console::Ps2];
+        let dat_names = || {
+            consoles
+                .into_iter()
+                .flat_map(|c| all.get(c).games.iter().map(move |g| (c, g.name.as_str())))
+        };
+        let subtitled = disc_subtitled(dat_names());
         let mut groups: HashMap<(Console, String), Vec<DiscRef>> = HashMap::new();
         for g in &lib.games {
-            if let Some((key, number)) = self.identify(g).await.name.as_deref().and_then(split_disc) {
+            let name = self.identify(g).await.name;
+            if let Some((key, number)) = name.as_deref().and_then(|n| disc_key(g.console, n, &subtitled)) {
                 groups.entry((g.console, key)).or_default().push(DiscRef {
                     id: g.id.clone(),
                     number,
@@ -412,13 +499,10 @@ impl AppState {
             }
         }
         // Every version's discs, as Redump lists them.
-        let all = self.dats.read().await.clone();
         let mut listed: HashMap<(Console, String), Vec<u32>> = HashMap::new();
-        for console in [Console::Ps1, Console::Ps2] {
-            for game in &all.get(console).games {
-                if let Some((key, number)) = split_disc(&game.name) {
-                    listed.entry((console, key)).or_default().push(number);
-                }
+        for (console, name) in dat_names() {
+            if let Some((key, number)) = disc_key(console, name, &subtitled) {
+                listed.entry((console, key)).or_default().push(number);
             }
         }
         let mut out = HashMap::new();
@@ -614,6 +698,41 @@ mod tests {
             Some(("Final Fantasy VII (Europe)".to_owned(), 2))
         );
         assert_eq!(super::split_disc("Rayman (Europe)"), None);
+    }
+
+    #[test]
+    fn discs_named_after_their_content_go_together() {
+        use super::{Console, disc_key, disc_subtitled};
+        let names = [
+            "Gran Turismo 2 (Europe) (En,Fr,De,Es,It) (Disc 1) (Arcade Mode)",
+            "Gran Turismo 2 (Europe) (En,Fr,De,Es,It) (Disc 2) (Gran Turismo Mode)",
+            // A beta of the first disc: an edition of its own.
+            "Gran Turismo 2 (Europe) (En,Fr,De,Es,It) (Disc 1) (Arcade Mode) (Beta) (1999-12-22)",
+            "Driver 2 - Back on the Streets (Europe) (Disc 1) (Rev 1)",
+            "Driver 2 - Back on the Streets (Europe) (Disc 2) (Rev 1)",
+            "Final Fantasy VII (Europe) (Disc 1)",
+            "Final Fantasy VII (Europe) (Disc 2)",
+            "Final Fantasy VII (Europe) (Disc 1) (Rev 1)",
+            "Final Fantasy VII (Europe) (Disc 2) (Rev 1)",
+        ];
+        let subtitled = disc_subtitled(names.iter().map(|&n| (Console::Ps1, n)));
+        let key = |n: &str| disc_key(Console::Ps1, n, &subtitled).map(|(k, _)| k);
+        // The modes are one game's two discs.
+        assert_eq!(key(names[0]), key(names[1]));
+        assert_eq!(
+            key(names[0]).as_deref(),
+            Some("Gran Turismo 2 (Europe) (En,Fr,De,Es,It)")
+        );
+        // The beta is another edition.
+        assert_ne!(key(names[0]), key(names[2]));
+        // A tag the edition's discs share stays: revisions apart.
+        assert_eq!(key(names[3]), key(names[4]));
+        assert_eq!(
+            key(names[3]).as_deref(),
+            Some("Driver 2 - Back on the Streets (Europe) (Rev 1)")
+        );
+        assert_eq!(key(names[5]), key(names[6]));
+        assert_ne!(key(names[5]), key(names[7]));
     }
 
     #[test]
