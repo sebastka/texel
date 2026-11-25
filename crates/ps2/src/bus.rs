@@ -20,6 +20,10 @@ use crate::vu1q::Why;
 /// The scratchpad channels' interleave sizes: skip (bits 0-7) and
 /// transfer (bits 16-23), in quadwords.
 const D_SQWC: u32 = 0x1000_E030;
+/// The memory FIFO's ring buffer: its size, as a mask of quadword
+/// addresses (RBSR), and where it is (RBOR).
+const D_RBSR: u32 = 0x1000_E040;
+const D_RBOR: u32 = 0x1000_E050;
 
 pub const RAM_SIZE: usize = 32 * 1024 * 1024;
 /// Writes to compiled code are watched by lines of this many bytes.
@@ -50,6 +54,11 @@ const D_ENABLER: u32 = 0x1000_F520;
 const D_ENABLEW: u32 = 0x1000_F590;
 const D_CTRL: u32 = 0x1000_E000;
 const D_STAT: u32 = 0x1000_E010;
+/// The GIF's mode (path 3's mask, intermittent mode) and status.
+const GIF_MODE: u32 = 0x1000_3010;
+const GIF_STAT: u32 = 0x1000_3020;
+/// The GIF's DMA channel (2).
+const GIF_BASE: u32 = 0x1000_A000;
 const D_PCR: u32 = 0x1000_E020;
 /// RDRAM chips: 2 × 16 MiB.
 const RDRAM_DEVICES: u32 = 2;
@@ -157,6 +166,10 @@ pub struct Bus {
     /// The EE's writes to D_STAT, for diagnostics.
     #[serde(skip)]
     pub d_stat_writes: Vec<u32>,
+    /// VIF1's MSKPATH3 was last set by a VIF1 DMA list now done (rather
+    /// than written to its FIFO by the EE): see `path3_masked`.
+    #[serde(skip)]
+    path3_mask_by_dma: bool,
     ba6: u32,
 }
 
@@ -213,6 +226,7 @@ impl Bus {
             frames: 0,
             ee_cycles_hint: 0,
             d_stat_writes: Vec::new(),
+            path3_mask_by_dma: false,
             ba6: 0,
         }
     }
@@ -220,7 +234,8 @@ impl Bus {
     /// INT1: the DMA controller's interrupt (a channel's status bit, enabled
     /// by its mask bit).
     pub fn dmac_line(&self) -> bool {
-        (self.d_stat & 0x3FF) & ((self.d_stat >> 16) & 0x3FF) != 0
+        // The channels, and the stall, MFIFO empty and bus error causes.
+        (self.d_stat & 0xE3FF) & ((self.d_stat >> 16) & 0xE3FF) != 0
     }
 
     /// COP0 condition (BC0F/BC0T): every channel D_PCR names is done.
@@ -471,7 +486,11 @@ impl Bus {
                             gs: &mut self.gs,
                         },
                     ),
-                    0x5000 => self.vu1q.vif1(&mut self.vif1, &mut self.vu1, &words),
+                    0x5000 => {
+                        self.vu1q.vif1(&mut self.vif1, &mut self.vu1, &words);
+                        self.path3_mask_by_dma = false;
+                        self.resume_path3();
+                    }
                     _ => {
                         self.sync_vu1(Why::Gif);
                         self.gif.write(2, value, &mut self.gs);
@@ -506,6 +525,20 @@ impl Bus {
             INTC_STAT => self.intc.stat,
             INTC_MASK => self.intc.mask,
             D_STAT => self.d_stat,
+            // Path 3 masked by GIF_MODE (M3R) or by VIF1's MSKPATH3 (M3P),
+            // the intermittent mode (IMT). Transfers end at once here, but
+            // one path 3 holds back while masked: queued (IP3, P3Q), the
+            // FIFO full of it (FQC).
+            GIF_STAT => {
+                let mode = self.reg(GIF_MODE);
+                let mut stat = (mode & 1) | u32::from(self.vif1.mask_path3) << 1 | (mode & 4);
+                if self.path3_waiting() {
+                    let qwc = self.reg(GIF_BASE + QWC) & 0xFFFF;
+                    let fifo = if qwc == 0 { 16 } else { qwc.min(16) };
+                    stat |= 1 << 5 | 1 << 6 | fifo << 24;
+                }
+                stat
+            }
             SIO_ISR => 0,
             IPU_CMD => self.ipu.read_cmd().0,
             IPU_CMD_HI => u32::from(self.ipu.read_cmd().1) << 31,
@@ -547,6 +580,11 @@ impl Bus {
             }
             INTC_STAT => self.intc.write_stat(value),
             INTC_MASK => self.intc.write_mask(value),
+            // Lifting GIF_MODE's mask (M3R) lets a waiting path 3 go.
+            GIF_MODE => {
+                self.regs.insert(GIF_MODE, value);
+                self.resume_path3();
+            }
             D_STAT => {
                 if self.d_stat_writes.len() < 32 {
                     self.d_stat_writes.push(value);
@@ -617,6 +655,8 @@ const CHANNELS: [(u32, u32); 10] = [
     (0x1000_D400, 9),
 ];
 const SIF0: u32 = 5;
+/// The scratchpad's channel towards memory (8), the memory FIFO's source.
+const SPR_FROM_BASE: u32 = 0x1000_D000;
 const SIF1: u32 = 6;
 const SIF0_BASE: u32 = 0x1000_C000;
 const SIF1_BASE: u32 = 0x1000_C400;
@@ -815,25 +855,36 @@ impl Bus {
     fn chain_tag(&mut self, ch: u32) -> u128 {
         let base = CHANNELS[ch as usize].0;
         let chcr = self.reg(base);
-        let tadr = self.reg(base + TADR);
+        let tadr = self.mfifo_addr(ch, self.reg(base + TADR));
         let tag = self.read128(Self::dma_address(tadr));
         let lo = tag as u64;
         let qwc = (lo & 0xFFFF) as u32;
         let id = ((lo >> 28) & 7) as u32;
         let addr = ((lo >> 32) & 0xFFFF_FFF0) as u32;
         self.regs.insert(base, (chcr & 0xFFFF) | ((lo as u32) & 0xFFFF_0000));
-        let after = tadr.wrapping_add(16);
+        // The memory FIFO's drain: addresses that follow the tag (its data,
+        // the next tag) wrap in the ring buffer, however far past its end.
+        let in_ring = self.mfifo_drain() == Some(ch);
+        let follow = |a: u32| {
+            if in_ring {
+                (a & self.reg(D_RBSR)) | self.reg(D_RBOR)
+            } else {
+                a
+            }
+        };
+        let after = follow(tadr.wrapping_add(16));
+        let past_data = follow(after.wrapping_add(qwc * 16));
         // TADR moves past every tag, REFE included: the kernel turns its
         // last REFE into a REF to append, and restarts without setting TADR.
         let stack = &mut self.chain_stack[ch as usize];
         let (madr, next, mut end) = match id {
             // REFE, CNT, NEXT, REF, REFS, CALL, RET, END.
             0 => (addr, after, true),
-            1 => (after, after.wrapping_add(qwc * 16), false),
+            1 => (after, past_data, false),
             2 => (after, addr, false),
             3 | 4 => (addr, after, false),
             5 => {
-                stack.push(after.wrapping_add(qwc * 16));
+                stack.push(past_data);
                 (after, addr, false)
             }
             6 => match stack.pop() {
@@ -846,16 +897,76 @@ impl Bus {
             end = true;
         }
         self.chain_end[ch as usize] = end;
+        let (madr, next) = (self.mfifo_addr(ch, madr), self.mfifo_addr(ch, next));
         self.regs.insert(base + MADR, madr);
         self.regs.insert(base + QWC, qwc);
         self.regs.insert(base + TADR, next);
         tag
     }
 
+    /// The memory FIFO's drain, when on (D_CTRL's MFD: VIF1 or the GIF):
+    /// the scratchpad's channel (8) fills a ring buffer in memory, which
+    /// the drain's source chain reads, its tags and their data wrapping in
+    /// the ring.
+    fn mfifo_drain(&self) -> Option<u32> {
+        match (self.reg(D_CTRL) >> 2) & 3 {
+            2 => Some(1),
+            3 => Some(2),
+            _ => None,
+        }
+    }
+
+    /// An address in the ring buffer, wrapped.
+    fn ring(&self, addr: u32) -> u32 {
+        (addr & self.reg(D_RBSR)) | self.reg(D_RBOR)
+    }
+
+    /// Channel `ch`'s address, wrapped when it is the drain's in the ring
+    /// (or just past its end); others (a REF tag's data) as they are.
+    fn mfifo_addr(&self, ch: u32, addr: u32) -> u32 {
+        if self.mfifo_drain() != Some(ch) {
+            return addr;
+        }
+        let (rbor, rbsr) = (self.reg(D_RBOR), self.reg(D_RBSR));
+        if (rbor..=rbor.wrapping_add(rbsr).wrapping_add(16)).contains(&addr) {
+            self.ring(addr)
+        } else {
+            addr
+        }
+    }
+
+    /// Path 3 is masked, by GIF_MODE or VIF1's MSKPATH3. A mask a VIF1
+    /// DMA list left on does not hold transfers started after the list:
+    /// VIF1 runs its lists at once here, where on the console the list
+    /// would still be running, the transfer going before it reaches the
+    /// mask (games end a list masking path 3, start an upload, and wait
+    /// for it before the next list, which unmasks it). One the EE writes
+    /// to VIF1's FIFO holds, as on the console.
+    fn path3_masked(&self) -> bool {
+        self.reg(GIF_MODE) & 1 != 0 || (self.vif1.mask_path3 && !self.path3_mask_by_dma)
+    }
+
+    /// A path 3 transfer started, held back by the mask.
+    fn path3_waiting(&self) -> bool {
+        self.reg(GIF_BASE) & CHCR_STR != 0 && self.path3_masked()
+    }
+
+    /// Runs path 3's transfer if it waited for the mask, now lifted.
+    fn resume_path3(&mut self) {
+        if self.reg(GIF_BASE) & CHCR_STR != 0 && !self.path3_masked() {
+            self.run_dma(2);
+        }
+    }
+
     /// Runs a transfer to VIF0, VIF1, the GIF or the scratchpad at once,
     /// in normal or source chain mode.
     fn run_dma(&mut self, ch: u32) {
         let base = CHANNELS[ch as usize].0;
+        // Path 3 masked: it waits (started, its data in the FIFO for
+        // GIF_STAT) until the mask is lifted (`resume_path3`).
+        if ch == 2 && self.path3_masked() {
+            return;
+        }
         // VIF1 towards memory (reading the GS back): not emulated.
         if ch == 1 && self.reg(base) & 1 == 0 {
             self.dma_complete(ch);
@@ -876,6 +987,14 @@ impl Bus {
                 if !chain || self.chain_end[ch as usize] {
                     break;
                 }
+                // The memory FIFO's drain, caught up with what the
+                // scratchpad's channel wrote: it waits (MFIFO empty).
+                if self.mfifo_drain() == Some(ch)
+                    && self.mfifo_addr(ch, self.reg(base + TADR)) == self.reg(SPR_FROM_BASE + MADR)
+                {
+                    self.d_stat |= 1 << 14;
+                    return;
+                }
                 let tag = self.chain_tag(ch);
                 if chcr & CHCR_TTE != 0 && ch <= 1 {
                     let words = [(tag >> 64) as u32, (tag >> 96) as u32];
@@ -886,18 +1005,24 @@ impl Bus {
                 }
                 continue;
             }
-            let madr = self.reg(base + MADR);
+            let madr = self.mfifo_addr(ch, self.reg(base + MADR));
+            let mfifo_fill = ch == 8 && self.mfifo_drain().is_some();
             let q = if ch == 8 {
-                // From the scratchpad (SADR) to memory.
+                // From the scratchpad (SADR) to memory: into the ring
+                // buffer when the memory FIFO is on.
                 let sadr = self.reg(base + 0x80);
                 self.regs.insert(base + 0x80, sadr.wrapping_add(16) & 0x3FF0);
                 let v = self.read128(SCRATCHPAD + (sadr & 0x3FF0));
-                self.write128(Self::dma_address(madr), v);
+                let to = if mfifo_fill { self.ring(madr) } else { madr };
+                self.write128(Self::dma_address(to), v);
                 None
             } else {
                 Some(self.read128(Self::dma_address(madr)))
             };
             let mut next = madr.wrapping_add(16);
+            if mfifo_fill {
+                next = self.ring(next);
+            }
             if interleave && run > 0 {
                 in_run += 1;
                 if in_run == run {
@@ -916,6 +1041,19 @@ impl Bus {
             }
         }
         self.dma_complete(ch);
+        // VIF1's data may have lifted path 3's mask; one it left on is a
+        // list's (see `path3_masked`).
+        if ch == 1 {
+            self.path3_mask_by_dma = self.vif1.mask_path3;
+            self.resume_path3();
+        }
+        // The memory FIFO filled: its drain goes on.
+        if ch == 8
+            && let Some(drain) = self.mfifo_drain()
+            && self.reg(CHANNELS[drain as usize].0) & CHCR_STR != 0
+        {
+            self.run_dma(drain);
+        }
     }
 
     /// Where a channel's data goes.
@@ -1012,6 +1150,111 @@ fn is_known_register(pa: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// VIF1's MSKPATH3 shows in GIF_STAT (M3P), as games wait for it;
+    /// GIF_MODE's mask too (M3R).
+    #[test]
+    fn path3_masks_show_in_gif_stat() {
+        let mut bus = Bus::new(&[]);
+        assert_eq!(bus.read32(GIF_STAT) & 3, 0);
+        bus.write128(0x1000_5000, 0x0600_8000);
+        assert_eq!(bus.read32(GIF_STAT) & 3, 2);
+        bus.write128(0x1000_5000, 0x0600_0000);
+        assert_eq!(bus.read32(GIF_STAT) & 3, 0);
+        bus.write32(GIF_MODE, 1);
+        assert_eq!(bus.read32(GIF_STAT) & 3, 1);
+    }
+
+    /// The memory FIFO: the scratchpad's channel fills the ring buffer,
+    /// VIF1 drains it (a CNT tag and its quadword), then waits (MFIFO
+    /// empty), still started, its TADR where the next tag will be.
+    #[test]
+    fn the_memory_fifo_drains_what_is_written() {
+        let mut bus = Bus::new(&[]);
+        bus.write32(D_CTRL, 1 | 2 << 2);
+        bus.write32(D_RBOR, 0x10_0000);
+        bus.write32(D_RBSR, 0xFF0);
+        // The scratchpad channel's write pointer at the ring's start, then
+        // VIF1's source chain, from the ring, started first: empty.
+        bus.write32(SPR_FROM_BASE + MADR, 0x10_0000);
+        bus.write32(0x1000_9000 + TADR, 0x10_0000);
+        bus.write32(0x1000_9000, CHCR_STR | 1 << 2 | 1);
+        assert_ne!(bus.read32(D_STAT) & 1 << 14, 0);
+        // A CNT tag of one quadword (VIF NOPs), then the quadword, from the
+        // scratchpad into the ring.
+        bus.write128(SCRATCHPAD, 1 | 1 << 28);
+        bus.write128(SCRATCHPAD + 16, 0);
+        bus.write32(D_STAT, 1 << 14);
+        bus.write32(SPR_FROM_BASE + 0x80, 0);
+        bus.write32(SPR_FROM_BASE + QWC, 2);
+        bus.write32(SPR_FROM_BASE, CHCR_STR);
+        assert_eq!(bus.read32(SPR_FROM_BASE + MADR), 0x10_0020);
+        assert_eq!(bus.read32(0x1000_9000 + TADR), 0x10_0020);
+        assert_ne!(bus.read32(0x1000_9000) & CHCR_STR, 0);
+        assert_ne!(bus.read32(D_STAT) & 1 << 14, 0);
+    }
+
+    /// A tag at the ring's end: its data and the next tag wrap to its
+    /// start, however far past the end they would be.
+    #[test]
+    fn the_memory_fifo_wraps() {
+        let mut bus = Bus::new(&[]);
+        bus.write32(D_CTRL, 1 | 2 << 2);
+        bus.write32(D_RBOR, 0x10_0000);
+        // Four quadwords.
+        bus.write32(D_RBSR, 0x30);
+        bus.write32(SPR_FROM_BASE + MADR, 0x10_0030);
+        bus.write32(0x1000_9000 + TADR, 0x10_0030);
+        bus.write32(0x1000_9000, CHCR_STR | 1 << 2 | 1);
+        // A CNT tag of two quadwords, in the last slot: its data in the
+        // first two, the next tag in the third.
+        bus.write128(SCRATCHPAD, 2 | 1 << 28);
+        bus.write128(SCRATCHPAD + 16, 0);
+        bus.write128(SCRATCHPAD + 32, 0);
+        bus.write32(SPR_FROM_BASE + 0x80, 0);
+        bus.write32(SPR_FROM_BASE + QWC, 3);
+        bus.write32(SPR_FROM_BASE, CHCR_STR);
+        assert_eq!(bus.read32(SPR_FROM_BASE + MADR), 0x10_0020);
+        assert_eq!(bus.read32(0x1000_9000 + TADR), 0x10_0020);
+        assert_ne!(bus.read32(0x1000_9000) & CHCR_STR, 0);
+    }
+
+    /// A mask a VIF1 DMA list leaves on does not hold an upload started
+    /// after it (it went before the mask, on the console).
+    #[test]
+    fn a_mask_left_by_a_vif1_list_does_not_hold_later_uploads() {
+        let mut bus = Bus::new(&[]);
+        // VIF1's list: MSKPATH3 on, by DMA.
+        bus.write128(0x2000, 0x0600_8000);
+        bus.write32(0x1000_9000 + MADR, 0x2000);
+        bus.write32(0x1000_9000 + QWC, 1);
+        bus.write32(0x1000_9000, CHCR_STR | 1);
+        assert_eq!(bus.read32(GIF_STAT) & 2, 2);
+        // Then an upload: it runs.
+        bus.write128(0x1000, 1 << 15);
+        bus.write32(GIF_BASE + MADR, 0x1000);
+        bus.write32(GIF_BASE + QWC, 1);
+        bus.write32(GIF_BASE, CHCR_STR);
+        assert_eq!(bus.read32(GIF_BASE) & CHCR_STR, 0);
+    }
+
+    /// Path 3 waits while masked: its DMA stays started, GIF_STAT shows
+    /// its data queued in the FIFO; it runs when the mask is lifted.
+    #[test]
+    fn path3_waits_while_masked() {
+        let mut bus = Bus::new(&[]);
+        bus.write128(0x1000_5000, 0x0600_8000);
+        // A normal transfer of one quadword: an empty GIF tag (EOP).
+        bus.write128(0x1000, 1 << 15);
+        bus.write32(GIF_BASE + MADR, 0x1000);
+        bus.write32(GIF_BASE + QWC, 1);
+        bus.write32(GIF_BASE, CHCR_STR);
+        assert_ne!(bus.read32(GIF_BASE) & CHCR_STR, 0);
+        assert_eq!(bus.read32(GIF_STAT) >> 24 & 0x1F, 1);
+        bus.write128(0x1000_5000, 0x0600_0000);
+        assert_eq!(bus.read32(GIF_BASE) & CHCR_STR, 0);
+        assert_eq!(bus.read32(GIF_STAT) >> 24 & 0x1F, 0);
+    }
 
     #[test]
     fn regions_and_widths() {

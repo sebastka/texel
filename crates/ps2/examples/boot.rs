@@ -442,6 +442,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     println!("VU1 queue {:?}", ps2.bus.vu1q.stats);
     println!("GIF quadwords by path {:?}", ps2.bus.gif.qwords);
+    println!(
+        "Path 3: GIF_MODE {:08X}, VIF1's MSKPATH3 {}; GIF DMA CHCR {:08X} MADR {:08X} QWC {:X} TADR {:08X}; D_CTRL {:08X}",
+        ps2.bus.register(0x1000_3010),
+        ps2.bus.vif1.mask_path3,
+        ps2.bus.register(0x1000_A000),
+        ps2.bus.register(0x1000_A010),
+        ps2.bus.register(0x1000_A020),
+        ps2.bus.register(0x1000_A030),
+        ps2.bus.register(0x1000_E000)
+    );
     let ipu = &ps2.bus.ipu;
     println!(
         "IPU commands (BCLR IDEC BDEC VDEC FDEC SETIQ SETVQ CSC PACK SETTH) {:?}, errors {}, busy {}, output {} quadwords",

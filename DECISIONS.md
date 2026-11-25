@@ -600,3 +600,28 @@ VU programs load small integers into vector registers with MAX and MINI: `MAXi.x
 - **The interpreter and the compiler** both compare the raw bits as sign-magnitude integers (`vu::order_key`: -0 and +0 equal, ties giving the second operand as before) and select the raw bits: denormals, and the largest exponent, kept as they are. The compiler loads MAX and MINI's operands unsanitized, and compares with WebAssembly's integer comparisons.
 - **Checked**: a test of the idiom (MAXi with I = 3; MINI against a negative denormal; -0 against +0); Jak's jungle, VU1 compiled and interpreted, the same for 10 seconds; Tekken 5's packets well formed (none of program 0x25's vertices off the screen, 98% before), and it reaches a dialog from boot rather than a black screen.
 - Found with a VIF1 watch for the boot example (`VIFWATCH`), which showed the game's uploads faithful, and a decoding of the program's run.
+
+## D76. Path 3 waits while masked, and GIF_STAT says so
+
+Games keep texture uploads (path 3, the GIF's DMA) from slipping between VU1's packets by masking path 3: VIF1's MSKPATH3, or GIF_MODE's M3R. They then check GIF_STAT: Burnout 3 masks path 3, waits for GIF_STAT's M3P, starts the upload, and waits for its data to show in the GIF's FIFO before unmasking. Texel had no GIF_STAT (reads gave 0) and ignored MSKPATH3: Burnout 3 waited forever, black.
+
+- **GIF_STAT** reports M3R and IMT (from GIF_MODE) and M3P (VIF1's MSKPATH3, which VIF1 now records).
+- **Path 3 waits while masked**: its DMA stays started without moving data, GIF_STAT showing it queued (IP3, P3Q) and the FIFO full of it (FQC, at most 16 quadwords); it runs when the mask is lifted (VIF1's MSKPATH3 by DMA or FIFO, or GIF_MODE written).
+- **A mask a VIF1 DMA list left on** does not hold an upload started after the list. VIF1 runs its lists at once here; on the console the list would still be running, the upload going before it reaches the mask. SSX on Tour ends a list masking path 3, starts an upload and waits for it before the next list, which unmasks it: held, it waited forever. A mask the EE writes to VIF1's FIFO holds, as on the console (Burnout 3's).
+- Otherwise transfers still end at once: no active path, an empty FIFO.
+- **Checked**: tests of both masks, of the wait, and of a list's mask; Burnout 3 now draws its loading screen, SSX on Tour as before.
+
+## D77. An expansion bay with nothing plugged in
+
+Games with online modes load the expansion bay's driver (DEV9) and the network adapter's: DEV9 reads the bay's revision (the halfword at IOP 0x1F80146E) and, unknown, unloads, so the network modules depending on it fail to load (-200), and some games wait for them (Midnight Club II said "dev9: unknown dev9 hardware"). Texel read 0 there.
+
+- **The bay's revision** says 0x30, a bay (every model but the first Japanese ones, which had PCMCIA, 0x2x); its device's registers (the network adapter's SPEED chip) read 0: nothing plugged in. DEV9 loads ("CXD9611 detected"), and the network driver fails cleanly (-3), as on a console without an adapter.
+- No network adapter is emulated.
+
+## D78. The memory FIFO
+
+The EE's DMA has a memory FIFO (D_CTRL's MFD): the scratchpad's channel (8) writes into a ring buffer in RAM (D_RBOR, its size a mask in D_RBSR), and a drain channel (VIF1 or the GIF) follows a source chain whose tags and data are in the ring, its addresses wrapping, and stalls when it catches up with what was written. Games stream their geometry that way, and wait for the drain's TADR to show room (Tekken 4, Midnight Club II): Texel had no ring, so they waited forever, black.
+
+- **The scratchpad's channel**, with the memory FIFO on, writes into the ring, its address wrapping; when it is done, a started drain goes on.
+- **The drain** reads its tags and their data in the ring: addresses that follow a tag (its data, the next tag) wrap however far past the end they land; a tag's own pointers (a REF's data) are taken as they are, a NEXT's wrapped if in the ring. It stalls when its TADR reaches the scratchpad channel's address (MFIFO empty: D_STAT bit 14, which can raise INT1), its DMA still started.
+- **Checked**: tests of a drain catching up and of wrapping at the ring's end; Tekken 4 reaches its memory-card prompt, Midnight Club II its intro (whose movie then stops: another matter).

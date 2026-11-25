@@ -119,6 +119,10 @@ pub struct Vif {
     pub irq: bool,
     /// Microprograms started, for diagnostics.
     pub calls: u64,
+    /// VIF1's MSKPATH3: path 3 masked (GIF_STAT's M3P). Not in save
+    /// states: games mask it around a transfer, never across frames.
+    #[serde(skip)]
+    pub mask_path3: bool,
     /// Diagnostics: VU memory's quadwords to watch (from, to), and what
     /// wrote there: UNPACKs, their vectors, programs started.
     #[serde(skip)]
@@ -151,6 +155,7 @@ impl Vif {
             written: 0,
             irq: false,
             calls: 0,
+            mask_path3: false,
             watch: None,
             watched: Vec::new(),
         }
@@ -318,7 +323,10 @@ impl Vif {
                 // Vectors that need no input (filling writes) go out now.
                 self.unpack_fill(vu);
             }
-            // NOP, MSKPATH3, FLUSHE, FLUSH, FLUSHA: nothing to wait for.
+            // MSKPATH3 (VIF1): path 3 masked (bit 15) or not; games wait
+            // for GIF_STAT to show it.
+            0x06 if self.index == 1 => self.mask_path3 = imm & 0x8000 != 0,
+            // NOP, FLUSHE, FLUSH, FLUSHA: nothing to wait for.
             _ => {}
         }
     }

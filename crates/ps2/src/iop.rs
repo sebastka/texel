@@ -514,6 +514,13 @@ impl IopBus {
             0x1D00_0000..0x1D00_0070 => self.sif.iop_read(pa - 0x1D00_0000),
             0x1F80_8200..0x1F80_8300 => self.sio2.read(pa - 0x1F80_8200),
             0x1F80_1600..0x1F80_1700 => self.usb.read(pa - 0x1F80_1600),
+            // The expansion bay (DEV9): its revision (the halfword at
+            // 0x146E) says a bay, 0x3x, as on every model but the first
+            // Japanese ones (PCMCIA, 0x2x); its device's registers (the
+            // network adapter's SPEED chip, at 0x10000000) read 0: nothing
+            // plugged in. Games load the bay's driver for their online
+            // modes, and wait for its answer.
+            0x1F80_146C => (self.regs.get(&pa).copied().unwrap_or(0) & 0xFFFF) | 0x30 << 16,
             0x1F80_1070 => self.intc.stat,
             0x1F80_1074 => self.intc.mask,
             0x1F80_1078 => std::mem::take(&mut self.intc.ctrl),
