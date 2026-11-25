@@ -1173,6 +1173,28 @@ impl Gpu {
         };
         display_rgba(self.display(), self.scale, src, &self.vram, out)
     }
+
+    /// The displayed picture's size: what `render_display` gives.
+    pub fn display_dims(&self) -> (usize, usize) {
+        let d = self.display();
+        let s = if d.depth24 { 1 } else { self.scale };
+        (d.w as usize * s, d.h as usize * s)
+    }
+
+    /// The displayed picture as VRAM holds it, for a renderer that converts
+    /// its colours itself (see `display_15`); `None` while drawing is
+    /// recorded (the recording's renderer shows it).
+    pub fn picture<'a>(&'a self, wrapped: &'a mut Vec<u16>) -> Option<Picture<'a>> {
+        if self.record {
+            return None;
+        }
+        let src = if self.scale == 1 {
+            &self.vram[..]
+        } else {
+            &self.hires[..]
+        };
+        display_15(self.display(), self.scale, src, wrapped)
+    }
 }
 
 /// A drawing target: the native VRAM, or its scaled-up copy. Coordinates
@@ -1932,6 +1954,58 @@ pub struct Spans {
     pub ye: i32,
 }
 
+/// The displayed picture as VRAM holds it (15-bit colours, the mask bit
+/// on top): `w` by `h` pixels from `x`, `y` in `pixels`, whose rows are
+/// `stride` pixels long.
+pub struct Picture<'a> {
+    pub pixels: &'a [u16],
+    pub stride: usize,
+    pub x: usize,
+    pub y: usize,
+    pub w: usize,
+    pub h: usize,
+}
+
+/// The displayed area of `scaled` (VRAM at `scale`), as it is: `None` in
+/// 24-bit mode and with the display off (`display_rgba` then). A picture
+/// that wraps around VRAM's edges is copied into `wrapped` (rarely).
+pub(crate) fn display_15<'a>(
+    d: Display,
+    scale: usize,
+    scaled: &'a [u16],
+    wrapped: &'a mut Vec<u16>,
+) -> Option<Picture<'a>> {
+    if d.off || d.depth24 {
+        return None;
+    }
+    let (stride, rows) = (VRAM_WIDTH * scale, VRAM_HEIGHT * scale);
+    let (w, h) = (d.w as usize * scale, d.h as usize * scale);
+    let (x, y) = ((d.x as usize * scale) % stride, (d.y as usize * scale) % rows);
+    if x + w <= stride && y + h <= rows {
+        return Some(Picture {
+            pixels: scaled,
+            stride,
+            x,
+            y,
+            w,
+            h,
+        });
+    }
+    wrapped.clear();
+    for r in 0..h {
+        let row = &scaled[(y + r) % rows * stride..][..stride];
+        wrapped.extend((0..w).map(|c| row[(x + c) % stride]));
+    }
+    Some(Picture {
+        pixels: wrapped,
+        stride: w,
+        x: 0,
+        y: 0,
+        w,
+        h,
+    })
+}
+
 /// Renders the displayed area as RGBA8888 into `out` and returns its size:
 /// the display size times `scale` (`scaled`: the VRAM drawn at that scale),
 /// except in 24-bit mode (FMVs), which only exists at native resolution
@@ -2013,6 +2087,41 @@ fn rgb24_to_15(c: u32) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_15_bit_picture_is_the_rgba_one() {
+        let scale = 2;
+        let vram: Vec<u16> = (0..VRAM_WIDTH * VRAM_HEIGHT * scale * scale)
+            .map(|i| (i as u32).wrapping_mul(2_654_435_761) as u16)
+            .collect();
+        // In the middle of VRAM, and wrapping around its right and bottom
+        // edges.
+        for (x, y) in [(64, 16), (900, 400)] {
+            let d = Display {
+                x,
+                y,
+                w: 320,
+                h: 240,
+                depth24: false,
+                off: false,
+            };
+            let mut rgba = Vec::new();
+            let (w, h) = display_rgba(d, scale, &vram, &vram, &mut rgba);
+            let mut wrapped = Vec::new();
+            let p = display_15(d, scale, &vram, &mut wrapped).expect("a 15-bit picture");
+            assert_eq!((p.w, p.h), (w, h));
+            let mut row = vec![[0u8; 4]; w];
+            for r in 0..h {
+                let start = (p.y + r) * p.stride + p.x;
+                widen(&p.pixels[start..start + w], &mut row);
+                assert_eq!(
+                    row.as_flattened(),
+                    &rgba[r * w * 4..(r + 1) * w * 4],
+                    "({x}, {y}), row {r}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn colours_widen_as_the_console_shows_them() {

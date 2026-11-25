@@ -6,7 +6,9 @@
 //! Precise triangles (`Command::Precise`) are for the GPU renderer: record
 //! without precise geometry for this one.
 
-use super::{Command, Display, Prim, Raster, Spans, Transfer, VRAM_HEIGHT, VRAM_WIDTH, Vertex, display_rgba};
+use super::{
+    Command, Display, Picture, Prim, Raster, Spans, Transfer, VRAM_HEIGHT, VRAM_WIDTH, Vertex, display_15, display_rgba,
+};
 
 pub struct Replay {
     scale: usize,
@@ -139,6 +141,12 @@ impl Replay {
     /// The displayed picture, RGBA8888, into `out`: its size.
     pub fn render_display(&self, d: Display, out: &mut Vec<u8>) -> (usize, usize) {
         display_rgba(d, self.scale, &self.hires, &self.native, out)
+    }
+
+    /// The displayed picture as the scaled VRAM holds it (see
+    /// `display_15`; `None`: `render_display`).
+    pub fn picture<'a>(&'a self, d: Display, wrapped: &'a mut Vec<u16>) -> Option<Picture<'a>> {
+        display_15(d, self.scale, &self.hires, wrapped)
     }
 
     fn raster(&mut self, check_mask: bool, set_mask: bool, area: [i32; 4]) -> Raster<'_> {

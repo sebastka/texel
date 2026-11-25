@@ -22,6 +22,7 @@ pub mod jit;
 
 pub use bios::{BiosInfo, Region};
 pub use cdrom::DiscImage;
+pub use gpu::Picture;
 /// What the GPU records for another renderer (see `System::set_gpu_recording`).
 pub mod gpu_record {
     pub use crate::gpu::replay::Replay;
@@ -123,8 +124,11 @@ pub struct System {
     bus: Bus,
     bios_info: BiosInfo,
     exe: Option<Vec<u8>>,
+    /// The last frame, RGBA8888, made when asked for (`frame`): renderers
+    /// that take VRAM's colours (`picture`) do without.
     frame: Vec<u8>,
     frame_size: (usize, usize),
+    frame_stale: bool,
     /// The CPU's code compiled to WebAssembly (browsers), when set.
     jit: Option<Box<jit::Jit>>,
     /// Enhancements on (see `set_precise_geometry`, `set_widescreen`): kept
@@ -145,6 +149,7 @@ impl System {
             exe: None,
             frame: Vec::new(),
             frame_size: (0, 0),
+            frame_stale: false,
             jit: None,
             precise: false,
             widescreen: false,
@@ -246,7 +251,8 @@ impl System {
                 self.start_exe(&exe);
             }
         }
-        self.frame_size = self.bus.gpu.render_display(&mut self.frame);
+        self.frame_size = self.bus.gpu.display_dims();
+        self.frame_stale = true;
     }
 
     /// Diagnostics: one turn of `run_frame`'s loop (a compiled block, or
@@ -291,8 +297,24 @@ impl System {
     }
 
     /// The last frame, RGBA8888, and its size.
-    pub fn frame(&self) -> (&[u8], usize, usize) {
+    pub fn frame(&mut self) -> (&[u8], usize, usize) {
+        if std::mem::take(&mut self.frame_stale) {
+            self.frame_size = self.bus.gpu.render_display(&mut self.frame);
+        }
         (&self.frame, self.frame_size.0, self.frame_size.1)
+    }
+
+    /// The last frame's size (without making it).
+    pub fn frame_size(&self) -> (usize, usize) {
+        self.frame_size
+    }
+
+    /// The last frame as VRAM holds it (15-bit colours), for a renderer
+    /// that converts them itself; `None` when only `frame` has it (24-bit
+    /// pictures, the display off, drawing recorded). `wrapped`: room for a
+    /// picture wrapping around VRAM's edges.
+    pub fn picture<'a>(&'a self, wrapped: &'a mut Vec<u16>) -> Option<Picture<'a>> {
+        self.bus.gpu.picture(wrapped)
     }
 
     /// Sets the internal resolution multiplier (1 to 4): polygons are

@@ -19,6 +19,8 @@ use wasm_bindgen::prelude::*;
 pub struct Emulator {
     system: System,
     audio: Vec<i16>,
+    /// Room for a picture wrapping around VRAM's edges (see `picture`).
+    wrapped: Vec<u16>,
     #[cfg(target_arch = "wasm32")]
     gpu: Option<texel_ps1_gpu::GpuRenderer>,
 }
@@ -30,6 +32,7 @@ impl Emulator {
         Ok(Self {
             system: System::new(bios)?,
             audio: Vec::with_capacity(4096),
+            wrapped: Vec::new(),
             #[cfg(target_arch = "wasm32")]
             gpu: None,
         })
@@ -176,17 +179,24 @@ impl Emulator {
 
     #[wasm_bindgen(getter, js_name = frameWidth)]
     pub fn frame_width(&self) -> usize {
-        self.system.frame().1
+        self.system.frame_size().0
     }
 
     #[wasm_bindgen(getter, js_name = frameHeight)]
     pub fn frame_height(&self) -> usize {
-        self.system.frame().2
+        self.system.frame_size().1
     }
 
-    /// The last frame, RGBA8888.
-    pub fn frame(&self) -> js_sys::Uint8ClampedArray {
+    /// The last frame, RGBA8888 (made now: `picture` is cheaper).
+    pub fn frame(&mut self) -> js_sys::Uint8ClampedArray {
         js_sys::Uint8ClampedArray::from(self.system.frame().0)
+    }
+
+    /// The last frame as VRAM holds it, to show without converting it: where
+    /// its 15-bit pixels are in this module's memory (see `layout`), or
+    /// nothing when only `frame` has it.
+    pub fn picture(&mut self) -> Option<Vec<u32>> {
+        self.system.picture(&mut self.wrapped).map(|p| layout(&p))
     }
 
     /// Interleaved stereo samples at 44.1 kHz produced since the last call.
@@ -330,6 +340,21 @@ pub struct Replayer {
     display: Option<texel_ps1::gpu_record::Display>,
     frame: Vec<u8>,
     size: (usize, usize),
+    /// Room for a picture wrapping around VRAM's edges (see `picture`).
+    wrapped: Vec<u16>,
+}
+
+/// A picture's place in this module's memory, for JavaScript to read it
+/// there (a view on the memory, no copy): the address of its pixels (bytes),
+/// how many there are (16-bit), the length of their rows, and the picture's
+/// position and size in them: `[address, length, stride, x, y, w, h]`. The
+/// view is valid until the module runs again.
+fn layout(p: &texel_ps1::Picture<'_>) -> Vec<u32> {
+    // In WebAssembly, an address is an offset in the memory.
+    [p.pixels.as_ptr() as usize, p.pixels.len(), p.stride, p.x, p.y, p.w, p.h]
+        .iter()
+        .map(|&v| v as u32)
+        .collect()
 }
 
 #[wasm_bindgen]
@@ -341,6 +366,7 @@ impl Replayer {
             display: None,
             frame: Vec::new(),
             size: (0, 0),
+            wrapped: Vec::new(),
         }
     }
 
@@ -374,6 +400,14 @@ impl Replayer {
     /// The last picture rendered, RGBA8888.
     pub fn frame(&self) -> js_sys::Uint8ClampedArray {
         js_sys::Uint8ClampedArray::from(&self.frame[..])
+    }
+
+    /// The displayed picture as the scaled VRAM holds it, to show without
+    /// converting it (see `Emulator::picture`); nothing when only `render`
+    /// and `frame` give it.
+    pub fn picture(&mut self) -> Option<Vec<u32>> {
+        let d = self.display?;
+        self.replay.picture(d, &mut self.wrapped).map(|p| layout(&p))
     }
 }
 

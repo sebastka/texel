@@ -87,7 +87,7 @@ The emulators run entirely in the browser: the server serves the web app, the BI
 The player runs a console in workers:
 
 - **Emulation worker** (`worker.ts`): the PS1 or PS2 core (WebAssembly, D1, D26), paced by its audio (D3); the disc is read from the server sector by sector (`crates/web-disc`, D2). The cores compile their CPUs' code to WebAssembly modules as it runs (D30, D49).
-- **Drawing**: where the browser has WebGPU, the cores' drawing runs on the GPU (`crates/ps1-gpu`, `crates/ps2-gpu`, D28, D29, D37, D39); the PS1's scaled drawing otherwise runs in software in a draw worker (`draw-worker.ts`), on another core (D40).
+- **Drawing**: where the browser has WebGPU, the cores' drawing runs on the GPU (`crates/ps1-gpu`, `crates/ps2-gpu`, D28, D29, D37, D39); the PS1's scaled drawing otherwise runs in software in a draw worker (`draw-worker.ts`), on another core (D40). Pictures drawn in software are shown through WebGL 2 (`paint.ts`): the PS1's as its VRAM holds them, read from the module's memory and unpacked by a shader, the PS2's as RGBA; on a 2D canvas where there is no WebGL 2 (D64).
 - **Audio**: samples go to an audio worklet (`audio-worklet.ts`) through a ring in a `SharedArrayBuffer`.
 - **VU1 worker** (`vu1-worker.ts`, PS2): VU1 and VIF1 run beside the EE, fed through pipes in `SharedArrayBuffer`s, when the page is cross-origin isolated and the machine has four cores or more (D57).
 

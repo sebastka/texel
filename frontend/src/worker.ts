@@ -8,7 +8,7 @@ import { RING_FRAMES, Ring } from "./audio";
 import type { FromDrawer, ToDrawer } from "./draw-worker";
 import { OPS_BYTES, Pipe, RECORDS_BYTES, Vu1Link } from "./vu1-pipe";
 import type { ToVu1 } from "./vu1-worker";
-import { Painter } from "./paint";
+import { type Painter, painter as makePainter } from "./paint";
 import { Session } from "./netplay";
 import { cardUrl } from "./api";
 import type { Axes, FromWorker, RoomSnapshot, Slots, StartMessage, ToWorker } from "./protocol";
@@ -36,6 +36,9 @@ let ps2Disc = false;
 let ring: Ring | null = null;
 /** Paints pictures drawn here (software, without a drawing worker). */
 let painter: Painter | null = null;
+/** The PlayStation's module's memory, where its pictures are (`picture`);
+ * null for the PS2. */
+let ps1Memory: WebAssembly.Memory | null = null;
 /** The PlayStation's scaled picture drawn in another worker (see
  * draw-worker.ts): it, whether it is ready for more, the recordings not
  * sent yet, a screenshot awaited. */
@@ -222,7 +225,7 @@ async function start(msg: StartMessage) {
       );
     }
   } else {
-    await init();
+    ps1Memory = (await init()).memory;
     // Scaled drawing on the GPU, where the browser has WebGPU.
     const onGpu = (await webgpu()) ? await Emulator.withGpu(bios, msg.canvas).catch(gpuFailed) : null;
     gpu = onGpu;
@@ -267,7 +270,7 @@ async function start(msg: StartMessage) {
     emu.setDrawingElsewhere(true);
   } else if (!gpu) {
     // On the GPU, the canvas is WebGPU's: no 2D context.
-    painter = new Painter(canvas);
+    painter = makePainter(canvas);
   }
   smooth = msg.smooth;
   ring = msg.audio ? new Ring(msg.audio) : null;
@@ -402,7 +405,12 @@ function draw() {
     sendDrawings();
     return;
   }
-  painter?.paint(emu.frame() as Uint8ClampedArray<ArrayBuffer>, emu.frameWidth, emu.frameHeight, viewport, smooth, hidden);
+  if (!painter) return;
+  // The PlayStation's 15-bit picture, unconverted, where the painter takes
+  // it (WebGL); else RGBA (the PS2's pictures, 24-bit ones, a 2D canvas).
+  const layout = painter.takes15 && ps1Memory ? (emu as Emulator).picture() : undefined;
+  if (layout && ps1Memory) painter.paint15(ps1Memory.buffer, layout, viewport, smooth, hidden);
+  else painter.paint(emu.frame() as Uint8ClampedArray<ArrayBuffer>, emu.frameWidth, emu.frameHeight, viewport, smooth, hidden);
 }
 
 async function compress(data: Uint8Array, format: "gzip", decompress = false): Promise<Uint8Array> {
@@ -450,7 +458,7 @@ async function screenshot(): Promise<Blob | null> {
     else drawings.push(new ArrayBuffer(0));
     return shot;
   }
-  return painter ? painter.picture.convertToBlob({ type: "image/png" }) : null;
+  return painter ? painter.screenshot() : null;
 }
 
 /** Each second: lowers the resolution while emulation (or drawing) lags
