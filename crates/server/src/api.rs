@@ -33,6 +33,20 @@ const MAX_STATE: usize = 32 << 20;
 const MAX_SCREENSHOT: usize = 8 << 20;
 const STATE_SLOTS: u8 = 4;
 
+/// Where the page opens netplay's datagram sessions (`webtransport`),
+/// when the server listens for them: `https://` the public name (any,
+/// without `TEXEL_PUBLIC_URL`) and the port browsers reach.
+fn datagram_source(state: &AppState) -> Option<String> {
+    let port = *state.datagram_port.get()?;
+    let host = state
+        .config
+        .public_url
+        .as_deref()
+        .and_then(|u| reqwest::Url::parse(u).ok())
+        .and_then(|u| u.host_str().map(str::to_owned));
+    Some(format!("https://{}:{port}", host.as_deref().unwrap_or("*")))
+}
+
 pub fn router(state: Arc<AppState>) -> Router {
     let web = &state.config.web;
     let spa = ServeDir::new(web).fallback(ServeFile::new(web.join("index.html")));
@@ -103,19 +117,26 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/netplay/host", get(crate::netplay::host))
         .route("/netplay/rooms/{code}", get(crate::netplay::room))
         .route("/netplay/join/{code}", get(crate::netplay::join));
+    // The page connects to its own origin, and to netplay's datagram
+    // endpoint when the server listens for it (another port: another
+    // origin, which the policy must name).
+    let connect = match datagram_source(&state) {
+        Some(source) => format!("'self' {source}"),
+        None => "'self'".to_owned(),
+    };
+    let csp = format!(
+        "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; \
+         img-src 'self' data: blob:; connect-src {connect}; worker-src 'self' blob:; object-src 'none'; \
+         base-uri 'none'; frame-ancestors 'none'"
+    );
     let headers = [
         // Cross-origin isolation, for SharedArrayBuffer (audio ring buffer).
-        ("cross-origin-opener-policy", "same-origin"),
-        ("cross-origin-embedder-policy", "require-corp"),
-        ("cross-origin-resource-policy", "same-origin"),
-        ("x-content-type-options", "nosniff"),
-        ("referrer-policy", "no-referrer"),
-        (
-            "content-security-policy",
-            "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; \
-             img-src 'self' data: blob:; connect-src 'self'; worker-src 'self' blob:; object-src 'none'; \
-             base-uri 'none'; frame-ancestors 'none'",
-        ),
+        ("cross-origin-opener-policy", "same-origin".to_owned()),
+        ("cross-origin-embedder-policy", "require-corp".to_owned()),
+        ("cross-origin-resource-policy", "same-origin".to_owned()),
+        ("x-content-type-options", "nosniff".to_owned()),
+        ("referrer-policy", "no-referrer".to_owned()),
+        ("content-security-policy", csp),
     ];
     let mut app = Router::new()
         .nest("/api", api)
@@ -128,7 +149,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .layer(axum::middleware::from_fn_with_state(state.clone(), auth::same_origin))
         .with_state(state);
     for (name, value) in headers {
-        let (name, value) = (HeaderName::from_static(name), HeaderValue::from_static(value));
+        let name = HeaderName::from_static(name);
+        let value = HeaderValue::from_str(&value).expect("the headers are ASCII");
         // A response may set a stricter policy of its own (users' pictures).
         app = if name == header::CONTENT_SECURITY_POLICY {
             app.layer(SetResponseHeaderLayer::if_not_present(name, value))

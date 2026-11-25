@@ -9,7 +9,7 @@
 
 use std::collections::VecDeque;
 
-use texel_ps1::pad::Pad;
+use crate::dualshock2::DualShock2;
 
 use crate::memcard::MemoryCard;
 
@@ -25,7 +25,7 @@ pub type Exchange = (usize, usize, usize, Vec<u8>, Vec<u8>);
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct Sio2 {
     /// The controllers in ports 0 and 1.
-    pub pads: [Pad; 2],
+    pub pads: [DualShock2; 2],
     /// The memory cards in ports 2 and 3 (slots 1 and 2).
     #[serde(skip)]
     pub cards: [Option<Box<MemoryCard>>; 2],
@@ -69,7 +69,7 @@ pub struct Sio2 {
 impl Default for Sio2 {
     fn default() -> Self {
         Self {
-            pads: [Pad::new(true), Pad::new(true)],
+            pads: [DualShock2::new(true), DualShock2::new(true)],
             cards: [None, None],
             send3: [0; 16],
             send12: [0; 8],

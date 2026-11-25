@@ -57,6 +57,12 @@ impl Pad {
         self.step = 0;
     }
 
+    /// In configuration mode (command 0x43): the DualShock 2's commands
+    /// are answered then (see the PS2's `dualshock2`).
+    pub fn in_config(&self) -> bool {
+        self.config
+    }
+
     fn id(&self) -> u8 {
         if self.config {
             0xf3

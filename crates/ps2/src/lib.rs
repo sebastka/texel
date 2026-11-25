@@ -8,6 +8,7 @@
 pub mod bios;
 pub mod bus;
 pub mod cdvd;
+pub mod dualshock2;
 pub mod ee;
 pub mod gif;
 pub mod gs;
@@ -59,8 +60,10 @@ pub struct Ps2 {
 }
 
 /// Save states: this tag, the format's version, then the rest (`State`).
+/// Format 3 adds the controllers' pressure masks after the machine (see
+/// `save_core`); format 2's load with them off.
 const STATE_MAGIC: &[u8; 8] = b"TEXELPS2";
-const STATE_VERSION: u32 = 2;
+const STATE_VERSION: u32 = 3;
 
 #[derive(serde::Serialize)]
 struct StateRef<'a> {
@@ -131,6 +134,10 @@ impl Ps2 {
     /// when the GPU draws, they are on the GPU, read back later.
     pub fn save_core(&self) -> Vec<u8> {
         let mut core = postcard::to_stdvec(self).expect("serialising to memory cannot fail");
+        // After the machine: what it leaves out to read format 2's.
+        for pad in &self.bus.iop.sio2.pads {
+            core.extend_from_slice(&pad.mask.to_le_bytes());
+        }
         core.extend_from_slice(&fnv1a(&self.bus.bios).to_le_bytes());
         core
     }
@@ -159,16 +166,23 @@ impl Ps2 {
             .ok_or("not a Texel PlayStation 2 save state")?;
         let (version, body) = body.split_at_checked(4).ok_or("truncated")?;
         let version = u32::from_le_bytes(version.try_into().expect("4 bytes"));
-        if version != STATE_VERSION {
+        if !(2..=STATE_VERSION).contains(&version) {
             return Err(format!(
-                "made by another version of the emulator (format {version}, this one reads {STATE_VERSION})"
+                "made by another version of the emulator (format {version}, this one reads 2 to {STATE_VERSION})"
             ));
         }
         let state: State = postcard::from_bytes(body).map_err(|e| e.to_string())?;
         if state.bios_hash != fnv1a(&self.bus.bios) {
             return Err("saved with another BIOS".into());
         }
-        let mut new: Ps2 = postcard::from_bytes(&state.core).map_err(|e| e.to_string())?;
+        let (mut new, rest): (Ps2, _) = postcard::take_from_bytes(&state.core).map_err(|e| e.to_string())?;
+        // Format 3: the controllers' pressure masks.
+        for (k, pad) in new.bus.iop.sio2.pads.iter_mut().enumerate() {
+            let mask = rest.get(4 * k..4 * k + 4).map_or(dualshock2::ANALOG_MASK, |b| {
+                u32::from_le_bytes(b.try_into().expect("4 bytes"))
+            });
+            pad.restore_mask(mask);
+        }
         if state.gs_memory.len() != new.bus.gs.mem.words.len() {
             return Err("the GS memory has the wrong size".into());
         }
@@ -369,6 +383,31 @@ mod tests {
         other.run(300_000);
         assert_eq!(other.save_state(), after);
         assert!(Ps2::new(&[1]).load_state(&state).is_err());
+    }
+
+    /// The controllers' pressure masks come back with the state; a state
+    /// of format 2 (without them) loads with the pressures off.
+    #[test]
+    fn states_keep_the_pressure_masks() {
+        let mut ps2 = Ps2::new(&counting_bios());
+        ps2.bus.iop.sio2.pads[0].press_analog_button();
+        ps2.bus.iop.sio2.pads[0].restore_mask(0x3_FFFF);
+        let state = ps2.save_state();
+        let mut other = Ps2::new(&counting_bios());
+        other.load_state(&state).unwrap();
+        assert_eq!(other.bus.iop.sio2.pads[0].mask, 0x3_FFFF);
+        assert_eq!(other.bus.iop.sio2.pads[1].mask, dualshock2::ANALOG_MASK);
+
+        // Format 2: the machine alone.
+        let core = postcard::to_stdvec(&ps2).unwrap();
+        let mut old = core.clone();
+        old.extend_from_slice(&fnv1a(&ps2.bus.bios).to_le_bytes());
+        let mut v2 = Ps2::pack_state(&old, &ps2.bus.gs.mem.words, ps2.bus.gs.clut());
+        v2[8..12].copy_from_slice(&2u32.to_le_bytes());
+        let mut other = Ps2::new(&counting_bios());
+        other.load_state(&v2).unwrap();
+        assert_eq!(other.bus.iop.sio2.pads[0].mask, dualshock2::ANALOG_MASK);
+        assert!(other.bus.iop.sio2.pads[0].analog);
     }
 
     /// A console whose EE runs EELOAD, with its boot target and the test

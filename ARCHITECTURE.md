@@ -119,7 +119,7 @@ Controllers come from the keyboard and the Gamepad API (`input.ts`, `gamepad.ts`
 
 | Part | State |
 |---|---|
-| Emotion Engine | MIPS R5900: interpreter with COP0 (exceptions, TLB), the FPU, the MMI SIMD instructions; compiled to WebAssembly in browsers, a block at a time (D30) |
+| Emotion Engine | MIPS R5900: interpreter with COP0 (exceptions, TLB), the FPU, the MMI SIMD instructions; compiled to WebAssembly in browsers, a block at a time, 64 blocks to a module compiled in the background (D30, D70) |
 | Vector units | VU0 (macro mode, as the EE's COP2, and microprograms) and VU1: interpreter with the flags' pipeline, microprograms compiled to WebAssembly (four lanes at once, in its SIMD) (D49). VU1's work is queued until the EE side needs it, and can run in its own worker (D57) |
 | VIF0, VIF1 | UNPACK (all formats, masks, modes), MPG, MSCAL/MSCNT, DIRECT, double buffering |
 | GIF | Paths 1 to 3: PACKED, REGLIST and IMAGE |
@@ -129,9 +129,9 @@ Controllers come from the keyboard and the Gamepad API (`input.ts`, `gamepad.ts`
 | I/O processor | `crates/ps1`'s CPU, with its own memory map, interrupts, six timers and DMA; the SIF between it and the EE (D24) |
 | CDVD | N commands (reads of CD and DVD sectors, the end once DMA has the data, D61), S commands (clock, region, EEPROM), disc changes |
 | SPU2 | Two cores of 24 voices (the PS1's SPU's), sound memory, DMA, reverb (D33) |
-| SIO2 | Controllers (DualShock) and memory cards (8 MiB, with ECC; formatted by the server) (D32) |
+| SIO2 | Controllers (DualShock 2, pressure-sensitive buttons included, D71) and memory cards (8 MiB, with ECC; formatted by the server) (D32) |
 | Save states | The whole machine, GS memory included (read back from the GPU) (D34) |
-| Missing | The DualShock 2's pressure-sensitive buttons (some games refuse to start without), the IOP's reboot into a game's DNAS image (Jak X), the DVD player, arcade boards, cycle-accurate timing, speed: Jak's jungle runs at about 16 frames per second (of 50) |
+| Missing | Pressures in between (a button is pressed fully or not), the IOP's reboot into a game's DNAS image (Jak X), the DVD player, arcade boards, cycle-accurate timing, speed: Jak's jungle runs at about 16 frames per second (of 50) |
 
 Determinism matters throughout: save states, netplay and the compilers' checks (a compiled and an interpreted machine must reach the same state) need a run to go the same way each time. VU1's worker syncs at points that depend on the EE's side only, so a machine with the worker and one without go the same way (D57).
 

@@ -196,8 +196,10 @@ export class Room {
         if (done) break;
         this.relay?.((value as Uint8Array).slice().buffer);
       }
-    } catch {
-      // Refused, or UDP blocked: the WebSocket carries everything anyway.
+    } catch (e) {
+      // Refused (the page's policy, the server), or UDP blocked: the
+      // WebSocket carries everything anyway; the console says why.
+      console.warn("Netplay's datagram session did not open (inputs go over the WebSocket only):", e);
     }
     this.datagramWriter = null;
     this.transport = null;

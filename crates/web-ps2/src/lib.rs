@@ -291,6 +291,10 @@ impl Ps2Emulator {
     #[wasm_bindgen(js_name = runFrame)]
     pub fn run_frame(&mut self) {
         self.ps2.run(FRAME_CYCLES);
+        // The blocks compiled in the frame go to the browser.
+        if let Some(jit) = &mut self.ps2.ee.jit {
+            jit.end_frame();
+        }
         #[cfg(target_arch = "wasm32")]
         if let Some(gpu) = &mut self.gpu {
             gpu.submit(&self.ps2.bus.gs.take_commands());

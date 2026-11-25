@@ -34,7 +34,7 @@ fn compiled_with(words: Vec<u32>, idle: Vec<u32>) -> super::Compiled {
     };
     let c = compile(&Source { va: VA, words, idle }, 7, layout).expect("a block");
     let mut v = wasmparser::Validator::new();
-    if let Err(e) = v.validate_all(&c.module) {
+    if let Err(e) = v.validate_all(&super::batch(&[&c])) {
         panic!("invalid module: {e}");
     }
     c

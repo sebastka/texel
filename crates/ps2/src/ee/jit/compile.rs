@@ -1160,9 +1160,23 @@ fn segment(src: &Source, k: usize) -> usize {
     n - k
 }
 
-/// A compiled block.
+/// The functions' types in compiled modules: blocks (`ee`, `bus`, `left`
+/// → instructions run), and `exec` (see `helpers::exec`).
+const TYPES: [FuncType; 2] = [
+    FuncType {
+        params: &[I32, I32, I32],
+        results: &[I32],
+    },
+    FuncType {
+        params: &[I32, I32, I32, I32, I32],
+        results: &[I32],
+    },
+];
+
+/// A compiled block: its function's body and locals (see `batch`).
 pub struct Compiled {
-    pub module: Vec<u8>,
+    pub code: Code,
+    pub locals: Vec<(u32, u8)>,
     /// The instructions it must have left to start: its first, with its
     /// delay slot when it is a branch (it can stop after any other).
     pub first: u32,
@@ -1307,28 +1321,24 @@ pub fn compile(src: &Source, exec: u32, layout: Layout) -> Option<Compiled> {
         g.code.i32_const(ran as i32);
     }
     g.code.op(op::END);
-    let module = wasm::module(
-        &[
-            FuncType {
-                params: &[I32, I32, I32],
-                results: &[I32],
-            },
-            FuncType {
-                params: &[I32, I32, I32, I32, I32],
-                results: &[I32],
-            },
-        ],
-        &if g.vu0 {
-            vec![(MACRO_I32_LOCALS, I32), (MACRO_V128_LOCALS, V128_TYPE), (1, F32)]
-        } else {
-            vec![(6, I32)]
-        },
-        &g.code,
-    );
+    let locals = if g.vu0 {
+        vec![(MACRO_I32_LOCALS, I32), (MACRO_V128_LOCALS, V128_TYPE), (1, F32)]
+    } else {
+        vec![(6, I32)]
+    };
     Some(Compiled {
-        module,
+        code: g.code,
+        locals,
         first: first as u32,
         words: k as u32,
         native: g.natives,
     })
+}
+
+/// One module of compiled blocks, exporting their functions as `b0`, `b1`
+/// and so on, in order: browsers' costs are per module (Firefox's growing
+/// with their number), not per function.
+pub fn batch(blocks: &[&Compiled]) -> Vec<u8> {
+    let funcs: Vec<_> = blocks.iter().map(|c| (&c.locals[..], &c.code)).collect();
+    wasm::module_of(&TYPES, &funcs)
 }

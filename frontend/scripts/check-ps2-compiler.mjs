@@ -24,7 +24,7 @@ await mod.default({ module_or_path: readFileSync(`${dir}texel_web_ps2_bg.wasm`) 
 const bios = readFileSync(biosPath);
 const frames = 60 * Number(secondsArg ?? 10);
 
-function run(compiled) {
+async function run(compiled) {
   const emu = new mod.Ps2Emulator(bios);
   if (!process.env.GFX) emu.disableGraphics();
   emu.setCompiler(compiled);
@@ -46,6 +46,8 @@ function run(compiled) {
     if (f === Math.floor(frames / 2) + 1) half = performance.now();
     emu.runFrame();
     if (f % 60 === 0) hashes.push(emu.stateHash());
+    // Compiled modules come in the background: let them in.
+    if (compiled) await new Promise((resolve) => setImmediate(resolve));
   }
   const now = performance.now();
   const fps = (frames * 1000) / (now - started);
@@ -56,9 +58,9 @@ function run(compiled) {
   return hashes;
 }
 
-const compiled = run(true);
+const compiled = await run(true);
 if (!process.env.COMPILED_ONLY) {
-  const interpreted = run(false);
+  const interpreted = await run(false);
   let same = true;
   interpreted.forEach((h, i) => {
     const ok = h === compiled[i];
