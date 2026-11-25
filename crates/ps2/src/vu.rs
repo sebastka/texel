@@ -24,6 +24,32 @@ fn val(bits: u32) -> f32 {
     }
 }
 
+/// A float's order as MAX and MINI see it: its bits as a sign-magnitude
+/// integer (so -0 and +0 are equal, and denormals and the largest
+/// exponent compare as their bits say).
+#[inline]
+pub(crate) fn order_key(bits: u32) -> i32 {
+    let magnitude = (bits & 0x7FFF_FFFF) as i32;
+    if bits >> 31 != 0 { -magnitude } else { magnitude }
+}
+
+/// MAX, MINI: the operand with the larger (smaller) key, its bits as they
+/// are, denormals included (programs load small integers into vector
+/// registers this way: MAXi from the I register); ties give `t`, as
+/// compiled code has them. No flags.
+fn minmax(fd: usize, mask: u32, s: [u32; 4], t: [u32; 4], max: bool) -> Option<Commit> {
+    let value = std::array::from_fn(|k| {
+        let (a, b) = (order_key(s[k]), order_key(t[k]));
+        if (max && a > b) || (!max && a < b) { s[k] } else { t[k] }
+    });
+    Some(Commit {
+        reg: Some(fd),
+        mask,
+        value,
+        flags: None,
+    })
+}
+
 /// A result, clamped the PS2 way; and its flags (zero, sign, underflow,
 /// overflow).
 #[inline]
@@ -416,8 +442,10 @@ impl Vu {
         let fs = ((instr >> 11) & 31) as usize;
         let fd = ((instr >> 6) & 31) as usize;
         let funct = instr & 0x3F;
-        let s = self.vf[fs].map(val);
-        let t = self.vf[ft].map(val);
+        // MAX and MINI take the registers' bits as they are (see `minmax`).
+        let (raw_s, raw_t) = (self.vf[fs], self.vf[ft]);
+        let s = raw_s.map(val);
+        let t = raw_t.map(val);
         let acc = self.acc.map(val);
         let bc = (funct & 3) as usize;
         let broadcast = [t[bc]; 4];
@@ -437,13 +465,13 @@ impl Vu {
             0x04..=0x07 => to(fdr, lanes(|k| s[k] - broadcast[k])),
             0x08..=0x0B => to(fdr, lanes(|k| acc[k] + s[k] * broadcast[k])),
             0x0C..=0x0F => to(fdr, lanes(|k| acc[k] - s[k] * broadcast[k])),
-            0x10..=0x13 => self.minmax(fd, mask, s, broadcast, true),
-            0x14..=0x17 => self.minmax(fd, mask, s, broadcast, false),
+            0x10..=0x13 => minmax(fd, mask, raw_s, [raw_t[bc]; 4], true),
+            0x14..=0x17 => minmax(fd, mask, raw_s, [raw_t[bc]; 4], false),
             0x18..=0x1B => to(fdr, lanes(|k| s[k] * broadcast[k])),
             0x1C => to(fdr, lanes(|k| s[k] * q[k])),
-            0x1D => self.minmax(fd, mask, s, iv, true),
+            0x1D => minmax(fd, mask, raw_s, [self.i; 4], true),
             0x1E => to(fdr, lanes(|k| s[k] * iv[k])),
-            0x1F => self.minmax(fd, mask, s, iv, false),
+            0x1F => minmax(fd, mask, raw_s, [self.i; 4], false),
             0x20 => to(fdr, lanes(|k| s[k] + q[k])),
             0x21 => to(fdr, lanes(|k| acc[k] + s[k] * q[k])),
             0x22 => to(fdr, lanes(|k| s[k] + iv[k])),
@@ -455,7 +483,7 @@ impl Vu {
             0x28 => to(fdr, lanes(|k| s[k] + t[k])),
             0x29 => to(fdr, lanes(|k| acc[k] + s[k] * t[k])),
             0x2A => to(fdr, lanes(|k| s[k] * t[k])),
-            0x2B => self.minmax(fd, mask, s, t, true),
+            0x2B => minmax(fd, mask, raw_s, raw_t, true),
             0x2C => to(fdr, lanes(|k| s[k] - t[k])),
             0x2D => to(fdr, lanes(|k| acc[k] - s[k] * t[k])),
             0x2E => {
@@ -463,33 +491,13 @@ impl Vu {
                 let cross = [s[1] * t[2], s[2] * t[0], s[0] * t[1], 0.0];
                 to(fdr, lanes(|k| acc[k] - cross[k]))
             }
-            0x2F => self.minmax(fd, mask, s, t, false),
+            0x2F => minmax(fd, mask, raw_s, raw_t, false),
             0x3C..=0x3F => {
                 let op = (funct & 3) | ((instr >> 4) & 0x7C);
                 self.upper_special(op, mask, ft, fs, s, t, acc, q, iv)
             }
             _ => None,
         }
-    }
-
-    fn minmax(&self, fd: usize, mask: u32, s: [f32; 4], t: [f32; 4], max: bool) -> Option<Commit> {
-        // Ties (+0 and -0) give t, as compiled code has them.
-        let value = std::array::from_fn(|k| {
-            let v = if max {
-                if s[k] > t[k] { s[k] } else { t[k] }
-            } else if s[k] < t[k] {
-                s[k]
-            } else {
-                t[k]
-            };
-            res(v).0
-        });
-        Some(Commit {
-            reg: Some(fd),
-            mask,
-            value,
-            flags: None,
-        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -918,6 +926,37 @@ mod tests {
 
     fn f(v: [f32; 4]) -> [u32; 4] {
         v.map(f32::to_bits)
+    }
+
+    /// MAXi and MINI keep the operands' bits, denormals included:
+    /// programs load small integers (a GIF tag's NLOOP) with MAXi from the
+    /// I register, and the tag must not lose them.
+    #[test]
+    fn max_and_mini_keep_the_bits() {
+        // I = 3 (lower word, I bit), then MAXi.x vf1, vf0; MINI.y vf2, vf3,
+        // vf4 (-1.0 against a negative denormal: -1.0); MAX.z vf5, vf6, vf7
+        // (-0 against +0: a tie, the second).
+        let maxi = (0x8 << 21) | (1 << 6) | 0x1D;
+        let mini = (0x4 << 21) | (4 << 16) | (3 << 11) | (2 << 6) | 0x2F;
+        let max = (0x2 << 21) | (7 << 16) | (6 << 11) | (5 << 6) | 0x2B;
+        let vu = run(
+            &[
+                (NOP | 1 << 31, 3),
+                (maxi, LNOP),
+                (mini, LNOP),
+                (max | E, LNOP),
+                (NOP, LNOP),
+            ],
+            |vu| {
+                vu.vf[3][1] = (-1.0f32).to_bits();
+                vu.vf[4][1] = 0x8000_0005;
+                vu.vf[6][2] = 0x8000_0000;
+                vu.vf[7][2] = 0;
+            },
+        );
+        assert_eq!(vu.vf[1][0], 3);
+        assert_eq!(vu.vf[2][1], (-1.0f32).to_bits());
+        assert_eq!(vu.vf[5][2], 0);
     }
 
     #[test]

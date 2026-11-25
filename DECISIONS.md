@@ -592,3 +592,11 @@ Operating systems dim, lock or sleep after a while without input, and a gamepad 
 
 - **A screen wake lock** (the Screen Wake Lock API, `wake.ts`) is held while a game runs, released while it is paused and when it stops. The browser drops it when the page is hidden (the player pauses then); it is taken again when the game runs again.
 - Where the API is missing or the lock refused (an old browser, a page not served securely, a battery saver), the system's timers apply, and the console says so.
+
+## D75. MAX and MINI keep their operands' bits
+
+VU programs load small integers into vector registers with MAX and MINI: `MAXi.x vf1, vf0` with the I register set to 3 puts 3 in vf1.x, a GIF tag's loop count, for instance. As floats, such values are denormals; the console's MAX and MINI compare the registers as sign-magnitude integers and copy the chosen operand's bits as they are, so the integer survives. Texel computed them as floats, its denormals read as zero by the PS2's float rules, so the integers became 0. Tekken 5 builds every 3D packet's GIF tag that way: its loop counts were 0, the GS read the rest of the packets as tags, 98% of the vertices landed at the origin, and the screen stayed black.
+
+- **The interpreter and the compiler** both compare the raw bits as sign-magnitude integers (`vu::order_key`: -0 and +0 equal, ties giving the second operand as before) and select the raw bits: denormals, and the largest exponent, kept as they are. The compiler loads MAX and MINI's operands unsanitized, and compares with WebAssembly's integer comparisons.
+- **Checked**: a test of the idiom (MAXi with I = 3; MINI against a negative denormal; -0 against +0); Jak's jungle, VU1 compiled and interpreted, the same for 10 seconds; Tekken 5's packets well formed (none of program 0x25's vertices off the screen, 98% before), and it reaches a dialog from boot rather than a black screen.
+- Found with a VIF1 watch for the boot example (`VIFWATCH`), which showed the game's uploads faithful, and a decoding of the program's run.

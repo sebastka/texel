@@ -654,6 +654,12 @@ fn dump_draws(ps2: &mut Ps2, frames: u64) {
     ps2.bus.gs.rendering = texel_ps2::gs::Rendering::Record;
     ps2.bus.gs.take_commands();
     ps2.bus.vu1.kicks = Some(Vec::new());
+    // VIFWATCH=from,to: VIF1's UNPACKs writing VU1 memory there
+    // (quadwords, hex), and the programs started.
+    ps2.bus.vif1.watch = std::env::var("VIFWATCH").ok().and_then(|v| {
+        let (a, b) = v.split_once(',')?;
+        Some((u32::from_str_radix(a, 16).ok()?, u32::from_str_radix(b, 16).ok()?))
+    });
     ps2.bus.vu1.trace_from = std::env::var("PROG")
         .ok()
         .and_then(|v| u32::from_str_radix(&v, 16).ok());
@@ -793,6 +799,12 @@ fn dump_draws(ps2: &mut Ps2, frames: u64) {
             let lo = u32::from_le_bytes(micro[at..at + 4].try_into().unwrap_or_default());
             let hi = u32::from_le_bytes(micro[at + 4..at + 8].try_into().unwrap_or_default());
             println!("CODE {pc:04x} {hi:08x} {lo:08x}");
+        }
+    }
+    if ps2.bus.vif1.watch.is_some() {
+        println!("--- VIF1 writes watched ({}):", ps2.bus.vif1.watched.len());
+        for line in &ps2.bus.vif1.watched {
+            println!("{line}");
         }
     }
     println!("--- VU1 programs (start: packets, vertices, off-screen ones)");

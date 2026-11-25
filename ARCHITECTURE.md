@@ -177,6 +177,7 @@ It prints what the BIOS kernel writes to its debug port (its start-up log) and w
 | `CDVDCMDS=1`, `CARDLOG=1`, `SIO2TRACE=1`, `USBLOG=1` | The drive's commands; the cards'; SIO2's registers; the USB controller's first accesses |
 | `DRAWS=frames` | What the GS was asked to draw over that many more frames |
 | `PROG=hex`, `FINDXY=x,y` | VU1's runs from there; which GIF path sent a vertex |
+| `VIFWATCH=from,to` | VIF1's UNPACKs writing VU1 memory there (quadwords, hex), their vectors, and the programs started |
 
 The GS on the GPU (`crates/ps2-gpu`, with wgpu: Vulkan, Metal or DirectX 12 natively, WebGPU in browsers) is checked against the software GS: `cargo run --release -p texel-ps2-gpu --example compare -- PS2-BIOS [SECONDS] [OUT_DIR]` boots a BIOS with both and prints, every second, how many GS memory words differ (`PAGES=1`: by page), writing both displayed frames (`GPU_ONLY=1`: the GPU alone, to measure it; it takes `DISC`, `MC1` and `PRESS` too). Its tests (`cargo test -p texel-ps2-gpu`) draw with both and compare the whole GS memory; without a GPU, they pass and say so.
 
