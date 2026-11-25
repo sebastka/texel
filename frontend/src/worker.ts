@@ -232,16 +232,12 @@ async function start(msg: StartMessage) {
     emu = onGpu ?? new Emulator(bios);
     // The CPU's code compiled to WebAssembly as it runs (it runs exactly as
     // interpreted: netplay peers may differ); interpreted if this browser
-    // will not make modules, and in Firefox, where calls between the
-    // emulator and its compiled blocks (other modules) cost more than
-    // compiling saves (Spyro the Dragon: half the interpreter's speed).
-    if (!navigator.userAgent.includes("Firefox/")) {
-      try {
-        emu.setCompiler(true);
-        compiled = "CPU compiled";
-      } catch (e) {
-        console.warn("The CPU's compiler is not available, interpreting:", e);
-      }
+    // will not make modules.
+    try {
+      emu.setCompiler(true);
+      compiled = "CPU compiled";
+    } catch (e) {
+      console.warn("The CPU's compiler is not available, interpreting:", e);
     }
     gameId = msg.gameId;
   }

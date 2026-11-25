@@ -224,6 +224,19 @@ fn name(out: &mut Vec<u8>, s: &str) {
 /// with `locals` (count, type) groups and `code` as its body (its final
 /// `end` included). It imports `env.memory` and `env.table` (funcref).
 pub fn module(types: &[FuncType], locals: &[(u32, u8)], code: &Code) -> Vec<u8> {
+    encode(types, &[(locals, code)], |_| "block".into())
+}
+
+/// A module of several functions, all of type 0, exported as `b0`, `b1`
+/// and so on, in order: fewer modules than functions (browsers' costs are
+/// per module, Firefox's growing with how many there are).
+pub fn module_of(types: &[FuncType], funcs: &[(&[(u32, u8)], &Code)]) -> Vec<u8> {
+    encode(types, funcs, |k| format!("b{k}"))
+}
+
+/// The module: the types, the memory and the table imported from `env`,
+/// the functions (all of type 0) exported by `export`'s names.
+fn encode(types: &[FuncType], funcs: &[(&[(u32, u8)], &Code)], export: impl Fn(usize) -> String) -> Vec<u8> {
     let mut out = b"\0asm\x01\0\0\0".to_vec();
 
     let mut body = Vec::new();
@@ -249,26 +262,34 @@ pub fn module(types: &[FuncType], locals: &[(u32, u8)], code: &Code) -> Vec<u8> 
     body.extend_from_slice(&[0x01, 0x70, 0x00, 0x01]);
     section(&mut out, 2, &body);
 
-    // One function, of type 0.
-    section(&mut out, 3, &[1, 0]);
+    // The functions, of type 0.
+    body.clear();
+    uleb(&mut body, funcs.len() as u64);
+    body.resize(body.len() + funcs.len(), 0);
+    section(&mut out, 3, &body);
 
     body.clear();
-    uleb(&mut body, 1);
-    name(&mut body, "block");
-    body.extend_from_slice(&[0x00, 0x00]);
+    uleb(&mut body, funcs.len() as u64);
+    for k in 0..funcs.len() {
+        name(&mut body, &export(k));
+        body.push(0x00);
+        uleb(&mut body, k as u64);
+    }
     section(&mut out, 7, &body);
 
-    let mut func = Vec::new();
-    uleb(&mut func, locals.len() as u64);
-    for &(n, t) in locals {
-        uleb(&mut func, u64::from(n));
-        func.push(t);
-    }
-    func.extend_from_slice(&code.bytes);
     body.clear();
-    uleb(&mut body, 1);
-    uleb(&mut body, func.len() as u64);
-    body.extend_from_slice(&func);
+    uleb(&mut body, funcs.len() as u64);
+    for (locals, code) in funcs {
+        let mut func = Vec::new();
+        uleb(&mut func, locals.len() as u64);
+        for &(n, t) in *locals {
+            uleb(&mut func, u64::from(n));
+            func.push(t);
+        }
+        func.extend_from_slice(&code.bytes);
+        uleb(&mut body, func.len() as u64);
+        body.extend_from_slice(&func);
+    }
     section(&mut out, 10, &body);
     out
 }

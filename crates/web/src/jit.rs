@@ -43,16 +43,22 @@ impl WebBackend {
 }
 
 impl Backend for WebBackend {
-    fn install(&mut self, module: &[u8]) -> Option<u32> {
+    fn install(&mut self, module: &[u8], count: usize) -> Option<Vec<u32>> {
         let module = WebAssembly::Module::new(&Uint8Array::from(module).into()).ok()?;
         let instance = WebAssembly::Instance::new(&module, &self.imports).ok()?;
-        let block = Reflect::get(&instance.exports(), &"block".into()).ok()?;
-        let index = match self.free.pop() {
-            Some(i) => i,
-            None => self.table.grow(1).ok()?,
-        };
-        self.table.set(index, block.unchecked_ref()).ok()?;
-        Some(index)
+        let exports = instance.exports();
+        // Slots freed first, then the table grown once for the rest.
+        let reused = count.min(self.free.len());
+        let mut slots: Vec<u32> = self.free.split_off(self.free.len() - reused);
+        if slots.len() < count {
+            let first = self.table.grow((count - slots.len()) as u32).ok()?;
+            slots.extend(first..first + (count - slots.len()) as u32);
+        }
+        for (k, &slot) in slots.iter().enumerate() {
+            let block = Reflect::get(&exports, &format!("b{k}").into()).ok()?;
+            self.table.set(slot, block.unchecked_ref()).ok()?;
+        }
+        Some(slots)
     }
 
     fn release(&mut self, func: u32) {

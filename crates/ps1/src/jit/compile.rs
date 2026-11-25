@@ -77,7 +77,8 @@ impl Layout {
 }
 
 pub struct Compiled {
-    pub module: Vec<u8>,
+    /// The function's body (see `batch`).
+    pub code: Code,
     /// Instructions in the block, and those compiled to WebAssembly.
     pub len: u32,
     pub native: u32,
@@ -851,6 +852,17 @@ pub fn compile(
     e.c.local_get(BUS).local_get(PEND).mem(op::I32_STORE, 2, layout.pending);
     e.c.local_get(CPU).local_get(CYC).mem(op::I64_STORE, 3, layout.cycles);
     e.c.local_get(N).op(op::END);
+    Some(Compiled {
+        code: e.c,
+        len: len as u32,
+        native,
+    })
+}
+
+/// A module of compiled blocks, exporting them as `b0`, `b1`... in order:
+/// `(cpu, bus) -> instructions run`, calling the interpreter's function
+/// (type 1) through the table.
+pub fn batch(blocks: &[&Code]) -> Vec<u8> {
     let types = [
         FuncType {
             params: &[I32, I32],
@@ -861,12 +873,9 @@ pub fn compile(
             results: &[I32],
         },
     ];
-    let module = wasm::module(&types, &[(2, I32), (1, I64), (11, I32)], &e.c);
-    Some(Compiled {
-        module,
-        len: len as u32,
-        native,
-    })
+    let locals: &[(u32, u8)] = &[(2, I32), (1, I64), (11, I32)];
+    let funcs: Vec<_> = blocks.iter().map(|&c| (locals, c)).collect();
+    wasm::module_of(&types, &funcs)
 }
 
 #[cfg(test)]

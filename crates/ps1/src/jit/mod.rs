@@ -26,18 +26,22 @@ use std::hash::{BuildHasherDefault, Hasher};
 use crate::bus::{Bus, RAM_PAGE_BITS, RAM_SIZE};
 use crate::cpu::{Cpu, CpuBus};
 
-pub use compile::{Layout, MAX_LEN, compile};
+pub use compile::{Compiled, Layout, MAX_LEN, batch, compile};
 
 /// Runs a block this many times before compiling it.
 const HOT: u32 = 2;
+
+/// Blocks compiled together, in one module (see `Jit::flush`).
+const BATCH: usize = 64;
 
 /// What compiles modules and runs their function: the browser, through the
 /// module running the emulator (where the little unsafe code calling into
 /// compiled blocks, and back, lives).
 pub trait Backend {
-    /// Compiles `module` (which exports its function as "block") and
-    /// returns a handle to the function, or `None` if it failed.
-    fn install(&mut self, module: &[u8]) -> Option<u32>;
+    /// Compiles `module`, which exports `count` functions (`b0`, `b1`...,
+    /// see `batch`), and returns handles to them, in order, or `None` if it
+    /// failed.
+    fn install(&mut self, module: &[u8], count: usize) -> Option<Vec<u32>>;
 
     /// Runs function `func` (from `install`) on `cpu` and `bus`: returns
     /// the number of instructions it ran.
@@ -67,8 +71,21 @@ enum Entry {
         writes: [u32; 2],
         icache: bool,
     },
+    /// Compiled, waiting for its batch's module (interpreted meanwhile).
+    Queued,
     /// Left to the interpreter (nothing to compile there).
     Interpreted,
+}
+
+/// A block compiled, waiting for its batch's module: what its entry will
+/// hold (see `Entry::Compiled`).
+struct Pending {
+    pc: u32,
+    compiled: Compiled,
+    pa: u32,
+    code: Vec<u8>,
+    writes: [u32; 2],
+    icache: bool,
 }
 
 /// Counters, for diagnostics.
@@ -112,6 +129,8 @@ pub struct Jit {
     backend: Box<dyn Backend>,
     /// By the address of their first instruction.
     blocks: HashMap<u32, Entry, BuildHasherDefault<PcHasher>>,
+    /// Blocks compiled, for the next module.
+    queue: Vec<Pending>,
     pub stats: Stats,
 }
 
@@ -120,6 +139,7 @@ impl Jit {
         Self {
             backend,
             blocks: HashMap::default(),
+            queue: Vec::new(),
             stats: Stats::default(),
         }
     }
@@ -127,6 +147,7 @@ impl Jit {
     /// Forgets every block (the machine was reset or restored: its memory
     /// is elsewhere now).
     pub fn clear(&mut self) {
+        self.queue.clear();
         for (_, entry) in self.blocks.drain() {
             if let Entry::Compiled { func, .. } = entry {
                 self.backend.release(func);
@@ -144,7 +165,7 @@ impl Jit {
         let pc = cpu.pc;
         let entry = self.blocks.entry(pc).or_insert(Entry::Cold(0));
         match entry {
-            Entry::Interpreted => return false,
+            Entry::Interpreted | Entry::Queued => return false,
             Entry::Compiled {
                 func,
                 pa,
@@ -178,7 +199,7 @@ impl Jit {
             }
             Entry::Cold(_) => {}
         }
-        // Hot: compile it (it runs the next time round).
+        // Hot: compile it (it runs once its batch is installed).
         *entry = Entry::Interpreted;
         let pa = pc & 0x1fff_ffff;
         let ram = (pa as usize) < 0x0080_0000;
@@ -201,11 +222,6 @@ impl Jit {
         };
         self.stats.native += u64::from(compiled.native);
         self.stats.total += u64::from(compiled.len);
-        let Some(func) = self.backend.install(&compiled.module) else {
-            self.stats.failed += 1;
-            return false;
-        };
-        self.stats.compiled += 1;
         // The code it was compiled from, as it must still be (RAM only:
         // the BIOS does not change).
         let pa = if ram { pa & (RAM_SIZE as u32 - 1) } else { u32::MAX };
@@ -217,17 +233,52 @@ impl Jit {
             Vec::new()
         };
         let writes = page_writes(bus, pa, code.len());
-        self.blocks.insert(
+        self.blocks.insert(pc, Entry::Queued);
+        self.queue.push(Pending {
             pc,
-            Entry::Compiled {
-                func,
-                pa,
-                code,
-                writes,
-                icache,
-            },
-        );
+            compiled,
+            pa,
+            code,
+            writes,
+            icache,
+        });
+        if self.queue.len() >= BATCH {
+            self.flush();
+        }
         false
+    }
+
+    /// Installs the blocks compiled since the last time, in one module: a
+    /// browser's costs are per module (Firefox's growing with their number,
+    /// up to a limit of about 16000), not per function. Called when a batch
+    /// is full, and at the end of each frame.
+    pub fn flush(&mut self) {
+        if self.queue.is_empty() {
+            return;
+        }
+        let queue = std::mem::take(&mut self.queue);
+        let codes: Vec<_> = queue.iter().map(|p| &p.compiled.code).collect();
+        let funcs = self.backend.install(&batch(&codes), queue.len());
+        let Some(funcs) = funcs.filter(|f| f.len() == queue.len()) else {
+            self.stats.failed += queue.len() as u64;
+            for p in &queue {
+                self.blocks.insert(p.pc, Entry::Interpreted);
+            }
+            return;
+        };
+        self.stats.compiled += queue.len() as u64;
+        for (p, func) in queue.into_iter().zip(funcs) {
+            self.blocks.insert(
+                p.pc,
+                Entry::Compiled {
+                    func,
+                    pa: p.pa,
+                    code: p.code,
+                    writes: p.writes,
+                    icache: p.icache,
+                },
+            );
+        }
     }
 }
 

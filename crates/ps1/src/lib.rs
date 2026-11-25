@@ -253,6 +253,10 @@ impl System {
         }
         self.frame_size = self.bus.gpu.display_dims();
         self.frame_stale = true;
+        // The blocks compiled this frame, installed.
+        if let Some(jit) = &mut self.jit {
+            jit.flush();
+        }
     }
 
     /// Diagnostics: one turn of `run_frame`'s loop (a compiled block, or
