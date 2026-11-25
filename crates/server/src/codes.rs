@@ -19,6 +19,19 @@ use crate::state::{AppState, write_atomic};
 
 const URL: &str = "https://codeload.github.com/duckstation/chtdb/zip/refs/heads/master";
 
+/// Texel's own patches (`patches/`, a file per game, under Texel's
+/// licence), by the serials they are for (see `build.rs`): listed with the
+/// database's.
+const OWN: &[(&[&str], &str)] = include!(concat!(env!("OUT_DIR"), "/own_patches.rs"));
+
+/// Texel's own patches for a serial.
+fn own_patches(serial: &str) -> Vec<FileCode> {
+    OWN.iter()
+        .filter(|(serials, _)| serials.iter().any(|s| s.eq_ignore_ascii_case(serial)))
+        .flat_map(|(_, text)| file::parse(text))
+        .collect()
+}
+
 /// The database, as downloaded (the zip) and indexed.
 #[derive(Default)]
 pub struct CodeDb {
@@ -176,15 +189,15 @@ fn build_hash(game: &Game) -> anyhow::Result<String> {
 /// whose hash is the disc's.
 pub async fn for_game(state: &AppState, game: &Game) -> GameCodes {
     let db = state.codes.read().await.clone();
-    if db.zip.is_empty() {
-        return GameCodes::default();
-    }
-    let mut out = GameCodes {
-        available: true,
-        ..GameCodes::default()
-    };
     let Some(serial) = game.serial.as_deref().filter(|_| game.console == Console::Ps1) else {
-        return out;
+        return GameCodes::default();
+    };
+    // Texel's own first, then the database's.
+    let own = own_patches(serial);
+    let mut out = GameCodes {
+        available: !db.zip.is_empty() || !own.is_empty(),
+        patches: own,
+        ..GameCodes::default()
     };
     let Some(entries) = db.index.get(&serial.to_ascii_uppercase()) else {
         return out;
@@ -213,7 +226,7 @@ pub async fn for_game(state: &AppState, game: &Game) -> GameCodes {
         let Some(text) = db.file(&entry.name) else { continue };
         let codes = file::parse(&text);
         if patches {
-            out.patches = codes;
+            out.patches.extend(codes);
         } else {
             out.cheats = codes;
         }
@@ -223,6 +236,18 @@ pub async fn for_game(state: &AppState, game: &Game) -> GameCodes {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn our_patches_parse_and_run() {
+        let codes = super::own_patches("SLES-02993");
+        assert_eq!(codes.len(), 1);
+        let code = &codes[0];
+        assert_eq!(code.name, "Increased Draw Distance");
+        assert_eq!(code.overrides.cpu_overclock, Some(300));
+        texel_ps1::cheats::Code::parse(&code.name, &code.body, code.activation()).expect("a code the core runs");
+        assert_eq!(super::own_patches("sles-12993").len(), 1);
+        assert!(super::own_patches("SLUS-01161").is_empty());
+    }
+
     #[test]
     fn file_names_give_serials_and_hashes() {
         let mut zip = Vec::new();
