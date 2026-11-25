@@ -319,7 +319,7 @@ async function start(msg: StartMessage) {
   ring = msg.audio ? new Ring(msg.audio) : null;
   chosenScale = autoScale = msg.scale;
   emu.setResolutionScale(msg.scale);
-  post({ type: "started", pal: emu.isPal, bios: emu.biosInfo(), renderer: renderer() });
+  post({ type: "started", pal: emu.isPal, bios: emu.biosInfo(), renderer: renderer(), precise: preciseShown() });
   if (msg.room) pendingRoom = msg.room;
   if (pendingRoom) joinRoom(pendingRoom);
   pendingRoom = null;
@@ -338,6 +338,13 @@ const FAST_SLICE_MS = 15;
 
 function frameInterval(): number {
   return 1000 / (emu?.isPal ? 49.76 : 59.83);
+}
+
+/** Whether precise geometry can be shown: its triangles are recorded, for
+ * the GPU or the drawing worker (the scaled picture drawn here, in
+ * software, has no precise triangles). */
+function preciseShown(): boolean {
+  return gpu !== null || drawer !== null;
 }
 
 /** Runs frames as needed, paced by the audio queue when there is audio. */
@@ -649,9 +656,8 @@ scope.onmessage = (e: MessageEvent<ToWorker>) => {
       nextFrameAt = performance.now();
       break;
     case "precise":
-      // The PlayStation's only (the PS2's module has none), and on the GPU
-      // only: software drawing has no precise triangles.
-      (emu as { setPreciseGeometry?: (on: boolean) => void } | null)?.setPreciseGeometry?.(msg.on && gpu !== null);
+      // The PlayStation's only (the PS2's module has none).
+      (emu as { setPreciseGeometry?: (on: boolean) => void } | null)?.setPreciseGeometry?.(msg.on && preciseShown());
       break;
     case "widescreen":
       (emu as { setWidescreen?: (on: boolean) => void } | null)?.setWidescreen?.(msg.on);

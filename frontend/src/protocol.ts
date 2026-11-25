@@ -133,7 +133,9 @@ export type FromWorker =
   | { type: "pad"; port: number; analog: boolean; small: number; large: number }
   /** renderer: what the PS2 runs on beyond software (the GS on WebGPU, the
    * EE's code compiled), or null. */
-  | { type: "started"; pal: boolean; bios: string; renderer: string | null }
+  /** precise: precise geometry can be shown (the PlayStation's, drawn on
+   * the GPU or in the drawing worker). */
+  | { type: "started"; pal: boolean; bios: string; renderer: string | null; precise: boolean }
   | { type: "stats"; fps: number; width: number; height: number }
   /** The resolution drawn changed: lowered while emulation lags (`chosen`:
    * the one chosen, which it returns to). */

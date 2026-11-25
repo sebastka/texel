@@ -1475,7 +1475,7 @@ function renderPlayer(id: string, biosId: string, roomGame = false, cards: Slots
     smooth.setAttribute("aria-pressed", String(on));
   };
   const reset = h("button.ghost", { hidden: guest, onclick: () => player?.reset() }, "Reset");
-  // Enhancements: precise geometry (GPU only), widescreen (16:9).
+  // Enhancements: precise geometry, widescreen (16:9).
   const showToggle = (b: Element, label: string, on: boolean) => {
     b.textContent = `${label}: ${on ? "on" : "off"}`;
     b.setAttribute("aria-pressed", String(on));
@@ -1485,7 +1485,7 @@ function renderPlayer(id: string, biosId: string, roomGame = false, cards: Slots
     {
       title:
         "Precise geometry: draws 3D from the exact positions the console computed, before it rounded them: no wobbling " +
-        "polygons, textures in perspective. Needs WebGPU.",
+        "polygons, textures in perspective.",
       onclick: () => {
         if (player) showToggle(precise, "Precise", player.togglePrecise());
       },
@@ -1626,10 +1626,9 @@ function renderPlayer(id: string, biosId: string, roomGame = false, cards: Slots
     onStateSaved: () => {
       if (!statesPanel.hidden) void renderStates();
     },
-    onStarted: (renderer) => {
-      const gpu = !!renderer?.includes("WebGPU");
-      precise.disabled = !gpu;
-      if (!gpu) precise.title += " This browser has no WebGPU: drawn in software.";
+    onStarted: (_renderer, shown) => {
+      precise.disabled = !shown;
+      if (!shown) precise.title += " Not available here: it needs WebGPU, or a spare processor core for drawing.";
     },
     onAnalog: (on) => {
       analog.textContent = on ? "Analog: on" : "Analog: off";

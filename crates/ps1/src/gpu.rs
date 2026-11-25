@@ -1596,6 +1596,70 @@ impl Raster<'_> {
     /// The texel at `u, v`; `last`: the previous one, reused when at the
     /// same coordinates and `reuse` (textures not changing while drawn).
     #[inline(always)]
+    /// A precise triangle (`Command::Precise`), as the GPU renderer draws
+    /// it (`crates/ps1-gpu`'s `exact_triangle`): float edge functions at
+    /// the pixels' corners with the console's top-left rule, colours
+    /// interpolated linearly, texture coordinates in perspective when every
+    /// vertex has a depth (else affine); then as any pixel.
+    fn exact_triangle(&mut self, v: &[ExactVertex; 3], bbox: [i32; 4], textured: bool, shaded: bool, prim: &Prim) {
+        let [(x0, y0), (x1, y1), (x2, y2)] = v.map(|p| (p.x, p.y));
+        // The edge function of a to b at (x, y), less a little when the
+        // edge is not a top or left one (its pixels are the neighbour's).
+        let edge = |ax: f32, ay: f32, bx: f32, by: f32, x: f32, y: f32| {
+            let e = (bx - ax) * (y - ay) - (by - ay) * (x - ax);
+            let top_left = (ay == by && bx > ax) || by < ay;
+            if top_left { e >= 0.0 } else { e > 0.0 }
+        };
+        let area = (x1 - x0) * (y2 - y0) - (x2 - x0) * (y1 - y0);
+        let z = v.map(|p| p.z);
+        let perspective = z.iter().all(|&z| z > 0.0);
+        let mix = |l: [f32; 3], a: [f32; 3]| l[0] * a[0] + l[1] * a[1] + l[2] * a[2];
+        let channel = |f: fn(&ExactVertex) -> i32| v.each_ref().map(|p| f(p) as f32);
+        let (cr, cg, cb) = (channel(|p| p.color.0), channel(|p| p.color.1), channel(|p| p.color.2));
+        let (us, vs) = (channel(|p| p.uv.0), channel(|p| p.uv.1));
+        let reuse = self.tex.is_some();
+        let mut last = None;
+        for y in bbox[1]..=bbox[3] {
+            let base = y as usize * self.stride;
+            let dither_row = self.dither_row(y, prim);
+            let py = y as f32;
+            for x in bbox[0]..=bbox[2] {
+                let px = x as f32;
+                if !edge(x1, y1, x2, y2, px, py) || !edge(x2, y2, x0, y0, px, py) || !edge(x0, y0, x1, y1, px, py) {
+                    continue;
+                }
+                let l = [
+                    ((x2 - x1) * (py - y1) - (y2 - y1) * (px - x1)) / area,
+                    ((x0 - x2) * (py - y2) - (y0 - y2) * (px - x2)) / area,
+                    ((x1 - x0) * (py - y0) - (y1 - y0) * (px - x0)) / area,
+                ];
+                let (r, g, b) = if shaded {
+                    let round = |c: [f32; 3]| (mix(l, c) + 0.5).floor() as i32;
+                    (round(cr), round(cg), round(cb))
+                } else {
+                    v[0].color
+                };
+                self.pixels += 1;
+                self.touch([x, y, x, y]);
+                let dither = dither_row.map_or(0, |d| d[((x / self.scale) & 3) as usize]);
+                if textured {
+                    let q = if perspective {
+                        [l[0] / z[0], l[1] / z[1], l[2] / z[2]]
+                    } else {
+                        l
+                    };
+                    let den = q[0] + q[1] + q[2];
+                    let u = (mix(q, us) / den + 0.5).floor() as i32;
+                    let tv = (mix(q, vs) / den + 0.5).floor() as i32;
+                    let t = self.texel_reusing(&mut last, reuse, u, tv, prim);
+                    self.pixel::<true>(base + x as usize, dither, r, g, b, t, prim);
+                } else {
+                    self.pixel::<false>(base + x as usize, dither, r, g, b, 0, prim);
+                }
+            }
+        }
+    }
+
     fn texel_reusing(&self, last: &mut Option<(i32, i32, u16)>, reuse: bool, u: i32, v: i32, p: &Prim) -> u16 {
         if let Some((lu, lv, t)) = *last
             && (lu, lv) == (u, v)

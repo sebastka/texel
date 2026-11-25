@@ -3,8 +3,8 @@
 //! another worker: another core). Its VRAMs: the scaled one it draws, and
 //! the native one textures are read from, as the recorder sends it.
 //!
-//! Precise triangles (`Command::Precise`) are for the GPU renderer: record
-//! without precise geometry for this one.
+//! Precise triangles (`Command::Precise`) are drawn as the GPU renderer
+//! draws them (`Raster::exact_triangle`).
 
 use super::{
     Command, Display, Picture, Prim, Raster, Spans, Transfer, VRAM_HEIGHT, VRAM_WIDTH, Vertex, display_15, display_rgba,
@@ -94,8 +94,10 @@ impl Replay {
                     let mut r = self.raster(pixel.check_mask, pixel.set_mask, *area);
                     r.line_scaled(*a, *b, pixel.shaded, &pixel.prim);
                 }
-                // For the GPU renderer.
-                Command::Precise { .. } => {}
+                Command::Precise { pixel, vertices, bbox } => {
+                    let mut r = self.raster(pixel.check_mask, pixel.set_mask, *bbox);
+                    r.exact_triangle(vertices, *bbox, pixel.textured, pixel.shaded, &pixel.prim);
+                }
                 Command::Fill { x, y, w, h, color } => {
                     for row in 0..*h {
                         let ny = ((y + row) & 0x1ff) as usize;

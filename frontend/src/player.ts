@@ -14,7 +14,8 @@ interface Callbacks {
   /** The first controller's analog mode changed (by the user or the game). */
   onAnalog: (analog: boolean) => void;
   /** Running: with what renderer (WebGPU, or null for software). */
-  onStarted?: (renderer: string | null) => void;
+  /** precise: precise geometry can be shown. */
+  onStarted?: (renderer: string | null, precise: boolean) => void;
   /** The room's game, as this player runs it. */
   onNet?: (status: NetStatus) => void;
   /** A message for the room. */
@@ -93,9 +94,9 @@ export class Player {
   private resize: ResizeObserver | null = null;
   /** Smooth (bilinear) scaling, rather than sharp pixels. */
   smooth = loadSmooth();
-  /** PlayStation enhancements: precise geometry (on by default: it only
-   * changes the picture), widescreen (off: it changes the game). */
-  precise = loadFlag(PRECISE_KEY, true);
+  /** PlayStation enhancements, off unless chosen: precise geometry (it
+   * only changes the picture), widescreen (it changes the game). */
+  precise = loadFlag(PRECISE_KEY, false);
   widescreen = loadFlag(WIDESCREEN_KEY, false);
   /** Internal resolution multiplier. */
   scale = loadScale();
@@ -223,7 +224,7 @@ export class Player {
         this.renderer = msg.renderer;
         this.send({ type: "precise", on: this.precise });
         this.send({ type: "widescreen", on: this.widescreen });
-        this.cb.onStarted?.(msg.renderer);
+        this.cb.onStarted?.(msg.renderer, msg.precise);
         this.cb.onStatus("Running");
         break;
       case "stats":
