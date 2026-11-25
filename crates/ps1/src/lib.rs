@@ -298,6 +298,12 @@ impl System {
         self.bus.deadline = self.bus.slice;
     }
 
+    /// Diagnostics: the CPU's pc (cheap, unlike `debug_cpu`).
+    #[doc(hidden)]
+    pub fn debug_pc(&self) -> u32 {
+        self.cpu.pc
+    }
+
     /// Diagnostics: the CPU's state, field by field.
     #[doc(hidden)]
     pub fn debug_cpu_fields(&self) -> Vec<(&'static str, String)> {

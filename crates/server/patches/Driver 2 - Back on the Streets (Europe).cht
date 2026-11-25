@@ -1,6 +1,12 @@
 # Driver 2 - Back on the Streets (Europe): both discs have the same executable.
 # Texel's own patches, under Texel's licence (MIT).
 ; Serials: SLES-02993, SLES-12993
+;
+; Skipped: "NTSC Mode" (Spain, SLES-02997 and SLES-12997, by PeterDelta, in DuckStation's
+; database), which runs the game at 60 Hz (with the CPU at 170%). Its codes change two
+; constants in the code (800A9744, 8008D8FC) and display settings in memory (800E0BD2...),
+; depending on a variable (800AA898); the European executable has no match for the two
+; constants nearby, and the lines alone do not identify the data in another build.
 
 [Increased Draw Distance]
 Description = Draws the city about 16 cells around the car rather than 7: buildings appear from much further away.

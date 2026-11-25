@@ -246,6 +246,15 @@ mod tests {
         texel_ps1::cheats::Code::parse(&code.name, &code.body, code.activation()).expect("a code the core runs");
         assert_eq!(super::own_patches("sles-12993").len(), 1);
         assert!(super::own_patches("SLUS-01161").is_empty());
+        // Every file's codes run.
+        for serial in ["SCES-01438", "SCES-02835"] {
+            let codes = super::own_patches(serial);
+            assert!(!codes.is_empty(), "{serial}");
+            for code in codes {
+                texel_ps1::cheats::Code::parse(&code.name, &code.body, code.activation())
+                    .expect("a code the core runs");
+            }
+        }
     }
 
     #[test]

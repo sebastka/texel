@@ -1,0 +1,8 @@
+# Driver (Europe). No patch of Texel's yet (DuckStation's database has this release's
+# "Music fix"): what other releases' patches do, and why they were not ported.
+; Serials: SLES-01816
+;
+; Skipped: "NTSC Mode" (Spain, SLES-01978, by PeterDelta, in DuckStation's database),
+; which runs the game at 60 Hz (with the CPU at 180%). Its codes change two constants in
+; the code and the display settings in memory (800BDAEE...), depending on variables
+; (800BDAF0, 800BDB72); the lines alone do not identify those in another build.

@@ -255,6 +255,12 @@ impl Emulator {
             .collect()
     }
 
+    /// Diagnostics: the CPU's pc.
+    #[wasm_bindgen(js_name = debugPc)]
+    pub fn debug_pc(&self) -> u32 {
+        self.system.debug_pc()
+    }
+
     /// Diagnostics: a word of memory, as the CPU reads it.
     #[wasm_bindgen(js_name = debugRead32)]
     pub fn debug_read32(&mut self, addr: u32) -> u32 {
