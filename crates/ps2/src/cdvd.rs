@@ -572,7 +572,11 @@ impl Cdvd {
                 self.lsn = r.lsn;
                 r.wait = if r.left > 0 { self.block_time(r.block) } else { 0 };
             }
-            if r.left > 0 {
+            // The read ends once DMA has taken every block: the drive's
+            // buffer cannot get ahead of it (a driver reading in chunks,
+            // its DMA set up again after each, sees the end otherwise
+            // before its data, and fails the read).
+            if r.left > 0 || !self.blocks.is_empty() {
                 self.read = Some(r);
                 return false;
             }
@@ -814,14 +818,17 @@ mod tests {
         // Stopped: it spins up first (a third of a second).
         assert!(!c.advance(ms(300)));
         assert!(c.blocks.is_empty());
-        let mut irq = false;
+        // Not done while a block waits for DMA.
         for _ in 0..100 {
-            irq |= c.advance(ms(1));
+            assert!(!c.advance(ms(1)));
         }
-        assert!(irq);
+        assert_eq!(c.blocks.len(), 3);
+        assert_eq!(c.read(0x0A), drive::READING);
+        // DMA takes them: then it is.
+        let b: Vec<_> = c.blocks.drain(..).collect();
+        assert!(c.advance(ms(1)));
         assert_eq!(c.read(0x08), INTR_DATA_READY | INTR_COMMAND_COMPLETE);
         assert_eq!(c.read(0x0A), drive::PAUSED);
-        let b: Vec<_> = c.blocks.drain(..).collect();
         assert_eq!(b.len(), 3);
         assert_eq!(b[0].len(), 2064);
         assert_eq!(b[0][..4], [0x20, 0x03, 0x00, 0x05]);
