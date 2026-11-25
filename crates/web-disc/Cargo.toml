@@ -3,6 +3,7 @@ name = "texel-web-disc"
 description = "Disc images read from a browser's worker: sectors fetched on demand through a JavaScript callback"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 

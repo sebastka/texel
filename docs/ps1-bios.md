@@ -50,7 +50,7 @@ The kernel is the part of the BIOS that games call into; its version string is s
 | `scph101.bin` | SCPH-101 (PS one) | 4.5 | 2000-05-25 | A | 1995 | The latest North American BIOS in Redump's list. |
 | `scph102-v45.bin` | SCPH-102 (PS one) | 4.5 | 2000-05-25 | E | 1995 | The same code as `scph101.bin` but for its region letter: the latest European BIOS in Redump's list. |
 | `psxonpsp660.bin` | PSP firmware 6.60 | 4.5 | 2000-05-25 | J (region-free) | 1995 | Not from a console: the BIOS of the PSP's PS1 emulator, based on the Japanese v4.5 and modified by Sony for it. Redump does not list it. Region-free in Texel (DECISIONS.md, D13). |
-| `openbios.bin` | | | | Region-free | | [OpenBIOS](https://github.com/pcsx-redux/nugget/tree/main/openbios), PCSX-Redux's open-source replacement (MIT): needs no console dump. No version string; built from source, so no DAT lists it. |
+| `openbios.bin` | | | | Region-free | | [OpenBIOS](https://github.com/pcsx-redux/nugget/tree/main/openbios), PCSX-Redux's open-source replacement (MIT): needs no console dump. The server downloads it from PCSX-Redux's newest build (`TEXEL_FETCH_OPEN_BIOS`). No version string; built from source, so no DAT lists it. |
 
 ## Checksums
 

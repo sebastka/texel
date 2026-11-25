@@ -47,7 +47,8 @@ RUN pnpm run build
 FROM gcr.io/distroless/static-debian13:nonroot@sha256:aafe993665bf6200db38a02c11a9351e782a84b6a45e7f33b6695638c88e3931
 
 LABEL org.opencontainers.image.title="Texel" \
-      org.opencontainers.image.description="A PlayStation emulator for the browser, with a self-hosted game library"
+      org.opencontainers.image.description="PlayStation and PlayStation 2 emulators for the browser, with a self-hosted game library" \
+      org.opencontainers.image.licenses="MIT"
 
 COPY --from=rust --chmod=0755 /texel /usr/local/bin/texel
 COPY --from=web /src/frontend/dist /usr/share/texel/web

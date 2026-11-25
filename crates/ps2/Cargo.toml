@@ -3,6 +3,7 @@ name = "texel-ps2"
 description = "PlayStation 2 emulation, in progress: the EE, the IOP and the SIF between them"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
