@@ -687,6 +687,34 @@ pub struct Ipu {
     /// from the one its command started in).
     #[serde(skip)]
     pub error_input: Option<(u32, Vec<u128>)>,
+    /// Diagnostics, when set: the input stream and the commands run on it.
+    #[serde(skip)]
+    pub trace: Option<Box<Trace>>,
+}
+
+/// The IPU's input, as it left the FIFO (decoded, cleared by BCLR, or
+/// dropped by a reset), and the commands, by bit of that stream: to
+/// compare with another decoder's parse of the same stream.
+#[derive(Default, Debug, Clone)]
+pub struct Trace {
+    /// The quadwords, in order, as bytes (128 MiB at most).
+    pub stream: Vec<u8>,
+    /// Quadwords gone from the FIFO's front so far.
+    removed: u64,
+    /// The running command's first bit (it may stall and go on).
+    start: Option<u64>,
+    /// Commands done: code, options, first and next bit (of the stream),
+    /// whether it failed (ECD), and its result (VDEC, FDEC).
+    pub commands: Vec<(u32, u32, u64, u64, bool, u32)>,
+}
+
+impl Trace {
+    fn remove(&mut self, q: u128) {
+        if self.stream.len() < 128 << 20 {
+            self.stream.extend_from_slice(&q.to_le_bytes());
+        }
+        self.removed += 1;
+    }
 }
 
 impl Default for Ipu {
@@ -711,6 +739,7 @@ impl Default for Ipu {
             errors: 0,
             error_log: Vec::new(),
             error_input: None,
+            trace: None,
         }
     }
 }
@@ -728,7 +757,7 @@ impl Ipu {
     }
 
     /// The input FIFO's count, and the decoder's own (up to 2 quadwords).
-    fn counts(&self) -> (u32, u32) {
+    pub fn counts(&self) -> (u32, u32) {
         let left = self.left();
         let fp = left.min(2);
         ((left - fp).min(FIFO) as u32, fp as u32)
@@ -757,6 +786,13 @@ impl Ipu {
                 errors: self.errors,
                 error_log: std::mem::take(&mut self.error_log),
                 error_input: self.error_input.take(),
+                trace: self.trace.take().map(|mut t| {
+                    // What the FIFO held is dropped.
+                    for q in self.input.drain(..) {
+                        t.remove(q);
+                    }
+                    t
+                }),
                 ..Self::default()
             };
             return;
@@ -846,6 +882,15 @@ impl Ipu {
         let Some(mut job) = self.job else {
             return;
         };
+        // BCLR drops what the FIFO holds: kept in the trace first.
+        if job.code == 0
+            && let Some(t) = self.trace.as_mut()
+        {
+            for &q in &self.input {
+                t.remove(q);
+            }
+        }
+        let trace_base = self.trace.as_ref().map(|t| t.removed * 128);
         let mut b = Bits {
             input: &mut self.input,
             pos: self.pos,
@@ -853,6 +898,11 @@ impl Ipu {
         };
         let mut reach = 0;
         let started = b.pos;
+        if let (Some(t), Some(base)) = (self.trace.as_mut(), trace_base)
+            && t.start.is_none()
+        {
+            t.start = Some(base + started);
+        }
         let done = execute(
             &mut self.dec,
             &mut b,
@@ -870,11 +920,27 @@ impl Ipu {
                 self.error_input = Some((self.dec.ctrl, words));
             }
         }
+        let ended = b.pos;
         self.pos = b.pos;
         self.reach = reach;
+        if done && let (Some(t), Some(base)) = (self.trace.as_mut(), trace_base) {
+            // BCLR: its bit pointer, in the stream after what it dropped.
+            let end = if job.code == 0 {
+                t.removed * 128 + ended
+            } else {
+                base + ended
+            };
+            let start = t.start.take().unwrap_or(end);
+            t.commands
+                .push((job.code, job.opt, start, end, self.dec.ctrl & CTRL_ECD != 0, self.data));
+        }
         // What is behind the bit pointer is gone.
         while self.pos >= 128 && !self.input.is_empty() {
-            self.input.pop_front();
+            if let Some(q) = self.input.pop_front()
+                && let Some(t) = self.trace.as_mut()
+            {
+                t.remove(q);
+            }
             self.pos -= 128;
             self.reach = self.reach.saturating_sub(128);
         }
@@ -1317,9 +1383,17 @@ mod tests {
             }
             let mut input = VecDeque::from([u128::from_le_bytes(bytes), 0]);
             let mut pull = || None;
-            let mut b = Bits { input: &mut input, pos: 0, pull: &mut pull };
+            let mut b = Bits {
+                input: &mut input,
+                pos: 0,
+                pull: &mut pull,
+            };
             let t = tables();
-            let vlc = if f[0] == "dct" { &t.dct[f[1].parse::<usize>().unwrap()] } else { &t.cbp };
+            let vlc = if f[0] == "dct" {
+                &t.dct[f[1].parse::<usize>().unwrap()]
+            } else {
+                &t.cbp
+            };
             let want = match (f[0], f[3]) {
                 ("dct", "esc") => ESCAPE,
                 ("dct", "eob") => EOB,

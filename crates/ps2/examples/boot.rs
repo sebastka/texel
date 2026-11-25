@@ -31,6 +31,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => return Err("not a PlayStation 2 BIOS".into()),
     }
     let mut ps2 = Ps2::new(&bios);
+    if std::env::var("CDVDREADS").is_ok() {
+        ps2.bus.iop.cdvd.read_log = Some(Vec::new());
+    }
     // What the IOP's modules print.
     ps2.iop_printf = Some(Default::default());
     // NOGFX=1: draw nothing (faster, when frames do not matter).
@@ -59,6 +62,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Ok(path) = std::env::var("LOAD") {
         ps2.load_state(&std::fs::read(&path)?)?;
         println!("Loaded {path}");
+    }
+    // IPUTRACE=path: the IPU's input stream (path.bin) and its commands
+    // (path.txt), for another decoder to compare.
+    if std::env::var("IPUTRACE").is_ok() {
+        ps2.bus.ipu.trace = Some(Box::default());
+        ps2.bus.ipu_sources = Some((Vec::new(), 0, 0));
+        // IPUWATCH=address: writes to those 64 bytes, in the same log.
+        ps2.bus.ipu_watch = std::env::var("IPUWATCH").ok().and_then(|a| u32::from_str_radix(&a, 16).ok());
     }
     // TRANSFERS=1: the GS's transfers, from the start (reported with
     // DRAWS).
@@ -460,6 +471,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ipu.busy(),
         ipu.output.len()
     );
+    if let (Ok(path), Some(t)) = (std::env::var("IPUTRACE"), &ipu.trace) {
+        std::fs::write(format!("{path}.bin"), &t.stream)?;
+        let lines: String = t
+            .commands
+            .iter()
+            .map(|(code, opt, start, end, err, data)| {
+                format!("{code:X} {opt:07X} {start} {end} {} {data:08X}\n", u8::from(*err))
+            })
+            .collect();
+        std::fs::write(format!("{path}.txt"), lines)?;
+        if let Some((log, _, _)) = &ps2.bus.ipu_sources {
+            let lines: String = log
+                .iter()
+                .map(|&(at, a, tag)| match tag {
+                    0 => format!("{at} {a:08X}\n"),
+                    t if t >> 61 == 1 => format!("{at} write {a:08X} {:08X} ({} bytes)\n", t as u32, (t >> 32) & 0xFF),
+                    t if t >> 62 == 1 => format!("{at} BP {a:08X} IFC {} FP {}\n", (t >> 8) & 0xFF, t & 0xFF),
+                    t if t >> 63 != 0 => format!(
+                        "{at} {a:08X} start CHCR {:08X} after {:08X}\n",
+                        t as u32,
+                        (t >> 32) as u32 & 0x7FFF_FFFF
+                    ),
+                    t => format!("{at} {a:08X} tag {t:016X}\n"),
+                })
+                .collect();
+            std::fs::write(format!("{path}.src"), lines)?;
+        }
+        println!(
+            "IPU trace: {} bytes of stream, {} commands",
+            t.stream.len(),
+            t.commands.len()
+        );
+    }
     for (code, opt, started, failed, next) in &ipu.error_log {
         println!(
             "  IPU error: command {code:X} options {opt:08X}, from bit {started} to {failed} (+{}), then {next:08X}",
@@ -560,6 +604,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "TLB {i:2}: mask {:08X} hi {:08X} lo0 {:08X} lo1 {:08X}",
                 e.page_mask, e.entry_hi, e.entry_lo0, e.entry_lo1
             );
+        }
+    }
+    if let Some(log) = &ps2.bus.iop.cdvd.read_log {
+        for &(cmd, lsn, count, left, waiting) in log {
+            if cmd == 0xFC {
+                println!("    words {lsn:08X} {count:08X} {left:08X} {waiting:08X}");
+                continue;
+            }
+            if cmd == 0xFD {
+                println!("  SPU2DMA ch{left} {lsn:08X} BCR {count:08X} (auto {}, read {})", waiting & 1, waiting >> 1);
+                continue;
+            }
+            if cmd == 0xFE {
+                println!("  SIF0 {lsn:08X} {count} words to EE {left:08X} (EE tag {waiting:08X})");
+                continue;
+            }
+            if cmd == 0xFF {
+                println!("  DMA3 {lsn:08X} {count} bytes (BCR {left:08X}, waiting {waiting})");
+                continue;
+            }
+            println!("  READ {cmd:02X} {lsn} {count} (previous left {left}, waiting {waiting})");
         }
     }
     if std::env::var("CDVDCMDS").is_ok() {

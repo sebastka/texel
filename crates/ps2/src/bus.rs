@@ -171,6 +171,17 @@ pub struct Bus {
     #[serde(skip)]
     path3_mask_by_dma: bool,
     ba6: u32,
+    /// Diagnostics, when set: where channel 4 took the IPU's input from,
+    /// as (quadwords taken before, address, 0) at each jump, (taken, TADR,
+    /// tag) at each tag, (taken, MADR, CHCR | the next address before << 32
+    /// | 1 << 63) at each start; and
+    /// the quadwords taken so far, the next address.
+    #[serde(skip)]
+    pub ipu_sources: Option<(Vec<(u64, u32, u64)>, u64, u32)>,
+    /// Diagnostics: 64 bytes whose writes go into `ipu_sources` (taken,
+    /// address, low 32 bits | 1 << 61).
+    #[serde(skip)]
+    pub ipu_watch: Option<u32>,
 }
 
 impl Bus {
@@ -228,6 +239,8 @@ impl Bus {
             d_stat_writes: Vec::new(),
             path3_mask_by_dma: false,
             ba6: 0,
+            ipu_sources: None,
+            ipu_watch: None,
         }
     }
 
@@ -329,6 +342,15 @@ impl Bus {
 
     pub fn write<const N: usize>(&mut self, pa: u32, data: [u8; N]) {
         let pa = pa & !(N as u32 - 1);
+        if let Some(w) = self.ipu_watch
+            && pa.wrapping_sub(w) < 64
+            && let Some((log, taken, _)) = &mut self.ipu_sources
+        {
+            let mut low = [0u8; 4];
+            let n = N.min(4);
+            low[..n].copy_from_slice(&data[..n]);
+            log.push((*taken, pa, u64::from(u32::from_le_bytes(low)) | (N as u64) << 32 | 1 << 61));
+        }
         if (pa as usize) < RAM_SIZE {
             let line = pa / CODE_LINE as u32;
             let (word, bit) = ((line / 64) as usize, 1u64 << (line % 64));
@@ -622,7 +644,18 @@ impl Bus {
                             SIF1 => {}
                             0..=2 | 8 | 9 => self.run_dma(ch),
                             // Moved as the IPU takes and gives (run_ipu).
-                            3 | 4 => self.run_ipu(),
+                            3 | 4 => {
+                                let madr = self.reg(IPU_TO + MADR);
+                                if ch == 4
+                                    && let Some((log, taken, next)) = &mut self.ipu_sources
+                                {
+                                    log.push((*taken, madr, u64::from(value) | u64::from(*next) << 32 | 1 << 63));
+                                    let (ifc, fp) = self.ipu.counts();
+                                    let bp = self.ipu.read_bp();
+                                    log.push((*taken, bp, u64::from(ifc) << 8 | u64::from(fp) | 1 << 62));
+                                }
+                                self.run_ipu()
+                            }
                             // Not emulated yet: done at once.
                             _ => self.dma_complete(ch),
                         }
@@ -841,6 +874,13 @@ impl Bus {
             }
             let madr = self.reg(IPU_TO + MADR);
             let q = self.read128(Self::dma_address(madr));
+            if let Some((log, taken, next)) = &mut self.ipu_sources {
+                if madr != *next {
+                    log.push((*taken, madr, 0));
+                }
+                *taken += 1;
+                *next = madr.wrapping_add(16);
+            }
             self.regs.insert(IPU_TO + MADR, madr.wrapping_add(16));
             self.regs.insert(IPU_TO + QWC, qwc - 1);
             if qwc == 1 && (!chain || self.chain_end[4]) {
@@ -858,6 +898,11 @@ impl Bus {
         let tadr = self.mfifo_addr(ch, self.reg(base + TADR));
         let tag = self.read128(Self::dma_address(tadr));
         let lo = tag as u64;
+        if ch == 4
+            && let Some((log, taken, _)) = &mut self.ipu_sources
+        {
+            log.push((*taken, tadr, lo));
+        }
         let qwc = (lo & 0xFFFF) as u32;
         let id = ((lo >> 28) & 7) as u32;
         let addr = ((lo >> 32) & 0xFFFF_FFF0) as u32;

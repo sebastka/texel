@@ -212,6 +212,14 @@ pub struct Cdvd {
     /// The last N and S commands issued, for diagnostics.
     #[serde(skip)]
     pub commands: VecDeque<(char, u8, Vec<u8>)>,
+    /// Every N command, when on, for diagnostics: (command, first and second
+    /// parameter words, sectors the read it replaced still had to read,
+    /// blocks still waiting for DMA). The IOP adds each block DMA takes:
+    /// (0xFF, address, bytes, BCR, blocks still waiting); and each SIF0
+    /// tag: (0xFE, IOP tag, words, EE address, EE tag); and each SPU2 DMA:
+    /// (0xFD, address, BCR, channel, auto-DMA | read << 1).
+    #[serde(skip)]
+    pub read_log: Option<Vec<(u8, u32, u32, u32, u32)>>,
 }
 
 impl Default for Cdvd {
@@ -256,6 +264,7 @@ impl Cdvd {
             accesses: std::collections::BTreeMap::new(),
             s_callers: std::collections::BTreeMap::new(),
             commands: VecDeque::new(),
+            read_log: None,
         }
     }
 
@@ -411,6 +420,16 @@ impl Cdvd {
 
     /// Starts N command `n_command` with `n_params`.
     fn n_command(&mut self) {
+        if self.read_log.is_some() {
+            let entry = (
+                self.n_command,
+                self.n_word(0),
+                self.n_word(4),
+                self.read.as_ref().map_or(0, |r| r.left),
+                self.blocks.len() as u32,
+            );
+            self.read_log.as_mut().unwrap().push(entry);
+        }
         self.error = 0;
         self.read = None;
         let has_disc = self.disc.is_some();
