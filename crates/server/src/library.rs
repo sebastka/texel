@@ -162,7 +162,23 @@ impl Game {
 #[derive(Default)]
 pub struct Library {
     pub bios: Vec<Bios>,
+    /// PS2 firmware other than BIOSes (DVD player, arcade, MechaCon):
+    /// listed, never booted.
+    pub firmware: Vec<Firmware>,
     pub games: Vec<Game>,
+}
+
+/// PS2 firmware found with the BIOSes: the DVD player, an arcade board's
+/// BIOS, the MechaCon's (`texel_ps2::bios::identify_firmware`).
+#[derive(Clone, Debug)]
+pub struct Firmware {
+    pub id: String,
+    pub kind: texel_ps2::bios::FirmwareKind,
+    /// Path relative to the library, for display.
+    pub file: String,
+    pub sha1: String,
+    pub version: String,
+    pub date: Option<String>,
 }
 
 /// An SBI file: a file, or an entry in a zip (Redump hands them out
@@ -236,12 +252,19 @@ fn mtime(meta: &std::fs::Metadata) -> u64 {
 pub fn scan(roots: &[Root], index_dir: &Path, dats: &crate::dat::AllDats) -> Library {
     let mut lib = Library::default();
     let mut bios_seen = HashSet::new();
+    let mut firmware_seen = HashSet::new();
     let mut games_seen: std::collections::HashMap<String, PathBuf> = std::collections::HashMap::new();
     for root in roots {
         for dir in &root.bios {
-            for b in scan_bios(root.console, dir) {
+            let (bios, firmware) = scan_bios(root.console, dir);
+            for b in bios {
                 if bios_seen.insert(b.id.clone()) {
                     lib.bios.push(b);
+                }
+            }
+            for f in firmware {
+                if firmware_seen.insert(f.id.clone()) {
+                    lib.firmware.push(f);
                 }
             }
         }
@@ -276,14 +299,16 @@ pub fn scan(roots: &[Root], index_dir: &Path, dats: &crate::dat::AllDats) -> Lib
         }
     }
     lib.bios.sort_by(|a, b| a.file.cmp(&b.file));
+    lib.firmware.sort_by(|a, b| a.file.cmp(&b.file));
     lib.games.sort_by(|a, b| a.rel.cmp(&b.rel));
     lib
 }
 
-fn scan_bios(console: Console, dir: &Path) -> Vec<Bios> {
+/// The BIOSes in `dir`, and (PS2) the other firmware there.
+fn scan_bios(console: Console, dir: &Path) -> (Vec<Bios>, Vec<Firmware>) {
     if !dir.is_dir() {
         tracing::warn!(console = console.name(), dir = %dir.display(), "no BIOS directory");
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
     if console == Console::Ps2 {
         return scan_ps2_bios(dir);
@@ -291,7 +316,7 @@ fn scan_bios(console: Console, dir: &Path) -> Vec<Bios> {
     // Any layout of subdirectories (original/, psxonpsp/, openbios/...):
     // BIOSes are identified by their content.
     let mut out = Vec::new();
-    for (path, entry, rom) in bios_candidates(dir, 512 * 1024) {
+    for (path, entry, rom) in bios_candidates(dir, &[512 * 1024]) {
         let shown = shown_path(&path, entry.as_deref());
         let Some(info) = texel_ps1::bios::identify(&rom) else {
             tracing::warn!(file = %shown, "not a PlayStation BIOS, ignored");
@@ -323,14 +348,38 @@ fn scan_bios(console: Console, dir: &Path) -> Vec<Bios> {
             commit,
         });
     }
-    out
+    (out, Vec::new())
 }
 
-fn scan_ps2_bios(dir: &Path) -> Vec<Bios> {
+fn scan_ps2_bios(dir: &Path) -> (Vec<Bios>, Vec<Firmware>) {
+    use texel_ps2::bios::{BIOS_SIZE, MECHACON_SIZE};
     let mut out = Vec::new();
-    for (path, entry, rom) in bios_candidates(dir, texel_ps2::bios::BIOS_SIZE as u64) {
+    let mut firmware = Vec::new();
+    let sizes = [BIOS_SIZE as u64, BIOS_SIZE as u64 / 2, MECHACON_SIZE as u64];
+    for (path, entry, rom) in bios_candidates(dir, &sizes) {
         let Some(info) = texel_ps2::bios::identify(&rom) else {
-            tracing::warn!(file = %shown_path(&path, entry.as_deref()), "not a PlayStation 2 BIOS, ignored");
+            // The file's name: the MechaCon's firmware is known by it.
+            let name = entry
+                .as_deref()
+                .or_else(|| path.file_name().and_then(|n| n.to_str()))
+                .unwrap_or_default();
+            match texel_ps2::bios::identify_firmware(&rom, name) {
+                Some(f) => {
+                    let sha1 = hex::encode(sha1::Sha1::digest(&rom));
+                    firmware.push(Firmware {
+                        id: sha1[..16].to_owned(),
+                        kind: f.kind,
+                        file: rel_with_entry(rel_path("ps2/bios", dir, &path), entry.as_deref()),
+                        sha1,
+                        version: f.version,
+                        date: f.date,
+                    });
+                }
+                None if rom.len() == BIOS_SIZE => {
+                    tracing::warn!(file = %shown_path(&path, entry.as_deref()), "not a PlayStation 2 BIOS, ignored");
+                }
+                None => {}
+            }
             continue;
         };
         let sha1 = hex::encode(sha1::Sha1::digest(&rom));
@@ -353,27 +402,27 @@ fn scan_ps2_bios(dir: &Path) -> Vec<Bios> {
             commit: open.flatten(),
         });
     }
-    out
+    (out, firmware)
 }
 
-/// The files under `dir` of `size` bytes, and the entries of that size in
-/// its zips: (file, entry in the zip, content), read one at a time as the
-/// caller goes: a library's BIOSes (hundreds of 4 MiB PS2 images in a
-/// Redump set) are never all in memory together. Unreadable zips are
-/// skipped.
-fn bios_candidates(dir: &Path, size: u64) -> BiosCandidates {
+/// The files under `dir` of one of `sizes` (bytes), and the entries of
+/// those sizes in its zips: (file, entry in the zip, content), read one at
+/// a time as the caller goes: a library's BIOSes (hundreds of 4 MiB PS2
+/// images in a Redump set) are never all in memory together. Unreadable
+/// zips are skipped.
+fn bios_candidates(dir: &Path, sizes: &[u64]) -> BiosCandidates {
     let mut files = Vec::new();
     walk(dir, &mut files, 0);
     BiosCandidates {
         files: files.into_iter(),
-        size,
+        sizes: sizes.to_vec(),
         zip: None,
     }
 }
 
 struct BiosCandidates {
     files: std::vec::IntoIter<PathBuf>,
-    size: u64,
+    sizes: Vec<u64>,
     /// The zip being read: its path, and the next entry.
     zip: Option<(PathBuf, zip::ZipArchive<std::fs::File>, usize)>,
 }
@@ -387,7 +436,7 @@ impl Iterator for BiosCandidates {
                 while *next < archive.len() {
                     let k = *next;
                     *next += 1;
-                    match zipped_of_size(archive, k, self.size) {
+                    match zipped_of_size(archive, k, &self.sizes) {
                         Ok(Some((name, rom))) => return Some((path.clone(), Some(name), rom)),
                         Ok(None) => {}
                         Err(e) => {
@@ -411,7 +460,7 @@ impl Iterator for BiosCandidates {
                 continue;
             }
             // `fs::metadata` follows symbolic links, unlike `DirEntry::metadata`.
-            if std::fs::metadata(&path).map(|m| m.len()).ok() != Some(self.size) {
+            if !std::fs::metadata(&path).is_ok_and(|m| self.sizes.contains(&m.len())) {
                 continue;
             }
             if let Ok(rom) = std::fs::read(&path) {
@@ -421,19 +470,19 @@ impl Iterator for BiosCandidates {
     }
 }
 
-/// A zip's entry `k` if it is of `size` bytes, decompressed: (name,
-/// content).
+/// A zip's entry `k` if it is of one of `sizes` (bytes), decompressed:
+/// (name, content).
 fn zipped_of_size(
     archive: &mut zip::ZipArchive<std::fs::File>,
     k: usize,
-    size: u64,
+    sizes: &[u64],
 ) -> anyhow::Result<Option<(String, Vec<u8>)>> {
     let mut f = archive.by_index(k)?;
-    if f.is_dir() || f.size() != size {
+    if f.is_dir() || !sizes.contains(&f.size()) {
         return Ok(None);
     }
     let name = f.name()?.into_owned();
-    let mut rom = Vec::with_capacity(size as usize);
+    let mut rom = Vec::with_capacity(f.size() as usize);
     std::io::Read::read_to_end(&mut f, &mut rom)?;
     Ok(Some((name, rom)))
 }
@@ -1087,7 +1136,7 @@ mod tests {
         zip.start_file("readme.txt", deflated).unwrap();
         zip.write_all(b"not a BIOS").unwrap();
         zip.finish().unwrap();
-        let mut found: Vec<_> = bios_candidates(&dir, 512 * 1024).collect();
+        let mut found: Vec<_> = bios_candidates(&dir, &[512 * 1024]).collect();
         found.sort_by(|a, b| a.1.cmp(&b.1));
         assert_eq!(found.len(), 2);
         assert_eq!(found[0].1, None);

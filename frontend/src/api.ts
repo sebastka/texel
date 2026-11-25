@@ -3,6 +3,21 @@
 /** The console a game or a BIOS belongs to. */
 export type Console = "ps1" | "ps2";
 
+/** PS2 firmware other than BIOSes: listed, never booted. */
+export interface Firmware {
+  id: string;
+  kind: "dvd" | "arcade" | "mechacon";
+  file: string;
+  sha1: string;
+  /** e.g. "1.10U" (a DVD player's, with its region letter), "1.00", "5.04". */
+  version: string;
+  date: string | null;
+  /** Redump's description, when the image is a known-good dump. */
+  model: string | null;
+  /** A known-good dump; null until Redump's DAT is downloaded. */
+  verified: boolean | null;
+}
+
 export interface Bios {
   id: string;
   console: Console;
@@ -251,6 +266,7 @@ export const api = {
     send("PUT", `/api/games/${encodeURIComponent(game)}/cards`, { cards }),
   states: (id: string) => json<SaveState[]>(`/api/games/${encodeURIComponent(id)}/states`),
   bios: () => json<Bios[]>("/api/bios"),
+  firmware: () => json<Firmware[]>("/api/firmware"),
   games: () => json<GameListItem[]>("/api/games"),
   game: (id: string) => json<GameDetail>(`/api/games/${encodeURIComponent(id)}`),
   room: (code: string) =>

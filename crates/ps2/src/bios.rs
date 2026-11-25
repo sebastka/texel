@@ -6,6 +6,12 @@
 //! the ROM, each aligned to 16 bytes. The `ROMVER` file describes the ROM:
 //! `0200EC20040614` is version 2.00, Europe, a console ROM (C), built on
 //! 2004-06-14.
+//!
+//! Other PS2 firmware, kept in a library with the BIOSes but booting
+//! nothing here (`identify_firmware`): the DVD player (`rom1`, the same file
+//! system, with `DVDVER`), the BIOS of PS2-based arcade boards (a `ROMVER`
+//! of type Z, in 2 MiB), and the MechaCon's (the disc drive's controller in
+//! slim consoles: no file system, known by its size and name).
 
 /// Size of a BIOS dump: 4 MiB for every model.
 pub const BIOS_SIZE: usize = 4 * 1024 * 1024;
@@ -94,10 +100,137 @@ pub fn identify(rom: &[u8]) -> Option<BiosInfo> {
     if !(major.bytes().chain(minor.bytes()).chain(date.bytes())).all(|b| b.is_ascii_digit()) {
         return None;
     }
+    // An arcade board's BIOS: not a console's (`identify_firmware`).
+    if text.as_bytes()[5] == b'Z' {
+        return None;
+    }
     Some(BiosInfo {
         version: format!("{}.{minor}", major.trim_start_matches('0').max("0")),
         date: format!("{}-{}-{}", &date[..4], &date[4..6], &date[6..8]),
         region: Region::from_letter(text.as_bytes()[4]),
+    })
+}
+
+/// The size of a MechaCon firmware dump (256 KiB of flash, 16 KiB more).
+pub const MECHACON_SIZE: usize = 272 * 1024;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FirmwareKind {
+    /// The console's DVD video player (`rom1`).
+    DvdPlayer,
+    /// The BIOS of a PS2-based arcade board.
+    Arcade,
+    /// The disc drive's controller (slim consoles).
+    MechaCon,
+}
+
+impl FirmwareKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::DvdPlayer => "dvd",
+            Self::Arcade => "arcade",
+            Self::MechaCon => "mechacon",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FirmwareInfo {
+    pub kind: FirmwareKind,
+    /// e.g. "1.10U" (a DVD player's, with its region letter), "1.00",
+    /// "5.00".
+    pub version: String,
+    /// e.g. "2000-07-26", when known.
+    pub date: Option<String>,
+}
+
+/// Identifies PS2 firmware other than a console's BIOS, from its content
+/// (and, for the MechaCon's, which has no file system, its size and file
+/// name). `None` for anything else.
+pub fn identify_firmware(rom: &[u8], name: &str) -> Option<FirmwareInfo> {
+    if rom.len() == MECHACON_SIZE {
+        return mechacon(name);
+    }
+    if rom.len() != BIOS_SIZE && rom.len() != BIOS_SIZE / 2 {
+        return None;
+    }
+    let files = romdir(rom)?;
+    let file = |want: &[u8]| {
+        files
+            .iter()
+            .find(|(n, ..)| *n == want)
+            .and_then(|&(_, offset, size)| rom.get(offset..offset + size))
+    };
+    let text = |b: &[u8]| {
+        String::from_utf8_lossy(b)
+            .trim_end_matches(['\n', '\0'])
+            .trim()
+            .to_owned()
+    };
+    // The DVD player: DVDVER, or one per region (DVDVERJ, DVDVERU...: the
+    // version is theirs, without region letters).
+    let versions: Vec<String> = files
+        .iter()
+        .filter(|(n, ..)| n.starts_with(b"DVDVER"))
+        .filter_map(|&(_, offset, size)| rom.get(offset..offset + size).map(text))
+        .collect();
+    // The image's build date: EXTINFO's first "20000726-221712".
+    let built = file(b"EXTINFO").and_then(|e| {
+        e.windows(9).find_map(|w| {
+            (w[..8].iter().all(u8::is_ascii_digit) && w[8] == b'-').then(|| {
+                let d = std::str::from_utf8(&w[..8]).unwrap_or_default();
+                format!("{}-{}-{}", &d[..4], &d[4..6], &d[6..8])
+            })
+        })
+    });
+    if !versions.is_empty() {
+        // DVDID names the version (3.04M's DVDVER is a build tag); else
+        // DVDVER, else the regions' own, without their letters.
+        let version = match file(b"DVDID").or_else(|| file(b"DVDVER")) {
+            Some(v) => text(v),
+            None => versions[0]
+                .trim_end_matches(|c: char| c.is_ascii_alphabetic())
+                .to_owned(),
+        };
+        return Some(FirmwareInfo {
+            kind: FirmwareKind::DvdPlayer,
+            version,
+            date: built,
+        });
+    }
+    // An arcade board's BIOS: a ROMVER of type Z (the same in every build:
+    // the build's date is EXTINFO's).
+    let romver = text(file(b"ROMVER")?);
+    let b = romver.as_bytes();
+    if b.len() >= 14 && b[5] == b'Z' && b[..4].iter().chain(&b[6..14]).all(u8::is_ascii_digit) {
+        return Some(FirmwareInfo {
+            kind: FirmwareKind::Arcade,
+            version: format!("{}.{}", romver[0..2].trim_start_matches('0').max("0"), &romver[2..4]),
+            date: built.or_else(|| Some(format!("{}-{}-{}", &romver[6..10], &romver[10..12], &romver[12..14]))),
+        });
+    }
+    None
+}
+
+/// A MechaCon firmware dump, by its file name: "ps2-mechacon-500-20030120..."
+/// is version 5.00, of 2003-01-20.
+fn mechacon(name: &str) -> Option<FirmwareInfo> {
+    let lower = name.to_ascii_lowercase();
+    let after = &lower[lower.find("mechacon")? + "mechacon".len()..];
+    let mut fields = after.split(|c: char| !c.is_ascii_digit()).filter(|f| !f.is_empty());
+    let version = fields
+        .next()
+        .filter(|v| v.len() == 3)
+        .map(|v| format!("{}.{}", &v[..1], &v[1..]))
+        .unwrap_or_else(|| "unknown".to_owned());
+    let date = fields
+        .next()
+        .filter(|d| d.len() == 8)
+        .map(|d| format!("{}-{}-{}", &d[..4], &d[4..6], &d[6..8]));
+    Some(FirmwareInfo {
+        kind: FirmwareKind::MechaCon,
+        version,
+        date,
     })
 }
 
@@ -107,7 +240,12 @@ mod tests {
 
     /// A ROM with a directory (RESET, ROMDIR, ROMVER) and a ROMVER file.
     fn rom(romver: &[u8]) -> Vec<u8> {
-        let mut rom = vec![0u8; BIOS_SIZE];
+        rom_with(BIOS_SIZE, &[(b"ROMVER", romver)])
+    }
+
+    /// A ROM of `size` with a directory (RESET, ROMDIR) and these files.
+    fn rom_with(size: usize, files: &[(&[u8], &[u8])]) -> Vec<u8> {
+        let mut rom = vec![0u8; size];
         let entry = |name: &[u8], size: u32| {
             let mut e = [0u8; 16];
             e[..name.len()].copy_from_slice(name);
@@ -115,16 +253,70 @@ mod tests {
             e
         };
         // RESET holds the directory, at 0x100: 0x200 bytes long.
-        let dir = [
-            entry(b"RESET", 0x200),
-            entry(b"ROMDIR", 0x40),
-            entry(b"ROMVER", romver.len() as u32),
-        ];
+        let mut dir = vec![entry(b"RESET", 0x200), entry(b"ROMDIR", 0x40)];
+        dir.extend(files.iter().map(|(n, c)| entry(n, c.len() as u32)));
         for (i, e) in dir.iter().enumerate() {
             rom[0x100 + i * 16..0x110 + i * 16].copy_from_slice(e);
         }
-        rom[0x240..0x240 + romver.len()].copy_from_slice(romver);
+        let mut at = 0x240;
+        for (_, content) in files {
+            rom[at..at + content.len()].copy_from_slice(content);
+            at += content.len().div_ceil(16) * 16;
+        }
         rom
+    }
+
+    #[test]
+    fn identifies_other_firmware() {
+        let dvd = rom_with(
+            BIOS_SIZE / 2,
+            &[
+                (b"EXTINFO", b"\0\0\x04\x0120000726-221712,"),
+                (b"DVDID", b"1.10U\n"),
+                (b"DVDVER", b"1.10U\n"),
+            ],
+        );
+        assert_eq!(
+            identify_firmware(&dvd, "x.bin"),
+            Some(FirmwareInfo {
+                kind: FirmwareKind::DvdPlayer,
+                version: "1.10U".into(),
+                date: Some("2000-07-26".into()),
+            })
+        );
+        let multi = rom_with(BIOS_SIZE, &[(b"DVDVERJ", b"3.11\n"), (b"DVDVERU", b"3.11U\n")]);
+        assert_eq!(
+            identify_firmware(&multi, "x.bin").map(|f| f.version),
+            Some("3.11".into())
+        );
+        let arcade = rom_with(BIOS_SIZE / 2, &[(b"ROMVER", b"0100TZ20000306\n")]);
+        let info = identify_firmware(&arcade, "x.bin").unwrap();
+        assert_eq!((info.kind, info.version.as_str()), (FirmwareKind::Arcade, "1.00"));
+        assert_eq!(info.date.as_deref(), Some("2000-03-06"));
+        let built = rom_with(
+            BIOS_SIZE / 2,
+            &[
+                (b"EXTINFO", b"\0\x03\x0320091029-174532,rom0"),
+                (b"ROMVER", b"0100TZ20000306\n"),
+            ],
+        );
+        assert_eq!(
+            identify_firmware(&built, "x.bin").and_then(|f| f.date),
+            Some("2009-10-29".into())
+        );
+        let tagged = rom_with(BIOS_SIZE / 2, &[(b"DVDID", b"3.04M\n"), (b"DVDVER", b"cvrM040402a\n")]);
+        assert_eq!(
+            identify_firmware(&tagged, "x.bin").map(|f| f.version),
+            Some("3.04M".into())
+        );
+        // Never a console's BIOS, even of a console's size.
+        assert_eq!(identify(&rom(b"0100TZ20000306")), None);
+        let m = identify_firmware(&vec![0; MECHACON_SIZE], "ps2-mechacon-504-20030408-232700.bin").unwrap();
+        assert_eq!((m.kind, m.version.as_str()), (FirmwareKind::MechaCon, "5.04"));
+        assert_eq!(m.date.as_deref(), Some("2003-04-08"));
+        assert_eq!(identify_firmware(&vec![0; MECHACON_SIZE], "other.bin"), None);
+        // A console's BIOS is not this.
+        assert_eq!(identify_firmware(&rom(b"0200EC20040614"), "x.bin"), None);
     }
 
     #[test]

@@ -71,6 +71,7 @@ pub fn router(state: Arc<AppState>) -> Router {
             post(copy_save).layer(DefaultBodyLimit::max(4096)),
         )
         .route("/bios", get(list_bios))
+        .route("/firmware", get(list_firmware))
         .route("/bios/{id}/data", get(bios_data))
         .route("/games", get(list_games))
         .route("/games/{id}", get(game_detail))
@@ -228,6 +229,42 @@ async fn list_bios(State(state): AppStateRef, _: CurrentUser) -> Json<Vec<BiosJs
             version: b.version.clone(),
             date: b.date.clone(),
             region: b.region,
+        });
+    }
+    Json(out)
+}
+
+/// PS2 firmware other than BIOSes, checked against Redump.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FirmwareJson {
+    id: String,
+    /// "dvd", "arcade" or "mechacon".
+    kind: &'static str,
+    file: String,
+    sha1: String,
+    version: String,
+    date: Option<String>,
+    /// Redump's description, when the image is a known-good dump.
+    model: Option<String>,
+    /// Whether the SHA-1 is a known-good dump; `None` without the DAT.
+    verified: Option<bool>,
+}
+
+async fn list_firmware(State(state): AppStateRef, _: CurrentUser) -> Json<Vec<FirmwareJson>> {
+    let lib = state.library.read().await.clone();
+    let mut out = Vec::with_capacity(lib.firmware.len());
+    for f in &lib.firmware {
+        let (model, dat_loaded) = state.bios_model(Console::Ps2, &f.sha1).await;
+        out.push(FirmwareJson {
+            id: f.id.clone(),
+            kind: f.kind.as_str(),
+            file: f.file.clone(),
+            sha1: f.sha1.clone(),
+            version: f.version.clone(),
+            date: f.date.clone(),
+            verified: dat_loaded.then_some(model.is_some()),
+            model: model.map(|(m, _)| m),
         });
     }
     Json(out)
