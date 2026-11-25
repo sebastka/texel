@@ -23,7 +23,7 @@ allow = [
     "Unicode-3.0",
     "Zlib",
 ]
-# The workspace crates are private and unlicensed.
+# The workspace crates are private (MIT, never published): not checked.
 private = { ignore = true }
 
 [bans]

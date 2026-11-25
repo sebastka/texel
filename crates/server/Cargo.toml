@@ -3,6 +3,7 @@ name = "texel-server"
 description = "Serves the Texel web app, the BIOS and game library, saves and game metadata"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 

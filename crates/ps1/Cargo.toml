@@ -3,6 +3,7 @@ name = "texel-ps1"
 description = "PlayStation emulation core: CPU, GTE, GPU, SPU, CD-ROM, MDEC and peripherals"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 

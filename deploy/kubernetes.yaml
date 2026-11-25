@@ -1,23 +1,24 @@
-# Texel on Kubernetes. Provide yourself:
+# Texel on Kubernetes: an example. Provide yourself:
 # - the `texel-library` PersistentVolumeClaim, holding `ps1/bios/`,
-#   `ps1/games/` (and `ps2/` for later)
-#   (mounted read-only; e.g. an NFS share);
-# - a MariaDB (or MySQL) database for saves, settings and hashes, and the
+#   `ps1/games/`, `ps2/bios/` and `ps2/games/` (mounted read-only; e.g. an
+#   NFS share). Other layouts, or several directories per kind: set
+#   TEXEL_PS1_BIOS, TEXEL_PS1_GAMES, TEXEL_PS2_BIOS and TEXEL_PS2_GAMES below
+#   (directories separated by `:`);
+# - a MariaDB (or MySQL) database for users, saves and hashes, and the
 #   `texel-database` Secret with its URL under `url`:
 #   mysql://user:password@host:3306/database (the server creates its tables);
 # - the `texel` Secret with the sign-in settings: TEXEL_OIDC_ISSUER,
 #   TEXEL_OIDC_CLIENT_ID, TEXEL_OIDC_CLIENT_SECRET, TEXEL_OIDC_ADMIN_GROUPS
 #   (or TEXEL_OIDC_ADMIN_USERS), and optionally TEXEL_IGDB_CLIENT_ID and
-#   TEXEL_IGDB_CLIENT_SECRET, for game descriptions from IGDB. Without
-#   OpenID Connect, invite users with `texel --create-invite "note"` (in
-#   the pod);
+#   TEXEL_IGDB_CLIENT_SECRET, for game details from IGDB. Without OpenID
+#   Connect, invite users with `texel --create-invite "note"` (in the pod);
 # - TEXEL_PUBLIC_URL below: the address users reach Texel at (the OpenID
 #   Connect redirect URI is <it>/auth/oidc/callback);
 # - an Ingress in front of the Service, over HTTPS. It must pass WebSocket
-#   upgrades (netplay, under /api/netplay/).
+#   upgrades (netplay, under /api/netplay/), and keep the server's
+#   Cross-Origin-Opener-Policy and Cross-Origin-Embedder-Policy headers (the
+#   emulators need SharedArrayBuffer).
 # Netplay rooms live in the server's memory: keep a single replica.
-# The state directory only holds caches (DATs, artwork, game details): an
-# emptyDir, filled again after a restart.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -58,17 +59,20 @@ spec:
             readOnlyRootFilesystem: true
             capabilities: { drop: [ALL] }
           resources:
-            requests: { cpu: 20m, memory: 64Mi }
-            # Parsing the Redump DAT (~13 MB of XML) peaks around 150 MiB.
-            limits: { memory: 384Mi }
+            requests: { cpu: 20m, memory: 256Mi }
+            # Scanning a large library and indexing its zipped images stay
+            # well under this (files read once leave the page cache).
+            limits: { memory: 1Gi }
           startupProbe:
             httpGet: { path: /readyz, port: http }
             failureThreshold: 60
             periodSeconds: 5
           livenessProbe:
             httpGet: { path: /healthz, port: http }
+            periodSeconds: 60
           readinessProbe:
             httpGet: { path: /readyz, port: http }
+            periodSeconds: 30
           volumeMounts:
             - { name: library, mountPath: /library, readOnly: true }
             - { name: state, mountPath: /state }
@@ -76,7 +80,20 @@ spec:
         - name: library
           persistentVolumeClaim: { claimName: texel-library, readOnly: true }
         - name: state
-          emptyDir: { sizeLimit: 1Gi }
+          persistentVolumeClaim: { claimName: texel-state }
+---
+# The state directory: caches only (DATs, artwork, game details, and the
+# zipped images' seek indexes, about 1% of their size), filled again if
+# lost, but downloading and indexing again take a while.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: texel-state
+  labels: { app.kubernetes.io/name: texel }
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests: { storage: 2Gi }
 ---
 apiVersion: v1
 kind: Service
