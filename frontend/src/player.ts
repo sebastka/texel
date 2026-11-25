@@ -21,7 +21,8 @@ interface Callbacks {
   /** The room's game, as this player runs it. */
   onNet?: (status: NetStatus) => void;
   /** A message for the room. */
-  onNetOut?: (data: string | Uint8Array) => void;
+  /** A message for the room; `datagram`: for its datagram session. */
+  onNetOut?: (data: string | Uint8Array, datagram: boolean) => void;
 }
 
 const SMOOTH_KEY = "texel.smooth";
@@ -271,7 +272,7 @@ export class Player {
         this.cb.onNet?.(msg.status);
         break;
       case "net-out":
-        this.cb.onNetOut?.(msg.data);
+        this.cb.onNetOut?.(msg.data, msg.datagram === true);
         break;
       case "error":
         this.cb.onStatus(`Error: ${msg.message}`);

@@ -98,11 +98,13 @@ impl Db {
     pub async fn set_settings(&self, rows: &[(String, String)]) -> anyhow::Result<()> {
         let mut tx = self.pool.begin().await?;
         for (name, value) in rows {
-            sqlx::query("INSERT INTO settings (name, value) VALUES (?, ?) ON DUPLICATE KEY UPDATE value = VALUES(value)")
-                .bind(name)
-                .bind(value)
-                .execute(&mut *tx)
-                .await?;
+            sqlx::query(
+                "INSERT INTO settings (name, value) VALUES (?, ?) ON DUPLICATE KEY UPDATE value = VALUES(value)",
+            )
+            .bind(name)
+            .bind(value)
+            .execute(&mut *tx)
+            .await?;
         }
         tx.commit().await?;
         Ok(())

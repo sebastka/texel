@@ -37,6 +37,9 @@ pub struct AppState {
     pub rooms: crate::netplay::Rooms,
     /// The administrators' settings (see `settings`).
     pub settings: RwLock<crate::settings::Settings>,
+    /// The UDP port browsers open netplay's datagram sessions at, once the
+    /// endpoint listens (see `webtransport`).
+    pub datagram_port: std::sync::OnceLock<u16>,
     /// Sign-in and sessions.
     pub auth: crate::auth::Auth,
     scan_lock: Mutex<()>,
@@ -221,6 +224,7 @@ impl AppState {
             zip_indexes: tokio::sync::Notify::new(),
             rooms: crate::netplay::Rooms::default(),
             settings: RwLock::new(settings),
+            datagram_port: std::sync::OnceLock::new(),
             auth,
             scan_lock: Mutex::new(()),
         })

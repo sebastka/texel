@@ -14,9 +14,9 @@ mod gte;
 mod irq;
 mod mdec;
 pub mod pad;
+mod rewind;
 mod sio;
 pub mod spu;
-mod rewind;
 mod timers;
 
 pub mod bios;

@@ -59,6 +59,8 @@ ENV TEXEL_STATE=/state \
     TEXEL_WEB=/usr/share/texel/web
 VOLUME ["/state"]
 EXPOSE 8080
+# Netplay's datagrams (WebTransport), when TEXEL_WEBTRANSPORT_LISTEN is set.
+EXPOSE 4433/udp
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s \
     CMD ["/usr/local/bin/texel", "--healthcheck"]
 ENTRYPOINT ["/usr/local/bin/texel"]

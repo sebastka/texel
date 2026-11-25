@@ -3,6 +3,10 @@
 // the host browses the library in it, and the others follow the games the
 // host starts. While a game runs, the player's worker runs it in step
 // (netplay.ts): the room relays the game's messages, both ways.
+//
+// Where the server offers it (an administrators' setting), inputs also go
+// as datagrams, over a WebTransport session next to the WebSocket: they
+// come sooner when packets are lost (see the server's webtransport.rs).
 
 import type { ChatLine, CodeSet, Ports, RoomSnapshot, SplitView } from "./protocol";
 
@@ -36,6 +40,10 @@ export interface RoomEvents {
   end: (why: string) => void;
 }
 
+/** Netplay's datagrams: not offered (or no WebTransport here), opening,
+ * open, or failed (UDP blocked, maybe: the WebSocket carries everything). */
+export type Datagrams = "off" | "opening" | "on" | "failed";
+
 const median = (xs: number[]) => (xs.length ? [...xs].sort((a, b) => a - b)[xs.length >> 1]! : null);
 
 export function wsUrl(path: string): string {
@@ -61,6 +69,9 @@ export class Room {
   /** Members run ahead and go back on a late input (see netplay.ts): the
    * server's setting when the room was opened. */
   rollback = false;
+  datagrams: Datagrams = "off";
+  private transport: WebTransport | null = null;
+  private datagramWriter: WritableStreamDefaultWriter<Uint8Array> | null = null;
   private rtts: number[] = [];
   private readonly timers: ReturnType<typeof setInterval>[] = [];
   private leaving = false;
@@ -158,6 +169,44 @@ export class Room {
     if (this.ws.readyState === WebSocket.OPEN) this.ws.send(data as string | Uint8Array<ArrayBuffer>);
   }
 
+  /** A datagram from the running game: lost when there is no session. */
+  sendDatagram(data: Uint8Array) {
+    void this.datagramWriter?.write(data).catch(() => {});
+  }
+
+  /** Opens the datagram session the server offers, if this browser can. */
+  private async openDatagrams(port: number, path: string) {
+    if (typeof WebTransport === "undefined") return;
+    this.datagrams = "opening";
+    this.on.change();
+    try {
+      const transport = new WebTransport(`https://${location.hostname}:${port}${path}`);
+      this.transport = transport;
+      await transport.ready;
+      if (this.state === "ended") {
+        transport.close();
+        return;
+      }
+      this.datagramWriter = transport.datagrams.writable.getWriter();
+      this.datagrams = "on";
+      this.on.change();
+      const reader = transport.datagrams.readable.getReader();
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        this.relay?.((value as Uint8Array).slice().buffer);
+      }
+    } catch {
+      // Refused, or UDP blocked: the WebSocket carries everything anyway.
+    }
+    this.datagramWriter = null;
+    this.transport = null;
+    if (this.state !== "ended") {
+      this.datagrams = "failed";
+      this.on.change();
+    }
+  }
+
   leave() {
     if (this.state === "ended") return;
     this.leaving = true;
@@ -182,6 +231,7 @@ export class Room {
     this.timers.forEach(clearInterval);
     window.removeEventListener("pagehide", this.onPageHide);
     this.ws.close();
+    this.transport?.close();
     this.relay = null;
     this.on.end(why);
   }
@@ -197,6 +247,8 @@ export class Room {
         this.host = Number(msg.host);
         this.epoch = Number(msg.epoch);
         this.rollback = msg.rollback === true;
+        const dg = msg.datagrams as { port: number; path: string } | null;
+        if (dg && this.datagrams === "off") void this.openDatagrams(dg.port, dg.path);
         this.game = typeof msg.game === "string" ? { game: msg.game, bios: String(msg.bios), codes: (msg.codes as CodeSet | null) ?? null } : null;
         this.ports = [[this.host], []];
         for (const m of msg.members as { id: number; name: string; registered: boolean }[]) {

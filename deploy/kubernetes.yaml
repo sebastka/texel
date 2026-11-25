@@ -18,6 +18,13 @@
 #   upgrades (netplay, under /api/netplay/), and keep the server's
 #   Cross-Origin-Opener-Policy and Cross-Origin-Embedder-Policy headers (the
 #   emulators need SharedArrayBuffer).
+# Optionally, netplay's inputs as datagrams (WebTransport, over UDP; an
+# administrator turns them on in Admin, Features): the `texel-tls` Secret
+# with a certificate for the same name (cert-manager's for the Ingress will
+# do), and the `texel-webtransport` Service below reachable on UDP 443 at
+# that name (a load balancer's address, shared with the Ingress's where it
+# allows TCP and UDP on one IP). Without them, leave them out: netplay goes
+# over the WebSocket only.
 # Netplay rooms live in the server's memory: keep a single replica.
 apiVersion: apps/v1
 kind: Deployment
@@ -47,6 +54,12 @@ spec:
           env:
             - { name: TEXEL_LOG_FORMAT, value: json }
             - { name: TEXEL_PUBLIC_URL, value: https://texel.example.com }
+            # Netplay's datagrams (optional, see above): an unprivileged port
+            # here, 443 for browsers.
+            - { name: TEXEL_WEBTRANSPORT_LISTEN, value: "[::]:4433" }
+            - { name: TEXEL_WEBTRANSPORT_PORT, value: "443" }
+            - { name: TEXEL_WEBTRANSPORT_CERT, value: /tls/tls.crt }
+            - { name: TEXEL_WEBTRANSPORT_KEY, value: /tls/tls.key }
             - name: TEXEL_DATABASE_URL
               valueFrom:
                 secretKeyRef: { name: texel-database, key: url }
@@ -54,6 +67,7 @@ spec:
             - secretRef: { name: texel, optional: true }
           ports:
             - { name: http, containerPort: 8080 }
+            - { name: webtransport, containerPort: 4433, protocol: UDP }
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
@@ -76,11 +90,16 @@ spec:
           volumeMounts:
             - { name: library, mountPath: /library, readOnly: true }
             - { name: state, mountPath: /state }
+            - { name: tls, mountPath: /tls, readOnly: true }
       volumes:
         - name: library
           persistentVolumeClaim: { claimName: texel-library, readOnly: true }
         - name: state
           persistentVolumeClaim: { claimName: texel-state }
+        # Renewed certificates reach the pod (not with subPath), and are
+        # read again.
+        - name: tls
+          secret: { secretName: texel-tls, optional: true }
 ---
 # The state directory: caches only (DATs, artwork, game details, and the
 # zipped images' seek indexes, about 1% of their size), filled again if
@@ -104,3 +123,15 @@ spec:
   selector: { app.kubernetes.io/name: texel }
   ports:
     - { name: http, port: 80, targetPort: http }
+---
+# Netplay's datagrams (optional, see above): UDP 443 for browsers.
+apiVersion: v1
+kind: Service
+metadata:
+  name: texel-webtransport
+  labels: { app.kubernetes.io/name: texel }
+spec:
+  type: LoadBalancer
+  selector: { app.kubernetes.io/name: texel }
+  ports:
+    - { name: webtransport, port: 443, targetPort: webtransport, protocol: UDP }

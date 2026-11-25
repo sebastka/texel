@@ -42,6 +42,8 @@ tower = { version = "0.5.3", default-features = false, features = ["util"] }
 tower-http = { version = "0.7.1", default-features = false, features = ["fs", "set-header", "trace", "limit"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["std", "fmt", "ansi", "env-filter", "json"] }
+# Netplay inputs as datagrams (WebTransport over HTTP/3, see webtransport.rs).
+wtransport = { version = "0.7.2", default-features = false, features = ["ring"] }
 # DuckStation's hash of a disc's build, which picks its cheat files (codes.rs).
 xxhash-rust = { version = "0.8.19", default-features = false, features = ["xxh64"] }
 zip = { version = "9.8.1", default-features = false, features = ["deflate-flate2-zlib-rs"] }
@@ -51,6 +53,8 @@ zip = { version = "9.8.1", default-features = false, features = ["deflate-flate2
 libc = "0.2.191"
 
 [dev-dependencies]
+# Netplay's datagrams, tested with a self-signed certificate and a client.
+wtransport = { version = "0.7.2", default-features = false, features = ["ring", "self-signed", "dangerous-configuration"] }
 # The memory card size the server accepts for PS2 games.
 texel-ps2.workspace = true
 

@@ -179,6 +179,6 @@ export type FromWorker =
   | { type: "state-loaded"; slot: number }
   | { type: "net"; status: NetStatus }
   /** A message for the room. */
-  | { type: "net-out"; data: string | Uint8Array }
+  | { type: "net-out"; data: string | Uint8Array; datagram?: boolean }
   | { type: "stopped" }
   | { type: "error"; message: string };

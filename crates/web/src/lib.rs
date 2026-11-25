@@ -231,7 +231,10 @@ impl Emulator {
     /// over them.
     #[wasm_bindgen(js_name = rewindLoad)]
     pub fn rewind_load(&mut self, slot: usize) -> Result<(), JsError> {
-        let r = self.rewinds.get(slot).ok_or_else(|| JsError::new("no state kept there"))?;
+        let r = self
+            .rewinds
+            .get(slot)
+            .ok_or_else(|| JsError::new("no state kept there"))?;
         self.system.load_rewind(r)?;
         Ok(())
     }

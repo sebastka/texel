@@ -49,7 +49,7 @@ export async function renderAdmin(shell: Shell) {
 
   /** A switch per setting, saved as soon as it changes. */
   const renderFeatures = (settings: Settings) => {
-    const toggle = (key: keyof Settings, title: string, about: string) => {
+    const toggle = (key: "netplayRollback" | "netplayDatagrams", title: string, about: string, warning?: string | null) => {
       const box = h("input.switch", { type: "checkbox", checked: settings[key], "aria-label": title }) as HTMLInputElement;
       box.onchange = () => {
         box.disabled = true;
@@ -64,7 +64,13 @@ export async function renderAdmin(shell: Shell) {
       return h(
         "label.admin-feature",
         {},
-        h("span.admin-feature-text", {}, h("strong", {}, title), h("span.muted.small", {}, about)),
+        h(
+          "span.admin-feature-text",
+          {},
+          h("strong", {}, title),
+          h("span.muted.small", {}, about),
+          warning ? h("span.small.error", {}, warning) : null,
+        ),
         box,
       );
     };
@@ -76,6 +82,14 @@ export async function renderAdmin(shell: Shell) {
           "turns out otherwise: the input delay is hidden, at the cost of brief corrections and of more work for " +
           "each player's machine. Off: each frame waits for every player's input (lockstep). Rooms already open keep " +
           "theirs.",
+      ),
+      toggle(
+        "netplayDatagrams",
+        "Netplay: inputs as datagrams",
+        "Players' inputs also go over WebTransport (UDP), each carrying the last few: a lost packet no longer holds " +
+          "the game back while it is sent again. Needs the server to listen for it (TEXEL_WEBTRANSPORT_LISTEN, with " +
+          "a certificate), and a browser with WebTransport; the others play as before. Players joining from now on.",
+        settings.datagramsListening ? null : "The server does not listen for them: on, this changes nothing.",
       ),
     );
   };

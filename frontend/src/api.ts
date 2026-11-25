@@ -181,6 +181,11 @@ export interface UserRow {
 export interface Settings {
   /** Netplay rooms opened from now on use rollback rather than lockstep. */
   netplayRollback: boolean;
+  /** Netplay inputs also go as datagrams (WebTransport), where the server
+   * listens for them. */
+  netplayDatagrams: boolean;
+  /** Read only: the server listens for them. */
+  datagramsListening?: boolean;
 }
 
 export interface InviteRow {

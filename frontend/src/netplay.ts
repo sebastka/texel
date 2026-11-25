@@ -24,6 +24,11 @@
 // for corrections to stay short on both sides. Checksums and states sent
 // to others are of frames every input of which is known.
 //
+// Inputs also go as datagrams where the room has a datagram session
+// (room-link.ts): each carries the sender's last BUNDLE inputs, so that
+// one lost is covered by the next. The WebSocket copy still comes: the
+// first to arrive counts.
+//
 // Each change of game or host starts an epoch, and messages of earlier
 // ones are dropped. A session lasts one game: the page starts another
 // player for the next. When the host leaves, the member who takes over
@@ -41,6 +46,9 @@ const EVERYONE = 255;
 const INPUT = 1;
 const SNAPSHOT = 2;
 const CHECK = 3;
+/** The last inputs of a member, and its frame (datagrams). */
+const INPUTS = 4;
+const BUNDLE = 8;
 
 const CHECK_EVERY = 120;
 /** Frames of input kept, to replay after loading another member's state. */
@@ -181,6 +189,8 @@ export interface SessionHooks {
   status: (s: NetStatus) => void;
   /** Sends a message to the room (through the page). */
   send: (data: string | Uint8Array) => void;
+  /** Sends a datagram to the room, if it has a datagram session. */
+  sendDatagram?: (data: Uint8Array) => void;
   gzip: (data: Uint8Array, decompress?: boolean) => Promise<Uint8Array>;
   /** This member got the game's state and runs it. */
   onStarted?: () => void;
@@ -250,6 +260,8 @@ export class Session {
   /** Frames run again: since the last report, and over the one before. */
   private replayed = 0;
   private replayedRecent = 0;
+  /** This member's last inputs sent, for the datagrams. */
+  private readonly sent: [number, Packet][] = [];
   /** This member's controller: the keyboard and first gamepad. */
   input: { buttons: number; axes: Axes } = { buttons: 0, axes: [128, 128, 128, 128] };
 
@@ -422,6 +434,7 @@ export class Session {
     this.inputs.clear();
     this.history.clear();
     this.used.clear();
+    this.sent.length = 0;
     this.lastReal.clear();
     this.remoteFrames.clear();
     this.rollbackFrom = null;
@@ -630,12 +643,16 @@ export class Session {
     switch (kind) {
       case INPUT: {
         const [frame, p] = readPacket(r);
-        if (this.rollback) {
-          if (r.left >= 4) this.remoteFrames.set(from, { frame: r.u32(), at: performance.now() });
-          this.storeLate(from, frame, p);
-        } else if (!this.started || frame >= this.frame) this.store(from, frame, p);
-        // Far behind (the tab was hidden): ask for the state.
-        if (from === this.host && this.started && frame - this.frame > TOO_FAR_BEHIND) this.askForState(this.host, "behind");
+        this.onInput(from, frame, p, r.left >= 4 ? r.u32() : null);
+        break;
+      }
+      case INPUTS: {
+        const at = r.u32();
+        const count = r.u8();
+        for (let k = 0; k < count; k++) {
+          const [frame, p] = readPacket(r);
+          this.onInput(from, frame, p, k === count - 1 ? at : null);
+        }
         break;
       }
       case CHECK: {
@@ -648,6 +665,18 @@ export class Session {
         await this.load(r);
         break;
     }
+  }
+
+  /** An input (over the WebSocket, or in a datagram: the same one may come
+   * twice, the first counts), and its sender's frame then (rollback). */
+  private onInput(from: number, frame: number, p: Packet, at: number | null) {
+    if (this.rollback) {
+      const last = this.remoteFrames.get(from);
+      if (at !== null && (!last || at >= last.frame)) this.remoteFrames.set(from, { frame: at, at: performance.now() });
+      this.storeLate(from, frame, p);
+    } else if (!this.started || frame >= this.frame) this.store(from, frame, p);
+    // Far behind (the tab was hidden): ask for the state.
+    if (from === this.host && this.started && frame - this.frame > TOO_FAR_BEHIND) this.askForState(this.host, "behind");
   }
 
   /** Rollback: an input, maybe for a frame run already on a prediction. */
@@ -888,6 +917,7 @@ export class Session {
 
   /** Sends this member's input for the frames up to `f` + its delay. */
   private sendInputs(f: number) {
+    let sent = false;
     while (this.nextSend <= f + this.delay) {
       const p: Packet = {
         buttons: this.input.buttons,
@@ -902,7 +932,15 @@ export class Session {
       // Rollback: this member's frame, for the others to keep in step.
       if (this.rollback) w.u32(f);
       this.sendBinary(EVERYONE, w.done());
+      this.sent.push([this.nextSend, p]);
+      if (this.sent.length > BUNDLE) this.sent.shift();
       this.nextSend++;
+      sent = true;
+    }
+    if (sent && this.hooks.sendDatagram) {
+      const w = new Writer().u8(EVERYONE).u8(0).u8(INPUTS).u8(this.epoch & 0xff).u32(f).u8(this.sent.length);
+      for (const [frame, p] of this.sent) writePacket(w, frame, p);
+      this.hooks.sendDatagram(w.done());
     }
   }
 

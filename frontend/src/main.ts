@@ -1698,7 +1698,10 @@ function renderPlayer(id: string, biosId: string, roomGame = false, cards: Slots
       }
       renderBar();
     },
-    onNetOut: (data) => room?.send(data),
+    onNetOut: (data, datagram) => {
+      if (!datagram) room?.send(data);
+      else if (typeof data !== "string") room?.sendDatagram(data);
+    },
   });
   onRoomChange = lock;
   lock();

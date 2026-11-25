@@ -20,6 +20,10 @@ pub struct Settings {
     /// ahead with the others' last inputs and go back when they differ
     /// (rollback). Off: lockstep, each frame waits for every input.
     pub netplay_rollback: bool,
+    /// Netplay inputs also go as datagrams (WebTransport, see
+    /// `webtransport`), where the server listens for them: a lost packet no
+    /// longer holds the game back. Members join with it from now on.
+    pub netplay_datagrams: bool,
 }
 
 impl Settings {
@@ -58,8 +62,27 @@ pub async fn load(db: &crate::db::Db) -> anyhow::Result<Settings> {
     Ok(Settings::from_rows(db.settings().await?))
 }
 
+/// The settings, and what the server can do of them (read only).
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Shown {
+    #[serde(flatten)]
+    settings: Settings,
+    /// The server listens for netplay's datagrams (see `webtransport`).
+    datagrams_listening: bool,
+}
+
+fn shown(state: &AppState, settings: Settings) -> Response {
+    Json(Shown {
+        settings,
+        datagrams_listening: state.datagram_port.get().is_some(),
+    })
+    .into_response()
+}
+
 pub async fn get(State(state): State<Arc<AppState>>, _: Admin) -> Response {
-    Json(state.settings.read().await.clone()).into_response()
+    let settings = state.settings.read().await.clone();
+    shown(&state, settings)
 }
 
 pub async fn put(State(state): State<Arc<AppState>>, Admin(admin): Admin, Json(new): Json<Settings>) -> Response {
@@ -73,7 +96,8 @@ pub async fn put(State(state): State<Arc<AppState>>, Admin(admin): Admin, Json(n
         tracing::info!(by = admin.id, settings = ?new, "settings changed");
     }
     *current = new.clone();
-    Json(new).into_response()
+    drop(current);
+    shown(&state, new)
 }
 
 #[cfg(test)]
@@ -82,7 +106,10 @@ mod tests {
 
     #[test]
     fn rows_round_trip_and_bad_ones_are_left_out() {
-        let on = Settings { netplay_rollback: true };
+        let on = Settings {
+            netplay_rollback: true,
+            netplay_datagrams: true,
+        };
         assert_eq!(Settings::from_rows(on.to_rows()), on);
         let rows = vec![
             ("netplayRollback".to_owned(), "\"yes\"".to_owned()),
