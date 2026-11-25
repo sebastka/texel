@@ -62,14 +62,16 @@ export function cardSlots(console: Console, initial: Slots, newName: string | nu
       );
     });
     note.textContent = list.length
-      ? "Saves go to the cards chosen."
+      ? ""
       : newName !== null
         ? "You have no memory card for this console yet: one is created for this game."
         : "You have no memory card for this console yet.";
+    note.hidden = !note.textContent;
   };
   const loaded = api.cards(console).then(fill, (e: unknown) => {
-    note.textContent = `Your memory cards could not be read: ${String(e)}`;
     fill([]);
+    note.textContent = `Your memory cards could not be read: ${String(e)}`;
+    note.hidden = false;
   });
   const element = h(
     "div.card-slots",
@@ -77,7 +79,6 @@ export function cardSlots(console: Console, initial: Slots, newName: string | nu
     h("label", {}, "Memory card 1", menus[0]),
     h("label", {}, "Memory card 2", menus[1]),
     note,
-    h("a.small", { href: `#/cards/${console}` }, "Manage memory cards"),
   );
   return {
     element,

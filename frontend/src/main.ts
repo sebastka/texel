@@ -248,7 +248,6 @@ function header(active: Page | null, ...right: Node[]): DocumentFragment {
         tab("bios", `#/bios/${shownConsole}`, "BIOS"),
         tab("cards", `#/cards/${shownConsole}`, "Memory cards"),
         tab("join", "#/join", "Join"),
-        ...(me.role === "admin" ? [tab("admin", "#/admin", "Admin")] : []),
       ]
     : [tab("join", "#/join", "Join")];
   const account = me
@@ -1308,7 +1307,8 @@ function renderJoin(code: string | undefined) {
             submit();
           },
         },
-        h("label", {}, "Your name", name),
+        // Signed in, the account's name: not asked.
+        me ? null : h("label", {}, "Your name", name),
         h("label", {}, "Room code", input),
         h("button.primary", { type: "submit" }, "Join"),
       ),

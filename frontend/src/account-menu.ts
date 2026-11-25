@@ -91,6 +91,7 @@ export function accountMenu(user: User, signOut: () => void): HTMLElement {
     ),
     entry("Your account", () => (location.hash = "#/account")),
     entry("Memory cards", () => (location.hash = "#/cards")),
+    user.role === "admin" ? entry("Admin", () => (location.hash = "#/admin")) : null,
     entry("Sign out", signOut),
   );
   const root = h("div.account", {}, button, menu);
