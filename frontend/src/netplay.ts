@@ -12,6 +12,18 @@
 // a member whose checksum differs asks it for its state, and loads it.
 // Members joining get the host's state the same way.
 //
+// Rollback rooms (an administrators' setting, see the server's
+// settings.rs) hide the delay rather than wait: each member runs the next
+// frame at once, with the inputs not there yet predicted (each player's
+// last one repeated), and keeps the machine's state before every frame
+// (the core's rewind states). When an input arrives that is not the one
+// predicted, it goes back to that frame and runs the frames since again
+// (their sound is dropped: the predicted frames' was played). It waits
+// only when the oldest frame missing an input is MAX_ROLLBACK frames back,
+// and lets a frame go by now and then when it runs ahead of the others,
+// for corrections to stay short on both sides. Checksums and states sent
+// to others are of frames every input of which is known.
+//
 // Each change of game or host starts an epoch, and messages of earlier
 // ones are dropped. A session lasts one game: the page starts another
 // player for the next. When the host leaves, the member who takes over
@@ -36,6 +48,16 @@ const HISTORY = 600;
 const MAX_DELAY = 15;
 /** Frames behind the host past which a member asks for its state. */
 const TOO_FAR_BEHIND = 600;
+/** Rollback: the most frames run on predicted inputs, the states kept (a
+ * slot each, by frame), and the input delay at most (fewer corrections,
+ * at the cost of the delay it hides). */
+const MAX_ROLLBACK = 8;
+const RING = MAX_ROLLBACK + 2;
+const ROLLBACK_DELAY = 2;
+/** Rollback: frames ahead of the others past which a frame is let go by,
+ * and frames between two. */
+const LEAD = 1.5;
+const IDLE_EVERY = 4;
 /** A guest asks for the host's state again this often until it gets it
  * (the host may still be starting the game), and the host sends it at most
  * this often to one member. */
@@ -111,6 +133,23 @@ class Reader {
     this.at += n;
     return b;
   }
+  get left() {
+    return this.view.byteLength - this.at;
+  }
+}
+
+const NEUTRAL: Omit<Packet, "ports"> = { buttons: 0, axes: [128, 128, 128, 128], analog: false };
+
+const samePacket = (a: Packet, b: Packet) =>
+  a.buttons === b.buttons &&
+  a.analog === b.analog &&
+  a.axes.every((v, i) => v === b.axes[i]) &&
+  JSON.stringify(a.ports) === JSON.stringify(b.ports);
+
+/** Rollback: the inputs a frame ran with, and whose were predicted. */
+interface Used {
+  set: Map<number, Packet>;
+  predicted: Set<number>;
 }
 
 function writePacket(w: Writer, frame: number, p: Packet) {
@@ -192,6 +231,25 @@ export class Session {
   private note: string | undefined;
   /** Split screen, set by the host: display only, not part of the game. */
   private view: SplitView;
+  /** Rollback (see above): the room's mode, for its life. */
+  private readonly rollback: boolean;
+  /** The inputs each frame ran with, by frame. */
+  private readonly used = new Map<number, Used>();
+  /** The first frame some input of which is not known yet (or this.frame):
+   * the states before it and before every frame up to it are final. */
+  private frontier = 0;
+  /** The earliest frame run on an input that turned out otherwise. */
+  private rollbackFrom: number | null = null;
+  /** Each member's last input known, and its frame: the prediction. */
+  private readonly lastReal = new Map<number, [number, Packet]>();
+  /** Each member's frame when it last sent an input, and when it came. */
+  private readonly remoteFrames = new Map<number, { frame: number; at: number }>();
+  private idledAt = 0;
+  /** Checksums sent up to this frame. */
+  private checkedUpTo = -1;
+  /** Frames run again: since the last report, and over the one before. */
+  private replayed = 0;
+  private replayedRecent = 0;
   /** This member's controller: the keyboard and first gamepad. */
   input: { buttons: number; axes: Axes } = { buttons: 0, axes: [128, 128, 128, 128] };
 
@@ -211,6 +269,7 @@ export class Session {
     this.wantedPorts = room.ports;
     this.autoAssigned = room.assigned;
     this.view = room.view;
+    this.rollback = room.rollback;
     this.timers.push(setInterval(() => this.adapt(), 2000));
     this.timers.push(
       setInterval(() => {
@@ -256,7 +315,9 @@ export class Session {
 
   /** Frames to run quickly to catch up with the host (after a pause). */
   get behind(): number {
-    return this.started ? Math.max(0, this.latestHost - MAX_DELAY - 2 - this.frame) : 0;
+    if (!this.started) return 0;
+    const slack = this.rollback ? this.delay + MAX_ROLLBACK : MAX_DELAY + 2;
+    return Math.max(0, this.latestHost - slack - this.frame);
   }
 
   setPorts(ports: Ports) {
@@ -331,6 +392,7 @@ export class Session {
       ports: this.isHost ? this.wantedPorts : this.ports,
       assigned: this.autoAssigned,
       delay: this.started ? this.delay : null,
+      rollback: this.rollback && this.started ? { ahead: this.frame - this.frontier, replayed: this.replayedRecent } : null,
       waitingFor: this.waitingFor,
       view: this.view,
       hidden: this.hiddenHalf,
@@ -347,7 +409,9 @@ export class Session {
     const emu = this.hooks.emu();
     const frameMs = 1000 / (emu?.isPal ? 50 : 60);
     const delay = others.length ? Math.ceil((mine / 2 + Math.max(...others) / 2) / frameMs) + 1 : 1;
-    this.delay = Math.min(MAX_DELAY, Math.max(1, delay));
+    this.delay = Math.min(this.rollback ? ROLLBACK_DELAY : MAX_DELAY, Math.max(1, delay));
+    this.replayedRecent = this.replayed;
+    this.replayed = 0;
     this.report();
   }
 
@@ -357,6 +421,11 @@ export class Session {
     this.started = false;
     this.inputs.clear();
     this.history.clear();
+    this.used.clear();
+    this.lastReal.clear();
+    this.remoteFrames.clear();
+    this.rollbackFrom = null;
+    this.checkedUpTo = -1;
     this.checks.clear();
     this.checkFloor = 0;
     this.latestHost = -1;
@@ -375,6 +444,9 @@ export class Session {
     this.frame = frame;
     this.nextSend = frame;
     this.checkFloor = frame;
+    this.frontier = frame;
+    this.rollbackFrom = null;
+    this.checkedUpTo = frame - 1;
     const me = this.members.get(this.me);
     if (me) me.playing = true;
     this.setState("playing", "");
@@ -510,8 +582,16 @@ export class Session {
     const emu = this.hooks.emu();
     if (!emu || !this.started) return;
     this.sentAt.set(to, performance.now());
-    const frame = this.frame;
-    const state = emu.saveState();
+    let frame = this.frame;
+    let state: Uint8Array;
+    if (this.rollback && this.frontier < this.frame && this.frame - this.frontier < RING) {
+      // Of the last frame every input of which is known (the frames since
+      // ran on predictions), and back to where it was.
+      frame = this.frontier;
+      emu.rewindLoad(frame % RING);
+      state = emu.saveState();
+      this.rerun(emu, frame, false);
+    } else state = emu.saveState();
     const cards = [0, 1].map((slot) => emu.memoryCard(slot) ?? new Uint8Array());
     const pending: [number, number, Packet][] = [];
     for (const [f, set] of this.inputs) if (f >= frame) for (const [id, p] of set) pending.push([id, f, p]);
@@ -537,6 +617,7 @@ export class Session {
     if (!set) this.inputs.set(frame, (set = new Map()));
     if (!set.has(id)) set.set(id, p);
     if (id === this.host && frame > this.latestHost) this.latestHost = frame;
+    if (frame > (this.lastReal.get(id)?.[0] ?? -1)) this.lastReal.set(id, [frame, p]);
   }
 
   private async onBinary(view: DataView) {
@@ -549,7 +630,10 @@ export class Session {
     switch (kind) {
       case INPUT: {
         const [frame, p] = readPacket(r);
-        if (!this.started || frame >= this.frame) this.store(from, frame, p);
+        if (this.rollback) {
+          if (r.left >= 4) this.remoteFrames.set(from, { frame: r.u32(), at: performance.now() });
+          this.storeLate(from, frame, p);
+        } else if (!this.started || frame >= this.frame) this.store(from, frame, p);
         // Far behind (the tab was hidden): ask for the state.
         if (from === this.host && this.started && frame - this.frame > TOO_FAR_BEHIND) this.askForState(this.host, "behind");
         break;
@@ -564,6 +648,124 @@ export class Session {
         await this.load(r);
         break;
     }
+  }
+
+  /** Rollback: an input, maybe for a frame run already on a prediction. */
+  private storeLate(id: number, frame: number, p: Packet) {
+    if (this.started && frame < this.frame - HISTORY) return;
+    this.store(id, frame, p);
+    if (!this.started || frame >= this.frame) return;
+    const used = this.used.get(frame);
+    if (!used?.predicted.has(id)) return;
+    if (samePacket(used.set.get(id)!, p)) {
+      used.predicted.delete(id);
+      return;
+    }
+    if (frame <= this.frame - RING) {
+      // Too far back to go (cannot happen while the window holds).
+      this.askForState(this.authority(frame), "drift");
+      return;
+    }
+    this.rollbackFrom = Math.min(this.rollbackFrom ?? frame, frame);
+  }
+
+  /** Rollback: a member's input at a frame, or its prediction. */
+  private predict(id: number, frame: number, ports: Ports): Packet {
+    const known = this.inputs.get(frame)?.get(id);
+    if (known) return known;
+    const last = this.lastReal.get(id);
+    // A press of Analog is not repeated.
+    return last ? { ...last[1], analog: false } : { ...NEUTRAL, ports };
+  }
+
+  /** Rollback: the inputs frame `f` runs with, known or predicted. */
+  private inputsFor(f: number): Used {
+    const real = this.inputs.get(f);
+    const set = new Map(real ?? []);
+    const predicted = new Set<number>();
+    let host = set.get(this.host);
+    if (!host) {
+      host = this.predict(this.host, f, this.ports);
+      set.set(this.host, host);
+      predicted.add(this.host);
+    }
+    for (const id of owners(host.ports)) {
+      if (set.has(id) || this.members.get(id)?.playing !== true) continue;
+      set.set(id, this.predict(id, f, host.ports));
+      predicted.add(id);
+    }
+    return { set, predicted };
+  }
+
+  /** Rollback: runs frame `f` with the inputs known (or predicted) now,
+   * for real (`live`: shown, heard) or again. */
+  private runAt(emu: Emulator, f: number, live: boolean) {
+    const used = this.inputsFor(f);
+    this.used.set(f, used);
+    this.apply(emu, used.set);
+    if (live) this.hooks.runFrame();
+    else {
+      emu.runFrame();
+      emu.takeAudio();
+    }
+  }
+
+  /** Rollback: runs the frames from `from` to the current one again, the
+   * machine being at `from`'s start (its state kept already). */
+  private rerun(emu: Emulator, from: number, count = true) {
+    for (let f = from; f < this.frame; f++) {
+      if (f > from) emu.rewindSave(f % RING);
+      this.runAt(emu, f, false);
+    }
+    if (count) this.replayed += this.frame - from;
+  }
+
+  /** Rollback: moves the frontier past the frames whose inputs are all
+   * known. A member gone is not waited for: its predictions stand. */
+  private advanceFrontier() {
+    while (this.frontier < this.frame) {
+      const used = this.used.get(this.frontier);
+      if (used) {
+        for (const id of used.predicted) {
+          if (id !== this.host && this.members.get(id)?.playing !== true) used.predicted.delete(id);
+        }
+        if (used.predicted.size) break;
+      }
+      this.frontier++;
+    }
+  }
+
+  /** Rollback: this member runs ahead of the players (by its estimate of
+   * their frame now): let a frame go by, now and then. */
+  private shouldIdle(): boolean {
+    if (this.frame - this.idledAt < IDLE_EVERY) return false;
+    const emu = this.hooks.emu();
+    const frameMs = 1000 / (emu?.isPal ? 50 : 60);
+    const mine = median(this.rtts) ?? 0;
+    const now = performance.now();
+    let lead = -Infinity;
+    for (const id of new Set([this.host, ...owners(this.ports)])) {
+      const r = this.remoteFrames.get(id);
+      if (id === this.me || !r || this.members.get(id)?.playing !== true) continue;
+      const oneWay = (mine + (this.members.get(id)?.rtt ?? mine)) / 2;
+      lead = Math.max(lead, this.frame - (r.frame + (now - r.at + oneWay) / frameMs));
+    }
+    if (lead < LEAD) return false;
+    this.idledAt = this.frame;
+    return true;
+  }
+
+  /** Rollback: sends the checksums of the states now final. */
+  private sendChecks(emu: Emulator, f: number) {
+    const upTo = Math.min(this.frontier, f);
+    for (let k = Math.max(this.checkedUpTo + 1, f - RING + 1); k <= upTo; k++) {
+      if (k % CHECK_EVERY !== 0) continue;
+      const sum = emu.rewindChecksum(k % RING);
+      if (sum === undefined) continue;
+      this.sendBinary(EVERYONE, new Writer().u8(CHECK).u8(this.epoch & 0xff).u32(k).u32(sum).done());
+      this.check(k, this.me, sum);
+    }
+    this.checkedUpTo = Math.max(this.checkedUpTo, upTo);
   }
 
   private askForState(to: number, reason: "behind" | "drift") {
@@ -601,6 +803,10 @@ export class Session {
     this.checks.clear();
     this.checkFloor = frame;
     this.resyncAskedAt = 0;
+    this.used.clear();
+    this.rollbackFrom = null;
+    this.frontier = frame;
+    this.checkedUpTo = frame - 1;
     if (!this.started) {
       this.frame = frame;
       this.nextSend = frame;
@@ -611,6 +817,15 @@ export class Session {
       if (me) me.playing = true;
       this.setState("playing", "");
       this.hooks.onStarted?.();
+      return;
+    }
+    if (this.rollback) {
+      if (frame < this.frame) {
+        emu.rewindSave(frame % RING);
+        this.rerun(emu, frame);
+      } else this.frame = frame;
+      this.nextSend = Math.max(this.nextSend, this.frame);
+      this.flash(`Got the game's state again, at frame ${frame}.`);
       return;
     }
     // Ahead of the state: replay the frames already run on it.
@@ -634,20 +849,8 @@ export class Session {
     const emu = this.hooks.emu();
     if (!this.started || !emu) return false;
     const f = this.frame;
-    while (this.nextSend <= f + this.delay) {
-      const p: Packet = {
-        buttons: this.input.buttons,
-        axes: [...this.input.axes],
-        analog: this.pendingAnalog,
-        ports: this.isHost ? this.wantedPorts : [[], []],
-      };
-      this.pendingAnalog = false;
-      this.store(this.me, this.nextSend, p);
-      const w = new Writer().u8(INPUT).u8(this.epoch & 0xff);
-      writePacket(w, this.nextSend, p);
-      this.sendBinary(EVERYONE, w.done());
-      this.nextSend++;
-    }
+    this.sendInputs(f);
+    if (this.rollback) return this.stepRollback(emu, f);
     const set = this.inputs.get(f);
     const host = set?.get(this.host);
     // Members who left (the room, or the game) send nothing more: their
@@ -683,6 +886,67 @@ export class Session {
     return true;
   }
 
+  /** Sends this member's input for the frames up to `f` + its delay. */
+  private sendInputs(f: number) {
+    while (this.nextSend <= f + this.delay) {
+      const p: Packet = {
+        buttons: this.input.buttons,
+        axes: [...this.input.axes],
+        analog: this.pendingAnalog,
+        ports: this.isHost ? this.wantedPorts : [[], []],
+      };
+      this.pendingAnalog = false;
+      this.store(this.me, this.nextSend, p);
+      const w = new Writer().u8(INPUT).u8(this.epoch & 0xff);
+      writePacket(w, this.nextSend, p);
+      // Rollback: this member's frame, for the others to keep in step.
+      if (this.rollback) w.u32(f);
+      this.sendBinary(EVERYONE, w.done());
+      this.nextSend++;
+    }
+  }
+
+  /** Rollback: corrects the frames run on predictions that were wrong,
+   * then runs the next one unless the oldest input missing is too far
+   * back (or this member runs ahead). False when no frame ran. */
+  private stepRollback(emu: Emulator, f: number): boolean {
+    if (this.rollbackFrom !== null) {
+      const from = this.rollbackFrom;
+      this.rollbackFrom = null;
+      try {
+        emu.rewindLoad(from % RING);
+        this.rerun(emu, from);
+      } catch {
+        this.askForState(this.authority(from), "drift");
+      }
+    }
+    this.advanceFrontier();
+    if (f - this.frontier >= MAX_ROLLBACK) {
+      const now = performance.now();
+      if (!this.stalledSince) this.stalledSince = now;
+      else if (now - this.stalledSince > 500 && this.state === "playing") {
+        this.waitingFor = [...(this.used.get(this.frontier)?.predicted ?? [])].map((id) => this.name(id));
+        this.setState("stalled");
+      }
+      return false;
+    }
+    this.stalledSince = 0;
+    if (this.state === "stalled") {
+      this.waitingFor = [];
+      this.setState("playing");
+    }
+    if (this.shouldIdle()) return false;
+    emu.rewindSave(f % RING);
+    this.sendChecks(emu, f);
+    this.runAt(emu, f, true);
+    this.frame = f + 1;
+    // A frame whose inputs were all known moves the frontier at once.
+    this.advanceFrontier();
+    this.inputs.delete(f - HISTORY);
+    this.used.delete(f - RING);
+    return true;
+  }
+
   /** Sets the controllers from their owners' input. */
   private apply(emu: Emulator, set: Map<number, Packet>) {
     const ports = set.get(this.host)!.ports;
@@ -707,7 +971,7 @@ export class Session {
    * it has a controller, else the owner of the first controller, then of
    * the second, else the host. */
   private authority(frame: number): number {
-    const ports = this.history.get(frame)?.get(this.host)?.ports ?? this.ports;
+    const ports = (this.rollback ? this.used.get(frame)?.set : this.history.get(frame))?.get(this.host)?.ports ?? this.ports;
     const list = owners(ports).filter((id) => this.members.get(id)?.playing);
     return list.includes(this.host) ? this.host : (list[0] ?? this.host);
   }

@@ -58,6 +58,9 @@ export class Room {
   ports: Ports = [[0], []];
   assigned = false;
   view: SplitView = null;
+  /** Members run ahead and go back on a late input (see netplay.ts): the
+   * server's setting when the room was opened. */
+  rollback = false;
   private rtts: number[] = [];
   private readonly timers: ReturnType<typeof setInterval>[] = [];
   private leaving = false;
@@ -118,6 +121,7 @@ export class Room {
       ports: this.ports,
       assigned: this.assigned,
       view: this.view,
+      rollback: this.rollback,
     };
   }
 
@@ -192,6 +196,7 @@ export class Room {
         this.me = Number(msg.you);
         this.host = Number(msg.host);
         this.epoch = Number(msg.epoch);
+        this.rollback = msg.rollback === true;
         this.game = typeof msg.game === "string" ? { game: msg.game, bios: String(msg.bios), codes: (msg.codes as CodeSet | null) ?? null } : null;
         this.ports = [[this.host], []];
         for (const m of msg.members as { id: number; name: string; registered: boolean }[]) {

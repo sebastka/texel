@@ -15,6 +15,7 @@ mod netplay;
 mod openbios;
 mod overrides;
 mod pagecache;
+mod settings;
 mod state;
 mod verify;
 mod zipimage;
@@ -274,7 +275,8 @@ async fn main() -> anyhow::Result<()> {
         anyhow::bail!("OpenID Connect needs both TEXEL_OIDC_ISSUER and TEXEL_OIDC_CLIENT_ID");
     }
     let hashes = db.hashes().await.context("loading hashes")?;
-    let state = Arc::new(state::AppState::new(config.clone(), db, hashes)?);
+    let settings = settings::load(&db).await.context("loading the settings")?;
+    let state = Arc::new(state::AppState::new(config.clone(), db, hashes, settings)?);
     state.load_cached_dats().await;
     {
         let s = state.clone();

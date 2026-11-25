@@ -82,6 +82,10 @@ struct Room {
     next_id: u8,
     members: BTreeMap<u8, Member>,
     chat: VecDeque<Value>,
+    /// Members run ahead and go back when an input differs (rollback),
+    /// rather than wait for every input: the administrators' setting when
+    /// the room was opened, for its whole life.
+    rollback: bool,
 }
 
 struct Member {
@@ -204,6 +208,7 @@ pub async fn host(
     if state.rooms.lock().len() >= MAX_ROOMS {
         return (StatusCode::SERVICE_UNAVAILABLE, "too many rooms").into_response();
     }
+    let rollback = state.settings.read().await.netplay_rollback;
     ws.max_message_size(MAX_MESSAGE).on_upgrade(move |socket| async move {
         let (tx, rx) = mpsc::channel(QUEUE);
         let code = {
@@ -227,6 +232,7 @@ pub async fn host(
                 next_id: 1,
                 members,
                 chat: VecDeque::new(),
+                rollback,
             };
             let _ = room.send(OPENER, text(&welcome(&code, OPENER, &room)));
             rooms.insert(code.clone(), room);
@@ -249,6 +255,7 @@ fn welcome(code: &str, you: u8, room: &Room) -> Value {
         "epoch": room.epoch,
         "members": room.roster(),
         "chat": room.chat,
+        "rollback": room.rollback,
     })
 }
 
@@ -563,6 +570,7 @@ mod tests {
             next_id: 4,
             members: BTreeMap::from([(OPENER, member(true)), (1, member(false)), (3, member(true))]),
             chat: VecDeque::new(),
+            rollback: false,
         };
         assert_eq!(room.successor(), Some(3));
         room.members.remove(&3);

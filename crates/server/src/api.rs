@@ -49,6 +49,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/admin/users/{id}/reset", post(auth::reset_user))
         .route("/admin/invites", get(auth::list_invites).post(auth::create_invite))
         .route("/admin/invites/{id}", axum::routing::delete(auth::delete_invite))
+        .route("/admin/settings", get(crate::settings::get).put(crate::settings::put))
         .route(
             "/cards",
             get(list_cards).post(create_card).layer(DefaultBodyLimit::max(4096)),

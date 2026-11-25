@@ -223,6 +223,13 @@ export function roomBar(a: BarActions): RoomBar {
         {},
         `Playing ${title ?? "a game"}`,
         net.delay !== null ? h("span.muted.small", {}, ` · input delay ${net.delay}`) : null,
+        net.rollback
+          ? h(
+              "span.muted.small",
+              { title: "Frames run on predicted inputs now, and frames run again over the last two seconds (corrections)" },
+              ` · rollback: ${net.rollback.ahead} ahead, ${net.rollback.replayed} replayed`,
+            )
+          : null,
       );
     }
     const heir = room.heir;

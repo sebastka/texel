@@ -21,6 +21,8 @@ pub struct Emulator {
     audio: Vec<i16>,
     /// Room for a picture wrapping around VRAM's edges (see `picture`).
     wrapped: Vec<u16>,
+    /// Netplay's rollback: states kept, by slot (see `rewindSave`).
+    rewinds: Vec<texel_ps1::Rewind>,
     #[cfg(target_arch = "wasm32")]
     gpu: Option<texel_ps1_gpu::GpuRenderer>,
 }
@@ -33,6 +35,7 @@ impl Emulator {
             system: System::new(bios)?,
             audio: Vec::with_capacity(4096),
             wrapped: Vec::new(),
+            rewinds: Vec::new(),
             #[cfg(target_arch = "wasm32")]
             gpu: None,
         })
@@ -211,6 +214,35 @@ impl Emulator {
     #[wasm_bindgen(js_name = saveState)]
     pub fn save_state(&self) -> Vec<u8> {
         self.system.save_state()
+    }
+
+    /// Rollback: keeps the machine as it is now in a slot (a few MB each,
+    /// kept until the emulator goes; quick, between two frames).
+    #[wasm_bindgen(js_name = rewindSave)]
+    pub fn rewind_save(&mut self, slot: usize) {
+        if self.rewinds.len() <= slot {
+            self.rewinds.resize_with(slot + 1, Default::default);
+        }
+        self.system.save_rewind(&mut self.rewinds[slot]);
+    }
+
+    /// Rollback: goes back to the machine kept in a slot. The frames run
+    /// since then were drawn: the scaled renderers draw those run again
+    /// over them.
+    #[wasm_bindgen(js_name = rewindLoad)]
+    pub fn rewind_load(&mut self, slot: usize) -> Result<(), JsError> {
+        let r = self.rewinds.get(slot).ok_or_else(|| JsError::new("no state kept there"))?;
+        self.system.load_rewind(r)?;
+        Ok(())
+    }
+
+    /// A checksum of the machine kept in a slot, as every member of a
+    /// netplay room computes it.
+    #[wasm_bindgen(js_name = rewindChecksum)]
+    pub fn rewind_checksum(&self, slot: usize) -> Option<u32> {
+        let r = self.rewinds.get(slot).filter(|r| r.is_set())?;
+        let h = r.checksum();
+        Some((h ^ (h >> 32)) as u32)
     }
 
     /// Restores a state saved with `saveState`, with the same BIOS.

@@ -121,6 +121,13 @@ impl Default for CdRom {
 }
 
 impl CdRom {
+    /// Rollback (see `Bus::adopt`): the disc, and diagnostics.
+    pub(crate) fn adopt(&mut self, old: &mut CdRom) {
+        self.disc = old.disc.take();
+        self.log = old.log.take();
+        self.xa_counts = old.xa_counts;
+    }
+
     pub fn new() -> Self {
         Self {
             disc: None,

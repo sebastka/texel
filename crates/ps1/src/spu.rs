@@ -228,6 +228,7 @@ impl Voice {
 
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct Spu {
+    #[serde(with = "crate::rewind::big")]
     pub ram: Box<[u8]>,
     #[serde(with = "serde_big_array::BigArray")]
     regs: [u16; 0x200],
@@ -269,6 +270,13 @@ impl Default for Spu {
 }
 
 impl Spu {
+    /// Rollback (see `Bus::adopt`): sound RAM's buffer, and the samples not
+    /// taken yet.
+    pub(crate) fn adopt(&mut self, old: &mut Spu) {
+        self.ram = std::mem::take(&mut old.ram);
+        self.output = std::mem::take(&mut old.output);
+    }
+
     pub fn new() -> Self {
         Self {
             ram: vec![0; SPU_RAM_SIZE].into_boxed_slice(),

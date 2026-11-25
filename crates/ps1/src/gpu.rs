@@ -114,6 +114,7 @@ const DITHER: [[i32; 4]; 4] = [[-4, 0, -3, 1], [2, -2, 3, -1], [-3, 1, -4, 0], [
 
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct Gpu {
+    #[serde(with = "crate::rewind::big")]
     pub vram: Box<[u16]>,
     /// Internal resolution multiplier, and the scaled VRAM (empty at 1).
     #[serde(skip)]
@@ -206,6 +207,21 @@ impl Default for Gpu {
 }
 
 impl Gpu {
+    /// Rollback (see `Bus::adopt`): VRAM's buffer, and what the scaled
+    /// renderers draw with, which carry on (replayed frames are drawn
+    /// again over the ones dropped).
+    pub(crate) fn adopt(&mut self, old: &mut Gpu) {
+        self.vram = std::mem::take(&mut old.vram);
+        self.scale = old.scale;
+        self.hires = std::mem::take(&mut old.hires);
+        self.flips = old.flips;
+        self.record = old.record;
+        self.commands = std::mem::take(&mut old.commands);
+        self.dirty = old.dirty;
+        self.exact = old.exact.take();
+        self.exact_frame = old.exact_frame;
+    }
+
     pub fn new() -> Self {
         let mut gpu = Self {
             vram: vec![0; VRAM_WIDTH * VRAM_HEIGHT].into_boxed_slice(),
