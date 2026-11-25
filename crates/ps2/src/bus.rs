@@ -908,6 +908,9 @@ impl Bus {
             self.regs.insert(base + MADR, next);
             self.regs.insert(base + QWC, qwc - 1);
             if let Some(q) = q {
+                if ch == 2 {
+                    self.gs.dma_source = madr;
+                }
                 let words: [u32; 4] = std::array::from_fn(|k| (q >> (32 * k)) as u32);
                 self.dma_sink(ch, &words, q);
             }

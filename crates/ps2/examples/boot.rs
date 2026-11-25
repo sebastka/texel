@@ -60,6 +60,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ps2.load_state(&std::fs::read(&path)?)?;
         println!("Loaded {path}");
     }
+    // TRANSFERS=1: the GS's transfers, from the start (reported with
+    // DRAWS).
+    if std::env::var("TRANSFERS").is_ok() {
+        ps2.bus.gs.transfer_log = Some(Vec::new());
+    }
     // VU1THREAD=1: VU1 in a thread of its own (see `vu1q`).
     if std::env::var("VU1THREAD").is_ok() {
         let b = &mut ps2.bus;
@@ -674,7 +679,7 @@ fn dump_draws(ps2: &mut Ps2, frames: u64) {
     // The context's changes, and the draws near the origin in the main
     // view's (offset 0x7000) between them.
     let log = ps2.bus.gif.context_log.take().unwrap_or_default();
-    println!("--- FRAME_1 / XYOFFSET_1 writes (path, register, value, at command):");
+    println!("--- FRAME_1 / XYOFFSET_1 / TEX0_1 / TEX2_1 writes (path, register, value, at command):");
     let near = |c: &Command| {
         matches!(c, Command::Draw { regs, vertices, .. }
         if regs.xyoffset & 0xFFFF == 0x7000 && vertices.iter().any(|v| v.x < 0x100 || v.y < 0x100))
@@ -801,6 +806,26 @@ fn dump_draws(ps2: &mut Ps2, frames: u64) {
             println!("CODE {pc:04x} {hi:08x} {lo:08x}");
         }
     }
+    if let Some(log) = &ps2.bus.gs.transfer_log {
+        println!(
+            "--- GS transfers ({}), in order (repeats folded): dir, to (base width format x y w h), \
+             from (base width format), data words (non-zero), the data's EE address (GIF DMA)",
+            log.len()
+        );
+        let mut k = 0;
+        while k < log.len() {
+            let t = log[k];
+            let mut n = 1;
+            while k + n < log.len() && log[k + n] == t {
+                n += 1;
+            }
+            println!(
+                "  {n:4}x dir {} to {:#06x} w{} psm {:#04x} ({},{}) {}x{} from {:#06x} w{} psm {:#04x}: {} words ({} non-zero) at {:#010x}",
+                t[0], t[1], t[2], t[3], t[4], t[5], t[6], t[7], t[8], t[9], t[10], t[11], t[12], t[13]
+            );
+            k += n;
+        }
+    }
     if ps2.bus.vif1.watch.is_some() {
         println!("--- VIF1 writes watched ({}):", ps2.bus.vif1.watched.len());
         for line in &ps2.bus.vif1.watched {
@@ -842,6 +867,37 @@ fn dump_draws(ps2: &mut Ps2, frames: u64) {
         "--- draws over {frames} frames: {} commands, by kind {kinds:?}",
         commands.len()
     );
+    // DRAWSTATE=1: the draws by their state (kind, PRIM's flags, TEX0,
+    // ALPHA, TEST, FRAME), with one vertex of each group.
+    if std::env::var("DRAWSTATE").is_ok() {
+        type State = (u32, u64, u64, u64, u64, u64);
+        let mut groups: std::collections::BTreeMap<State, (usize, Option<texel_ps2::gs::Vertex>)> =
+            std::collections::BTreeMap::new();
+        for c in &commands {
+            if let Command::Draw { kind, regs, vertices } = c {
+                let key = (*kind, regs.prim & 0x7F8, regs.tex0, regs.alpha, regs.test, regs.frame);
+                let g = groups.entry(key).or_insert((0, None));
+                g.0 += 1;
+                if g.1.is_none() {
+                    g.1 = vertices.first().copied();
+                }
+            }
+        }
+        let mut list: Vec<_> = groups.into_iter().collect();
+        list.sort_by_key(|(_, (n, _))| std::cmp::Reverse(*n));
+        println!("--- draws by state ({} states):", list.len());
+        for ((kind, flags, tex0, alpha, test, frame), (n, v)) in list.iter().take(24) {
+            println!(
+                "  {n:5} kind {kind} prim flags {flags:#05x} TEX0 {tex0:#018x} ALPHA {alpha:#012x} TEST {test:#07x} FRAME {frame:#012x}"
+            );
+            if let Some(v) = v {
+                println!(
+                    "        vertex rgba {:?} st {:.3},{:.3} q {:.3} uv {:#x},{:#x}",
+                    v.rgba, v.s, v.t, v.q, v.u, v.v
+                );
+            }
+        }
+    }
     let mut ctx: Vec<_> = contexts.into_iter().collect();
     ctx.sort_by_key(|(_, (n, _))| std::cmp::Reverse(*n));
     for ((frame, off, sc), (n, near)) in ctx.iter().take(14) {
