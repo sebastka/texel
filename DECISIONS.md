@@ -567,3 +567,21 @@ The PS2 used the PlayStation's DualShock, which has no pressures: a game asking 
 - **A DualShock 2 around the DualShock** (`dualshock2.rs`): it answers the commands the DualShock 2 adds in configuration mode (0x40, 0x41: the poll's bytes, 0x4F: choose them) and polls in pressure mode (mode 0x79: the buttons, the sticks, then twelve pressures, those the mask chose), and lets the DualShock see every byte, so rumble, modes and configuration work as before. Setting the mode, or the Analog button, ends pressure mode.
 - **Pressures from the buttons**: 255 pressed, 0 not; keyboards and most gamepads' face buttons have nothing in between. A game reading how hard a button is pressed sees it fully pressed.
 - **Save states**: the DualShock is serialised as before, and the PlayStation's states are unchanged; the PS2's format 3 adds the two masks after the machine, and format 2's states still load, pressures off.
+
+## D72. A USB host controller, with nothing plugged in
+
+A survey of a library of 46 PS2 games (each booted headless for a minute of console time) found ten stopping at the same point: right after loading Sony's USB driver (`USBD.IRX`), for keyboards, cameras, headsets and the like, which they load whether or not one is plugged in. The driver resets the IOP's USB host controller (bit HCR of HcCommandStatus) and waits for the bit to clear; with no controller, the register read back as written, the driver's start never returned, and the game waited for its module forever, showing nothing.
+
+- **An OHCI controller** (`usb.rs`, the Open Host Controller Interface's registers at 0x1F801600, as its specification describes them): a reset done at once, its registers at their defaults; frames counted while it is operational (one a millisecond, the number written to the HCCA as the controller would); its interrupts (start of frame, frame number overflow) raised on the IOP's line 22 when enabled.
+- **Nothing plugged in**: a root hub of two powered ports, no device on either, so the driver queues no transfer and the controller walks no list. A device (a keyboard, say) would need the lists walked; not done.
+- **Save states**: the controller's registers are saved after the machine (format 4), older states load with it reset.
+- **Checked**: the ten games (Ace Combat: Distant Thunder, Enthusia, Kya, Midnight Club II and 3, PES 2009, Yetisports, Killzone, TOCA Race Driver 2 and 3) now get past the driver and run their own code; seven show pictures in their first minute (the others: a movie file not found, a module failing to load, nothing drawn yet: separate causes).
+
+## D73. A fast boot gives the game the browser's system configuration
+
+On a console, the browser (OSDSYS) reads the system configuration (language, screen shape, time zone) from the EEPROM when it starts, and hands it to the kernel (`SetOsdConfigParam`), from which games read it (`GetOsdConfigParam`). A fast boot (D31) goes from EELOAD to the game without the browser: the kernel's configuration stayed zero, which reads as Japanese, and European games that follow the console's language (Jak II, Jak 3) spoke Japanese.
+
+- **After a fast boot**, the EE answers the game's `GetOsdConfigParam` (syscall 0x4B) itself, with the configuration a new console of the BIOS's region has: English outside Japan, Japanese in Japan, 4:3, configuration version 1. A game setting the configuration (`SetOsdConfigParam`) leaves it to the kernel from then on. Booting through the browser is unchanged: the kernel answers.
+- Compiled blocks end at a SYSCALL and leave it to the interpreter, so both run the same.
+- Saved after the machine (format 4).
+- Another language than English (the user's) would be a setting: not yet.

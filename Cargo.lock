@@ -2852,6 +2852,7 @@ dependencies = [
  "texel-disc",
  "texel-ps1",
  "wasmparser",
+ "zip",
 ]
 
 [[package]]

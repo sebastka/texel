@@ -74,6 +74,13 @@ pub struct Ee {
     /// (first and last address, the delay slot included). Running it
     /// changes nothing but time.
     pub idle: Option<(u32, u32)>,
+    /// After a fast boot: the system configuration (language, screen) the
+    /// browser would have given the kernel (`SetOsdConfigParam`), which a
+    /// fast boot skips; the game's `GetOsdConfigParam` gets it rather than
+    /// the kernel's zeros (Japanese). Saved after the machine (see
+    /// `Ps2::save_core`).
+    #[serde(skip)]
+    pub osd_config: Option<u32>,
     /// Instructions not emulated (executed as no-ops): name → count.
     #[serde(skip)]
     pub unimplemented: BTreeMap<&'static str, u64>,
@@ -123,6 +130,7 @@ impl Ee {
             polling: false,
             intc_watch: false,
             idle: None,
+            osd_config: None,
             unimplemented: BTreeMap::new(),
             trace: std::collections::VecDeque::new(),
         }
@@ -325,6 +333,21 @@ impl Ee {
         let imm = i & 0xFFFF;
         let simm = sext16(imm as u16);
         match op {
+            // SYSCALL, after a fast boot: the system configuration.
+            0x00 if i & 0x3F == 0x0C && self.osd_config.is_some() => {
+                match self.r32(3) {
+                    // GetOsdConfigParam(a0): answered here, as the kernel
+                    // would once the browser set it.
+                    0x4B => {
+                        let config = self.osd_config.unwrap_or(0);
+                        return self.store32(bus, self.r32(4), config);
+                    }
+                    // SetOsdConfigParam: the kernel's from now on.
+                    0x4A => self.osd_config = None,
+                    _ => {}
+                }
+                self.special(i, rs, rt, rd, sa);
+            }
             0x00 => self.special(i, rs, rt, rd, sa),
             0x01 => self.regimm(rs, rt, imm),
             0x02 => self.branch((self.pc & 0xF000_0000) | ((i & 0x03FF_FFFF) << 2)),
