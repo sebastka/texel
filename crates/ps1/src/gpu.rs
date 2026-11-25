@@ -1946,11 +1946,14 @@ pub(crate) fn display_rgba(
     let (w, h) = (d.w as usize, d.h as usize);
     let s = if d.depth24 { 1 } else { scale };
     let (ow, oh) = (w * s, h * s);
-    out.clear();
-    out.resize(ow * oh * 4, 0);
+    // Every pixel is written below: cleared only when the size changes.
+    if out.len() != ow * oh * 4 {
+        out.clear();
+        out.resize(ow * oh * 4, 0);
+    }
     if d.off {
         for px in out.as_chunks_mut::<4>().0 {
-            px[3] = 0xff;
+            *px = [0, 0, 0, 0xff];
         }
         return (ow, oh);
     }
@@ -1960,7 +1963,6 @@ pub(crate) fn display_rgba(
         (scaled, VRAM_WIDTH * s)
     };
     let rows = VRAM_HEIGHT * s;
-    let rgba = rgba_table();
     for y in 0..oh {
         let vy = (d.y as usize * s + y) % rows;
         let row = &src[vy * stride..(vy + 1) * stride];
@@ -1978,29 +1980,25 @@ pub(crate) fn display_rgba(
             }
         } else {
             // The row from the display's left edge, wrapping around VRAM
-            // at most once.
+            // at most once (the display is narrower than VRAM).
             let start = (d.x as usize * s) % stride;
-            let (first, wrapped) = row.split_at(start);
-            for (px, &c) in dst.iter_mut().zip(wrapped.iter().chain(first.iter().cycle())) {
-                *px = rgba[usize::from(c & 0x7fff)];
-            }
+            let before_wrap = (stride - start).min(dst.len());
+            let (left, right) = dst.split_at_mut(before_wrap);
+            widen(&row[start..start + before_wrap], left);
+            widen(&row[..right.len()], right);
         }
     }
     (ow, oh)
 }
 
-/// 15-bit colours as RGBA8888 (each 5-bit channel widened to 8 bits).
-fn rgba_table() -> &'static [[u8; 4]; 0x8000] {
-    static TABLE: std::sync::LazyLock<Box<[[u8; 4]; 0x8000]>> = std::sync::LazyLock::new(|| {
-        let e = |v: u16| ((v & 0x1f) << 3 | (v & 0x1f) >> 2) as u8;
-        let mut t = Box::new([[0u8; 4]; 0x8000]);
-        for (c, px) in t.iter_mut().enumerate() {
-            let c = c as u16;
-            *px = [e(c), e(c >> 5), e(c >> 10), 0xff];
-        }
-        t
-    });
-    &TABLE
+/// 15-bit colours as RGBA8888, each 5-bit channel widened to 8 bits (in
+/// 32-bit lanes, without a table: the compiler vectorises it).
+fn widen(src: &[u16], dst: &mut [[u8; 4]]) {
+    for (px, &c) in dst.iter_mut().zip(src) {
+        let c = u32::from(c);
+        let e = |v: u32| ((v & 0x1f) << 3) | ((v & 0x1f) >> 2);
+        *px = (e(c) | (e(c >> 5) << 8) | (e(c >> 10) << 16) | 0xff00_0000).to_le_bytes();
+    }
 }
 
 pub mod replay;
@@ -2015,6 +2013,17 @@ fn rgb24_to_15(c: u32) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn colours_widen_as_the_console_shows_them() {
+        let src: Vec<u16> = (0..=0xffff).collect();
+        let mut dst = vec![[0u8; 4]; src.len()];
+        widen(&src, &mut dst);
+        let e = |v: u16| ((v & 0x1f) << 3 | (v & 0x1f) >> 2) as u8;
+        for (&c, px) in src.iter().zip(&dst) {
+            assert_eq!(*px, [e(c), e(c >> 5), e(c >> 10), 0xff], "{c:04x}");
+        }
+    }
 
     fn draw_area(gpu: &mut Gpu) {
         gpu.gp0(0xe300_0000);
