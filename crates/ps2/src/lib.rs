@@ -21,6 +21,7 @@ pub mod sif;
 pub mod sio2;
 pub mod spu2;
 pub mod timers;
+pub mod usb;
 pub mod vif;
 pub mod vu;
 pub mod vu1q;
@@ -59,11 +60,23 @@ pub struct Ps2 {
     slices: u64,
 }
 
+/// The system configuration (`GetOsdConfigParam`'s word) of a console of
+/// this zone (see `cdvd::ConsoleRegion`), as its browser sets it from a
+/// new console's settings: Japanese in Japan, English elsewhere (bits 16
+/// to 20, and bit 4, the browser's own language), configuration version 1
+/// (bits 13 to 15), 4:3, RGB, SPDIF on, time zone UTC.
+fn osd_config(zone: u8) -> u32 {
+    let english = u32::from(zone != 0);
+    english << 16 | 1 << 13 | english << 4
+}
+
 /// Save states: this tag, the format's version, then the rest (`State`).
 /// Format 3 adds the controllers' pressure masks after the machine (see
-/// `save_core`); format 2's load with them off.
+/// `save_core`), format 4 the USB controller and the system configuration
+/// after a fast boot (`Ee::osd_config`) after them; older formats load with
+/// the masks off, the controller as reset, and no configuration.
 const STATE_MAGIC: &[u8; 8] = b"TEXELPS2";
-const STATE_VERSION: u32 = 3;
+const STATE_VERSION: u32 = 4;
 
 #[derive(serde::Serialize)]
 struct StateRef<'a> {
@@ -138,6 +151,8 @@ impl Ps2 {
         for pad in &self.bus.iop.sio2.pads {
             core.extend_from_slice(&pad.mask.to_le_bytes());
         }
+        core = postcard::to_extend(&(&self.bus.iop.usb, self.ee.osd_config), core)
+            .expect("serialising to memory cannot fail");
         core.extend_from_slice(&fnv1a(&self.bus.bios).to_le_bytes());
         core
     }
@@ -183,6 +198,12 @@ impl Ps2 {
             });
             pad.restore_mask(mask);
         }
+        // Format 4: the USB controller.
+        if let Some(extra) = rest.get(8..).filter(|r| !r.is_empty()) {
+            let (usb, osd): (usb::Ohci, Option<u32>) = postcard::from_bytes(extra).map_err(|e| e.to_string())?;
+            new.bus.iop.usb = usb;
+            new.ee.osd_config = osd;
+        }
         if state.gs_memory.len() != new.bus.gs.mem.words.len() {
             return Err("the GS memory has the wrong size".into());
         }
@@ -223,6 +244,8 @@ impl Ps2 {
         let pc = self.ee.pc & 0x1FFF_FFFF;
         if (EELOAD.end..0x0200_0000).contains(&pc) {
             self.boot = None;
+            // The game runs, without the browser's system configuration.
+            self.ee.osd_config = Some(osd_config(self.bus.iop.cdvd.region.zone));
             return;
         }
         if !EELOAD.contains(&pc) {
@@ -432,10 +455,11 @@ mod tests {
         ps2.bus.ram[0x90700..0x9070C].copy_from_slice(b"rom0:OSDSYS\0");
         ps2.fast_boot();
         assert_eq!(&ps2.bus.ram[0x90700..0x90706], b"cdrom0");
-        // The game runs: done.
+        // The game runs: done, in English (a console of the default region).
         ps2.ee.pc = 0x0010_0008;
         ps2.fast_boot();
         assert!(ps2.boot.is_none());
+        assert_eq!(ps2.ee.osd_config.map(|c| c >> 16 & 0x1F), Some(1));
     }
 
     #[test]

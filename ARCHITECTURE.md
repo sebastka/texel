@@ -126,8 +126,8 @@ Controllers come from the keyboard and the Gamepad API (`input.ts`, `gamepad.ts`
 | Graphics Synthesizer | Software rasteriser (sprites, triangles, lines, textures in every format, CLUTs, blending, depth and alpha tests, fog), transfers both ways, privileged registers; on the GPU through WebGPU: the software GS records what it is asked, `crates/ps2-gpu` draws it (D25, D28, D29) |
 | IPU | MPEG-1/2 decoding (BDEC, IDEC, VDEC, FDEC), colour conversion (CSC, PACK), its DMA channels: movies play (D60) |
 | DMA, INTC, timers | The EE's channels (normal, chain, interleave), interrupt controller (a vertical blank's interrupt waits for the next read of INTC_STAT, D59), four timers |
-| I/O processor | `crates/ps1`'s CPU, with its own memory map, interrupts, six timers and DMA; the SIF between it and the EE (D24) |
-| CDVD | N commands (reads of CD and DVD sectors, the end once DMA has the data, D61), S commands (clock, region, EEPROM), disc changes |
+| I/O processor | `crates/ps1`'s CPU, with its own memory map, interrupts, six timers and DMA; the SIF between it and the EE (D24); a USB host controller (OHCI) with nothing plugged in, for games loading Sony's USB driver (D72) |
+| CDVD | N commands (reads of CD and DVD sectors, the end once DMA has the data, D61), S commands (clock, region, EEPROM), disc changes; after a fast boot, the system configuration the browser would have set (D73) |
 | SPU2 | Two cores of 24 voices (the PS1's SPU's), sound memory, DMA, reverb (D33) |
 | SIO2 | Controllers (DualShock 2, pressure-sensitive buttons included, D71) and memory cards (8 MiB, with ECC; formatted by the server) (D32) |
 | Save states | The whole machine, GS memory included (read back from the GPU) (D34) |
@@ -162,7 +162,7 @@ It prints what the BIOS kernel writes to its debug port (its start-up log) and w
 
 | Variable | |
 |---|---|
-| `DISC=image.iso` (or a raw `.bin`) | Puts a disc in the drive and boots its game directly (`OSD=1`: through the browser instead) |
+| `DISC=image.iso` (or a raw `.bin`, or a zip holding one, unpacked in memory) | Puts a disc in the drive and boots its game directly (`OSD=1`: through the browser instead) |
 | `MC1=card.ps2`, `MC2=…` | Memory cards (created unformatted if missing, saved at the end) |
 | `LOAD=state`, `SAVE=state` | Start from a save state; save one at the end |
 | `PRESS="16:cross,20.5:start"` | Hold buttons for 0.2 s from a time (seconds of console time) |
@@ -174,7 +174,7 @@ It prints what the BIOS kernel writes to its debug port (its start-up log) and w
 | `EXC=1`, `EEREGS=1`, `IOPREGS=1`, `TLB=1` | The EE's last exceptions and system calls; registers; the TLB |
 | `PACKETS=1`, `TAGS=1` | The SIF's commands and DMA tags |
 | `CODE=start,end`, `FIND=imm`, `IOPFIND=imm` | EE memory (hex); EE or IOP loads and stores with that offset |
-| `CDVDCMDS=1`, `CARDLOG=1`, `SIO2TRACE=1` | The drive's commands; the cards'; SIO2's registers |
+| `CDVDCMDS=1`, `CARDLOG=1`, `SIO2TRACE=1`, `USBLOG=1` | The drive's commands; the cards'; SIO2's registers; the USB controller's first accesses |
 | `DRAWS=frames` | What the GS was asked to draw over that many more frames |
 | `PROG=hex`, `FINDXY=x,y` | VU1's runs from there; which GIF path sent a vertex |
 

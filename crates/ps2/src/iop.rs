@@ -33,6 +33,7 @@ pub mod irq {
     pub const TIMER: [u32; 6] = [4, 5, 6, 14, 15, 16];
     pub const VBLANK_END: u32 = 11;
     pub const SIO2: u32 = 17;
+    pub const USB: u32 = crate::usb::IRQ;
 }
 
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
@@ -308,6 +309,10 @@ pub struct IopBus {
     pub cdvd: Cdvd,
     pub sio2: Sio2,
     pub spu2: Spu2,
+    /// The USB host controller. Saved after the machine (see
+    /// `Ps2::save_core`): older states have none.
+    #[serde(skip)]
+    pub usb: crate::usb::Ohci,
     /// IOP cycles into the current second, for the CDVD's clock.
     second_cycles: u64,
     cache_ctrl: u32,
@@ -346,6 +351,7 @@ impl IopBus {
             cdvd: Cdvd::default(),
             sio2: Sio2::default(),
             spu2: Spu2::default(),
+            usb: crate::usb::Ohci::default(),
             second_cycles: 0,
             cache_ctrl: 0,
             regs: BTreeMap::new(),
@@ -391,6 +397,7 @@ impl IopBus {
         if self.cdvd.advance(cycles) {
             self.intc.raise(irq::CDVD);
         }
+        self.usb.advance(cycles, &mut self.ram, &mut self.intc);
         self.pump_cdvd();
         self.second_cycles += cycles;
         if self.second_cycles >= IOP_CLOCK {
@@ -506,6 +513,7 @@ impl IopBus {
         match pa {
             0x1D00_0000..0x1D00_0070 => self.sif.iop_read(pa - 0x1D00_0000),
             0x1F80_8200..0x1F80_8300 => self.sio2.read(pa - 0x1F80_8200),
+            0x1F80_1600..0x1F80_1700 => self.usb.read(pa - 0x1F80_1600),
             0x1F80_1070 => self.intc.stat,
             0x1F80_1074 => self.intc.mask,
             0x1F80_1078 => std::mem::take(&mut self.intc.ctrl),
@@ -571,6 +579,7 @@ impl IopBus {
                 self.sio2.write(pa - 0x1F80_8200, v);
                 self.pump_sio2();
             }
+            0x1F80_1600..0x1F80_1700 => self.usb.write(pa - 0x1F80_1600, v, &mut self.intc),
             // Written 0 to acknowledge.
             0x1F80_1070 => self.intc.stat &= v,
             0x1F80_1074 => self.intc.mask = v,

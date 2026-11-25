@@ -7,9 +7,9 @@
 //! Prints what the BIOS kernel writes to its debug port, then where the
 //! EE is, what it waits for, and what it touched that is not emulated.
 //!
-//! `DISC=image.iso` (or a raw `.bin` of 2352-byte sectors) puts a disc in
-//! the drive and boots its game directly (`OSD=1`: through the browser
-//! instead).
+//! `DISC=image.iso` (or a raw `.bin` of 2352-byte sectors, or a zip holding
+//! one, unpacked in memory) puts a disc in the drive and boots its game
+//! directly (`OSD=1`: through the browser instead).
 //!
 //! `LOAD=state` starts from a save state (with the same BIOS and disc),
 //! `SAVE=state` saves one at the end.
@@ -44,9 +44,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     if let Ok(path) = std::env::var("DISC") {
-        let size = std::fs::metadata(&path)?.len();
-        let layout = texel_disc::Layout::single_file(&path, size).ok_or("not a disc image")?;
-        let medium = texel_disc::Disc::new(layout, Box::new(FileImage(std::fs::File::open(&path)?)) as _);
+        let medium = if path.ends_with(".zip") {
+            let (name, image) = unzip_image(&path)?;
+            let layout = texel_disc::Layout::single_file(&name, image.len() as u64).ok_or("not a disc image")?;
+            texel_disc::Disc::new(layout, Box::new(MemoryImage(image)) as _)
+        } else {
+            let size = std::fs::metadata(&path)?.len();
+            let layout = texel_disc::Layout::single_file(&path, size).ok_or("not a disc image")?;
+            texel_disc::Disc::new(layout, Box::new(FileImage(std::fs::File::open(&path)?)) as _)
+        };
         let cnf = ps2.insert_disc(medium, std::env::var("OSD").is_err())?;
         println!("Disc: {} ({})", cnf.boot, cnf.volume_id);
     }
@@ -482,6 +488,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let peak = sound.iter().map(|s| s.unsigned_abs()).max().unwrap_or(0);
         println!("Sound: {} s, peak {peak}, saved to {path}", sound.len() / 2 / 48_000);
     }
+    // USBLOG=1: the USB controller's first accesses.
+    if std::env::var("USBLOG").is_ok() {
+        println!("USB controller accesses ({}):", ps2.bus.iop.usb.log.len());
+        for (write, offset, v) in &ps2.bus.iop.usb.log {
+            println!("  {} {offset:02X} {v:08X}", if *write { "write" } else { "read " });
+        }
+    }
     println!("SIO2 transfers: {}", ps2.bus.iop.sio2.transfers);
     if std::env::var("SIO2TRACE").is_ok() {
         for (w, off, v) in &ps2.bus.iop.sio2.trace {
@@ -569,6 +582,40 @@ fn write_ppm(path: &std::path::Path, w: usize, h: usize, rgba: &[u8]) -> std::io
 
 /// A disc image file.
 struct FileImage(std::fs::File);
+
+/// A zipped image (Redump's), unpacked: its largest `.iso` or `.bin`.
+fn unzip_image(path: &str) -> Result<(String, Vec<u8>), Box<dyn std::error::Error>> {
+    use std::io::Read;
+    let mut archive = zip::ZipArchive::new(std::fs::File::open(path)?)?;
+    let mut best: Option<(usize, u64, String)> = None;
+    for k in 0..archive.len() {
+        let entry = archive.by_index(k)?;
+        let name = entry.name()?.into_owned();
+        let lower = name.to_ascii_lowercase();
+        if (lower.ends_with(".iso") || lower.ends_with(".bin")) && best.as_ref().is_none_or(|b| entry.size() > b.1) {
+            best = Some((k, entry.size(), name));
+        }
+    }
+    let (k, size, name) = best.ok_or("no .iso or .bin in the zip")?;
+    let mut image = Vec::with_capacity(size as usize);
+    archive.by_index(k)?.read_to_end(&mut image)?;
+    Ok((name, image))
+}
+
+/// An image in memory.
+struct MemoryImage(Vec<u8>);
+
+impl texel_disc::FileReader for MemoryImage {
+    fn read_at(&mut self, _file: usize, offset: u64, buf: &mut [u8]) -> Result<(), texel_disc::ReadError> {
+        let start = usize::try_from(offset).map_err(|_| texel_disc::ReadError::Io("past the end".into()))?;
+        let part = self
+            .0
+            .get(start..start + buf.len())
+            .ok_or_else(|| texel_disc::ReadError::Io("past the end".into()))?;
+        buf.copy_from_slice(part);
+        Ok(())
+    }
+}
 
 impl texel_disc::FileReader for FileImage {
     fn read_at(&mut self, _file: usize, offset: u64, buf: &mut [u8]) -> Result<(), texel_disc::ReadError> {
