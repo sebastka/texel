@@ -101,6 +101,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         ps2.bus.value_watch = Some((v, std::collections::BTreeMap::new()));
     }
+    // SYSCALLS=1: every EE syscall, by number and address (reported with
+    // EXC).
+    if std::env::var("SYSCALLS").is_ok() {
+        ps2.ee.syscalls = Some(Default::default());
+    }
     // TRANSFERS=1: the GS's transfers, from the start (reported with
     // DRAWS).
     if std::env::var("TRANSFERS").is_ok() {
@@ -398,6 +403,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
     }
+    if let Some(log) = &ps2.ee.syscalls {
+        let now = ps2.ee.cycles;
+        for ((n, pc), (count, a0, at)) in log {
+            let ago = (now - at) as f64 / 294_912_000.0;
+            println!(
+                "  syscall {:3} ({n:08X}) at {pc:08X}: {count} times, last a0 {a0:08X}, {ago:.2} s ago",
+                *n as i32
+            );
+        }
+    }
     if std::env::var("EXC").is_ok() {
         for (code, epc, v1, a0) in &ps2.ee.trace {
             if *code != 0 {
@@ -463,6 +478,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "IOP SIF0 ch9 {:08X?}, SIF1 ch10 {:08X?}; DICR {:08X} DICR2 {:08X}",
         d.ch[9], d.ch[10], d.dicr, d.dicr2
     );
+    // Channels still busy (CHCR bit 24): MADR, BCR, CHCR, TADR.
+    for (n, c) in d.ch.iter().enumerate() {
+        if c[2] & 1 << 24 != 0 {
+            println!("IOP DMA ch{n} busy {c:08X?}");
+        }
+    }
     let i = &ps2.bus.iop.intc;
     println!("IOP INTC stat {:08X} mask {:08X} ctrl {:X}", i.stat, i.mask, i.ctrl);
     let raised: Vec<(usize, u64)> = i.counts.iter().copied().enumerate().filter(|(_, n)| *n > 0).collect();

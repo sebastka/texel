@@ -97,7 +97,14 @@ pub struct Ee {
     /// `TRACE_LEN`; syscalls carry their number in v1.
     #[serde(skip)]
     pub trace: std::collections::VecDeque<(u32, u32, u32, u32)>,
+    /// Diagnostics, when on: every syscall by number (v1) and address:
+    /// how many, the last a0, the cycle of the last.
+    #[serde(skip)]
+    pub syscalls: Option<SyscallLog>,
 }
+
+/// See `Ee::syscalls`.
+pub type SyscallLog = BTreeMap<(u32, u32), (u64, u32, u64)>;
 
 const TRACE_LEN: usize = 64;
 
@@ -145,6 +152,7 @@ impl Ee {
             osd_config: None,
             unimplemented: BTreeMap::new(),
             trace: std::collections::VecDeque::new(),
+            syscalls: None,
         }
     }
 
@@ -231,6 +239,13 @@ impl Ee {
         }
         self.trace
             .push_back((e as u32, self.current_pc, self.r32(3), self.r32(4)));
+        if e == Exception::Syscall {
+            let (n, a0, pc, now) = (self.r32(3), self.r32(4), self.current_pc, self.cycles);
+            if let Some(log) = &mut self.syscalls {
+                let entry = log.entry((n, pc)).or_default();
+                *entry = (entry.0 + 1, a0, now);
+            }
+        }
         let c = &mut self.cop0;
         if !c.exl() {
             let epc = if self.in_delay {

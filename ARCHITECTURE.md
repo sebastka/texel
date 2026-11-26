@@ -172,6 +172,7 @@ It prints what the BIOS kernel writes to its debug port (its start-up log) and w
 | `WAV=out.wav` | The sound |
 | `DUMP=1` | The busy loops' instructions and the EE's registers |
 | `EXC=1`, `EEREGS=1`, `IOPREGS=1`, `TLB=1` | The EE's last exceptions and system calls; registers; the TLB |
+| `SYSCALLS=1` | Every EE system call of the run, by number and address: how many, the last `a0`, how long ago the last was |
 | `PACKETS=1`, `TAGS=1` | The SIF's commands and DMA tags |
 | `CODE=start,end`, `IOPFIND=imm` | EE memory (hex); IOP loads and stores with that offset |
 | `CDVDCMDS=1`, `CARDLOG=1`, `SIO2TRACE=1`, `USBLOG=1` | The drive's commands; the cards'; SIO2's registers; the USB controller's first accesses |
