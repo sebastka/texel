@@ -58,6 +58,15 @@ pub struct Ee {
     /// the EE is found polling it (see `note_poll`).
     poll: (u32, u32),
     pub(crate) polling: bool,
+    /// Diagnostics: an instruction to stop at, and the registers the first
+    /// time the interpreter reached it.
+    #[serde(skip)]
+    pub break_at: Option<u32>,
+    /// ...when this register's low word holds this value, if set.
+    #[serde(skip)]
+    pub break_if: Option<(usize, u32)>,
+    #[serde(skip)]
+    pub break_regs: Option<Box<[u128; 32]>>,
     /// An interrupt waits for the next read of INTC_STAT: the EE stops
     /// right after it (as when polling), and the interrupt is taken there.
     #[serde(skip)]
@@ -118,6 +127,9 @@ impl Ee {
             pc: RESET_VECTOR,
             next_pc: RESET_VECTOR + 4,
             current_pc: RESET_VECTOR,
+            break_at: None,
+            break_if: None,
+            break_regs: None,
             delay_pending: false,
             in_delay: false,
             cop0: Cop0::new(),
@@ -301,6 +313,12 @@ impl Ee {
     /// Executes one instruction.
     pub fn step(&mut self, bus: &mut Bus) {
         self.current_pc = self.pc;
+        if self.break_at == Some(self.pc)
+            && self.break_regs.is_none()
+            && self.break_if.is_none_or(|(r, v)| self.gpr[r] as u32 == v)
+        {
+            self.break_regs = Some(Box::new(self.gpr));
+        }
         self.in_delay = self.delay_pending;
         self.delay_pending = false;
         let instr = match self.cop0.translate(self.pc, false) {
@@ -680,11 +698,13 @@ impl Ee {
     }
     fn store8(&mut self, bus: &mut Bus, va: u32, v: u8) -> Option<()> {
         let pa = self.data_addr(va, true)?;
+        bus.store_pc = self.current_pc;
         bus.write8(pa, v);
         Some(())
     }
     fn store16(&mut self, bus: &mut Bus, va: u32, v: u16) -> Option<()> {
         let pa = self.data_addr(va, true)?;
+        bus.store_pc = self.current_pc;
         bus.write16(pa, v);
         Some(())
     }
@@ -696,11 +716,13 @@ impl Ee {
     }
     fn store64(&mut self, bus: &mut Bus, va: u32, v: u64) -> Option<()> {
         let pa = self.data_addr(va, true)?;
+        bus.store_pc = self.current_pc;
         bus.write64(pa, v);
         Some(())
     }
     fn store128(&mut self, bus: &mut Bus, va: u32, v: u128) -> Option<()> {
         let pa = self.data_addr(va, true)?;
+        bus.store_pc = self.current_pc;
         bus.write128(pa, v);
         Some(())
     }

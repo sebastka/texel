@@ -173,7 +173,7 @@ It prints what the BIOS kernel writes to its debug port (its start-up log) and w
 | `DUMP=1` | The busy loops' instructions and the EE's registers |
 | `EXC=1`, `EEREGS=1`, `IOPREGS=1`, `TLB=1` | The EE's last exceptions and system calls; registers; the TLB |
 | `PACKETS=1`, `TAGS=1` | The SIF's commands and DMA tags |
-| `CODE=start,end`, `FIND=imm`, `IOPFIND=imm` | EE memory (hex); EE or IOP loads and stores with that offset |
+| `CODE=start,end`, `IOPFIND=imm` | EE memory (hex); IOP loads and stores with that offset |
 | `CDVDCMDS=1`, `CARDLOG=1`, `SIO2TRACE=1`, `USBLOG=1` | The drive's commands; the cards'; SIO2's registers; the USB controller's first accesses |
 | `DRAWS=frames` | What the GS was asked to draw over that many more frames, and the writes of FRAME, XYOFFSET, TEX0 and TEX2 by GIF path |
 | `PROG=hex`, `FINDXY=x,y` | VU1's runs from there; which GIF path sent a vertex |
@@ -181,6 +181,10 @@ It prints what the BIOS kernel writes to its debug port (its start-up log) and w
 | `CDVDREADS=1` | Every drive command, in order with the drive's DMA, the SIF0 transfers and the SPU2's DMA |
 | `IPUTRACE=path`, `IPUWATCH=hex,…` | The IPU's input stream (`path.bin`), its commands with their bits and frames (`path.txt`), and channel 4's sources, tags, starts and stops, with the IPU's commands, each with the EE instruction that wrote it (`path.src`), and the writes to those lines of 64 bytes |
 | `TRANSFERS=1`, `DRAWSTATE=1` (with `DRAWS`) | The GS's transfers from the start, in order (destination, format, size, how much data was not zero, its EE address); the draws by state (kind, TEX0, TEX1, ALPHA, TEST, FRAME), with their first vertices |
+| `VALUEWATCH=hex` | The EE instructions storing that 32-bit value, and where |
+| `BREAK=pc`, `BREAKIF=reg=hex` | The EE's registers the first time it reaches that instruction (when that register holds that value) |
+| `TAGWATCH=ch,from,to` (hex) | The chain tags that DMA channel reads in that range, or that point into it |
+| `FIND=imm` (hex) | Loads, stores, LUI, ADDIU and ORI with that immediate, in all of EE RAM |
 | `TEXDUMP=TEX0` (hex) | That texture as it is in GS memory, at the end (`texture.pgm`: indices; `texture.ppm`: colours), and its first texels' raw values |
 
 The GS on the GPU (`crates/ps2-gpu`, with wgpu: Vulkan, Metal or DirectX 12 natively, WebGPU in browsers) is checked against the software GS: `cargo run --release -p texel-ps2-gpu --example compare -- PS2-BIOS [SECONDS] [OUT_DIR]` boots a BIOS with both and prints, every second, how many GS memory words differ (`PAGES=1`: by page), writing both displayed frames (`GPU_ONLY=1`: the GPU alone, to measure it; it takes `DISC`, `MC1` and `PRESS` too). Its tests (`cargo test -p texel-ps2-gpu`) draw with both and compare the whole GS memory; without a GPU, they pass and say so.

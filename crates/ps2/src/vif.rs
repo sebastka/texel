@@ -117,6 +117,11 @@ pub struct Vif {
     written: u32,
     /// An interrupt was asked for (a code with its IRQ bit).
     pub irq: bool,
+    /// STAT's INT: a code with its IRQ bit was met, until FBRST's STC (or
+    /// RST) clears it. Games' interrupt handlers check it. Not in save
+    /// states (their format is positional): handlers clear it at once.
+    #[serde(skip)]
+    pub int: bool,
     /// Microprograms started, for diagnostics.
     pub calls: u64,
     /// VIF1's MSKPATH3: path 3 masked (GIF_STAT's M3P). Not in save
@@ -154,6 +159,7 @@ impl Vif {
             addr: 0,
             written: 0,
             irq: false,
+            int: false,
             calls: 0,
             mask_path3: false,
             watch: None,
@@ -271,6 +277,7 @@ impl Vif {
         let imm = w & 0xFFFF;
         if w & (1 << 31) != 0 {
             self.irq = true;
+            self.int = true;
         }
         match cmd {
             0x00 => {}

@@ -106,6 +106,13 @@ impl Mch {
     }
 }
 
+/// `Bus::value_watch`: the value, and its stores by EE instruction: PC →
+/// (last address, count).
+pub type ValueWatch = (u32, BTreeMap<u32, (u32, u64)>);
+
+/// `Bus::tag_watch`: the channel, the range, and the tags read: (TADR, tag).
+pub type TagWatch = (u32, u32, u32, Vec<(u32, u64)>);
+
 /// `Bus::ipu_sources`: the log, (quadwords taken, address, kind and
 /// values) entries; the quadwords taken so far; the next address.
 pub type IpuSources = (Vec<(u64, u32, u64)>, u64, u32);
@@ -191,10 +198,18 @@ pub struct Bus {
     /// (taken, address, low 32 bits | 1 << 61).
     #[serde(skip)]
     pub ipu_watch: Vec<u32>,
-    /// The EE instruction of the last word stored (by the interpreter), for
+    /// The EE instruction of the last store (by the interpreter), for
     /// diagnostics.
     #[serde(skip)]
     pub store_pc: u32,
+    /// Diagnostics: a 32-bit value whose stores (in any word of the data)
+    /// are counted by EE instruction: PC → (last address, count).
+    #[serde(skip)]
+    pub value_watch: Option<ValueWatch>,
+    /// Diagnostics: a channel and an address range; the chain tags it reads
+    /// there, or pointing there: (TADR, tag), the first 4096.
+    #[serde(skip)]
+    pub tag_watch: Option<TagWatch>,
 }
 
 impl Bus {
@@ -255,6 +270,8 @@ impl Bus {
             ipu_sources: None,
             ipu_watch: Vec::new(),
             store_pc: 0,
+            value_watch: None,
+            tag_watch: None,
         }
     }
 
@@ -376,6 +393,13 @@ impl Bus {
 
     pub fn write<const N: usize>(&mut self, pa: u32, data: [u8; N]) {
         let pa = pa & !(N as u32 - 1);
+        if let Some((value, hits)) = &mut self.value_watch
+            && N >= 4
+            && data.as_chunks::<4>().0.iter().any(|w| u32::from_le_bytes(*w) == *value)
+        {
+            let hit = hits.entry(self.store_pc).or_insert((0, 0));
+            *hit = (pa, hit.1 + 1);
+        }
         if self.ipu_watch.iter().any(|&w| pa.wrapping_sub(w) < 64)
             && let Some((log, taken, _)) = &mut self.ipu_sources
         {
@@ -599,6 +623,9 @@ impl Bus {
                 stat
             }
             SIO_ISR => 0,
+            // The VIFs' STAT: INT (bit 11) after a code with its IRQ bit.
+            VIF0_STAT => self.regs.get(&pa).copied().unwrap_or(0) | u32::from(self.vif0.int) << 11,
+            VIF1_STAT => self.regs.get(&pa).copied().unwrap_or(0) | u32::from(self.vif1.int) << 11,
             IPU_CMD => self.ipu.read_cmd().0,
             IPU_CMD_HI => u32::from(self.ipu.read_cmd().1) << 31,
             IPU_CTRL => self.ipu.read_ctrl(),
@@ -629,6 +656,14 @@ impl Bus {
     fn hw_write32(&mut self, pa: u32, value: u32) {
         match pa {
             0x1000_0000..0x1000_2000 => self.timers.write(pa - 0x1000_0000, value),
+            // FBRST: STC (cancel a stall) and RST clear STAT's INT.
+            VIF0_FBRST | VIF1_FBRST if value & 0b1001 != 0 => {
+                if pa == VIF0_FBRST {
+                    self.vif0.int = false;
+                } else {
+                    self.vif1.int = false;
+                }
+            }
             IPU_CMD => {
                 if let Some((log, taken, _)) = &mut self.ipu_sources {
                     let busy = u64::from(self.ipu.busy());
@@ -777,6 +812,10 @@ const TADR: u32 = 0x30;
 
 const IPU_FROM: u32 = 0x1000_B000;
 const IPU_TO: u32 = 0x1000_B400;
+const VIF0_STAT: u32 = 0x1000_3800;
+const VIF0_FBRST: u32 = 0x1000_3810;
+const VIF1_STAT: u32 = 0x1000_3C00;
+const VIF1_FBRST: u32 = 0x1000_3C10;
 const IPU_CMD: u32 = 0x1000_2000;
 const IPU_CMD_HI: u32 = 0x1000_2004;
 const IPU_CTRL: u32 = 0x1000_2010;
@@ -982,6 +1021,12 @@ impl Bus {
             && let Some((log, taken, _)) = &mut self.ipu_sources
         {
             log.push((*taken, tadr, lo));
+        }
+        if let Some((wch, from, to, log)) = &mut self.tag_watch {
+            let addr = (lo >> 32) as u32 & 0x7FFF_FFFF;
+            if ch == *wch && ((*from..*to).contains(&tadr) || (*from..*to).contains(&addr)) && log.len() < 4096 {
+                log.push((tadr, lo));
+            }
         }
         let qwc = (lo & 0xFFFF) as u32;
         let id = ((lo >> 28) & 7) as u32;
@@ -1275,6 +1320,19 @@ fn is_known_register(pa: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A VIF1 code with its IRQ bit sets STAT's INT, which FBRST's STC
+    /// clears (Tekken 5's VIF1 handler checks it before resuming the GIF).
+    #[test]
+    fn vif_stat_int_until_stc() {
+        let mut bus = Bus::new(&[]);
+        assert_eq!(bus.read32(VIF1_STAT) & (1 << 11), 0);
+        // NOP with the IRQ bit, through VIF1's FIFO.
+        bus.write128(0x1000_5000, 0x8000_0000);
+        assert_ne!(bus.read32(VIF1_STAT) & (1 << 11), 0);
+        bus.write32(VIF1_FBRST, 1 << 3);
+        assert_eq!(bus.read32(VIF1_STAT) & (1 << 11), 0);
+    }
 
     /// PAL timing once the game sets the CRTC's SYNCV for it (625
     /// half-lines a field): 50 frames a second, rather than 60 (GTA III's

@@ -673,3 +673,12 @@ The GS filters textures as TEX1 says: the level of detail is K (LCM set) or log2
 - **Mipmaps** are not drawn: MMIN's mipmapping modes filter the base level as their names say (linear or nearest).
 - **The GPU GS filters the same way** (TEX1's fields travel in the primitive's flags word). Both floor the weights' coordinates with a slack of 1/64 of a sixteenth, so that a coordinate a hair under a sixteenth by float rounding (f32 on the GPU, f64 in software) weighs the same in both.
 - **Checked**: a test magnifying a two-texel texture both ways; the GPU tests draw filtered sprites (magnified and shrunk) and a triangle whose Q varies (both filters), memories equal to the software GS's.
+
+## D85. VIF STAT's INT bit
+
+A VIFcode with its IRQ bit sets STAT's INT (bit 11) as well as raising the VIF's interrupt; FBRST's STC (or RST) clears it. Texel raised the interrupt only. Tekken 5 builds its GS uploads as DMA chains that the GIF runs after a pause: the chain stops at a tag asking for an interrupt and goes on once two callbacks have each set a flag, the GIF's (its DMA interrupt) and VIF1's. VIF1's callback sets its flag only if VIF1's STAT has INT: it never did, the GIF never went on, and the uploads queued after the pause (its dialogs' font and palette) never reached the GS: the dialogs were empty boxes.
+
+- **STAT's INT** is set by a code with its IRQ bit, read in VIF0's and VIF1's STAT, cleared by FBRST's STC or RST. Not in save states (their format is positional; handlers clear it at once).
+- **The stall is not emulated**: on the console, VIF1 waits after such a code until STC; here it goes on.
+- **Checked**: a test of INT and STC; Tekken 5's memory card dialog uploads its font every frame and shows its text (part of it garbled: the game's own glyph coordinates, both GSes drawing it the same).
+- Found with a value watch (the EE instruction storing a value), a breakpoint printing the EE's registers, and the chain tags a channel reads (`VALUEWATCH`, `BREAK`/`BREAKIF`, `TAGWATCH` in the boot example), and reading the game's code there.

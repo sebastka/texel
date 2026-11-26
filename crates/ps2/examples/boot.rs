@@ -76,6 +76,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .filter_map(|a| u32::from_str_radix(a, 16).ok())
             .collect();
     }
+    // BREAK=pc: the EE's registers the first time it reaches that
+    // instruction (interpreted); BREAKIF=reg=hex: when that register's low
+    // word holds that value.
+    ps2.ee.break_if = std::env::var("BREAKIF").ok().and_then(|v| {
+        let (r, x) = v.split_once('=')?;
+        Some((r.parse().ok()?, u32::from_str_radix(x, 16).ok()?))
+    });
+    ps2.ee.break_at = std::env::var("BREAK")
+        .ok()
+        .and_then(|v| u32::from_str_radix(&v, 16).ok());
+    // TAGWATCH=ch,from,to (hex): the chain tags that channel reads in that
+    // range of addresses, or that point into it.
+    if let Ok(v) = std::env::var("TAGWATCH") {
+        let p: Vec<u32> = v.split(',').filter_map(|x| u32::from_str_radix(x, 16).ok()).collect();
+        if let [ch, from, to] = p[..] {
+            ps2.bus.tag_watch = Some((ch, from, to, Vec::new()));
+        }
+    }
+    // VALUEWATCH=hex: the EE instructions storing that 32-bit value.
+    if let Some(v) = std::env::var("VALUEWATCH")
+        .ok()
+        .and_then(|v| u32::from_str_radix(&v, 16).ok())
+    {
+        ps2.bus.value_watch = Some((v, std::collections::BTreeMap::new()));
+    }
     // TRANSFERS=1: the GS's transfers, from the start (reported with
     // DRAWS).
     if std::env::var("TRANSFERS").is_ok() {
@@ -293,8 +318,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         for a in (0..0x0200_0000u32).step_by(4) {
             let w = ps2.bus.read32(a);
-            // Loads and stores (LW, SW), LUI, ADDIU and ORI with that immediate.
-            if w & 0xFFFF == imm && matches!(w >> 26, 0x23 | 0x2B | 0x0F | 0x09 | 0x0D) {
+            // Loads and stores (any width), LUI, ADDIU and ORI with that
+            // immediate.
+            if w & 0xFFFF == imm && matches!(w >> 26, 0x09 | 0x0D | 0x0F | 0x1A..=0x1F | 0x20..=0x3F) {
                 println!("  {:08X}: {w:08X} op {:02X}", 0x8000_0000 | a, w >> 26);
             }
         }
@@ -478,6 +504,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ipu.busy(),
         ipu.output.len()
     );
+    if let (Some(pc), Some(regs)) = (ps2.ee.break_at, &ps2.ee.break_regs) {
+        println!("Registers at {pc:08X}:");
+        for (k, r) in regs.iter().enumerate() {
+            print!("r{k}={:X}{}", *r as u64, if k % 8 == 7 { "\n" } else { " " });
+        }
+    }
+    if let Some((ch, from, to, log)) = &ps2.bus.tag_watch {
+        println!("Channel {ch}'s tags in or into {from:08X}-{to:08X} ({}):", log.len());
+        for (tadr, tag) in log.iter().take(4096) {
+            let id = (tag >> 28) & 7;
+            println!(
+                "  at {tadr:08X}: {tag:016X} (id {id}, qwc {}, to {:08X})",
+                tag & 0xFFFF,
+                tag >> 32
+            );
+        }
+    }
+    if let Some((v, hits)) = &ps2.bus.value_watch {
+        println!("Stores of {v:#010x}, by EE instruction:");
+        for (pc, (pa, n)) in hits {
+            println!("  {pc:08X}: {n} times, last at {pa:08X}");
+        }
+    }
     // TEXDUMP=TEX0 (hex): that texture as it is in GS memory, to texture.pgm
     // (4- and 8-bit indices, scaled to grey) or texture.ppm (colours).
     if let Some(tex0) = std::env::var("TEXDUMP")
