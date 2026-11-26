@@ -211,3 +211,51 @@ fn a_state_reads_back_and_restores() {
         "the restored GPU draws otherwise"
     );
 }
+
+/// A filtered (TEX1: MMAG and MMIN linear) 8×8 CT32 texture at page 4.
+fn filtered_texture(gs: &mut Gs) {
+    let texels: Vec<u64> = (0..32u64)
+        .map(|i| (0x8000_0000 | (i * 0x0507_0B0D)) | ((0x8000_0000 | (i * 0x0D0B_0705 + 0x40_2010)) << 32))
+        .collect();
+    upload(gs, 128, psm::CT32, 8, 8, &texels);
+    gs.write_reg(
+        reg::TEX0_1,
+        128 | (1 << 14) | (3 << 26) | (3 << 30) | (1 << 34) | (1 << 35),
+    );
+    gs.write_reg(reg::TEX1_1, (1 << 5) | (1 << 6));
+}
+
+#[test]
+fn bilinear_sprites() {
+    let mut gs = gs();
+    filtered_texture(&mut gs);
+    // Magnified (UV), then shrunk.
+    gs.write_reg(reg::PRIM, 6 | (1 << 4) | (1 << 8));
+    gs.write_reg(reg::UV, uv(0, 0));
+    gs.write_reg(reg::XYZ2, xyz(0, 0));
+    gs.write_reg(reg::UV, uv(8, 8));
+    gs.write_reg(reg::XYZ2, xyz(40, 30));
+    gs.write_reg(reg::UV, uv(0, 0));
+    gs.write_reg(reg::XYZ2, xyz(44, 34));
+    gs.write_reg(reg::UV, uv(8, 8));
+    gs.write_reg(reg::XYZ2, xyz(48, 38));
+    check(gs);
+}
+
+#[test]
+fn bilinear_triangle() {
+    let mut gs = gs();
+    filtered_texture(&mut gs);
+    // STQ, its Q varying: both filters by level of detail.
+    gs.write_reg(reg::PRIM, 3 | (1 << 4));
+    for (x, y, s, t, q) in [
+        (2u32, 40u32, 0.0f32, 0.0f32, 1.0f32),
+        (60, 42, 2.0, 0.0, 2.0),
+        (30, 63, 0.5, 4.0, 4.0),
+    ] {
+        gs.write_reg(reg::ST, u64::from(s.to_bits()) | (u64::from(t.to_bits()) << 32));
+        gs.write_reg(reg::RGBAQ, 0x8080_8080 | (u64::from(q.to_bits()) << 32));
+        gs.write_reg(reg::XYZ2, xyz(x, y));
+    }
+    check(gs);
+}

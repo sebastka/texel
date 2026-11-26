@@ -38,6 +38,10 @@ struct Texture {
     min_linear: bool,
 }
 
+/// Bilinear filtering's weights are sixteenths of a texel: coordinates
+/// within this much under one count as on it (gs.wgsl has the same).
+const SIXTEENTH_SLACK: f64 = 1.0 / 64.0;
+
 /// The drawing environment of a primitive.
 struct Env {
     iip: bool,
@@ -425,9 +429,11 @@ impl Gs {
             return self.texel(tex, u.floor() as i32, v.floor() as i32);
         }
         // Bilinear: the four texels around (u - 0.5, v - 0.5), weighted
-        // with 4 fractional bits.
-        let fu = ((u - 0.5) * 16.0).floor() as i32;
-        let fv = ((v - 0.5) * 16.0).floor() as i32;
+        // with 4 fractional bits; a coordinate a hair under a sixteenth
+        // (float rounding) counts as on it, so that the GPU GS, in f32,
+        // weighs the same.
+        let fu = ((u - 0.5) * 16.0 + SIXTEENTH_SLACK).floor() as i32;
+        let fv = ((v - 0.5) * 16.0 + SIXTEENTH_SLACK).floor() as i32;
         let (u0, v0, a, b) = (fu >> 4, fv >> 4, (fu & 15) as u32, (fv & 15) as u32);
         let t00 = self.texel(tex, u0, v0);
         let t10 = self.texel(tex, u0 + 1, v0);

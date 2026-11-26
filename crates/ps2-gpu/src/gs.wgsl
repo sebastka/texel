@@ -221,7 +221,7 @@ const REG_CLAMP_HI: u32 = 58u;
 const REG_TEXA: u32 = 59u;
 const REG_TA1: u32 = 60u;
 const REG_FOGCOL: u32 = 61u;
-const REG_FLAGS: u32 = 62u;  // bit 0: FBA, bit 1: COLCLAMP
+const REG_FLAGS: u32 = 62u;  // bit 0: FBA, bit 1: COLCLAMP; TEX1: 8 LCM, 9-10 L, 11 MMAG, 12-14 MMIN, 16-27 K
 const REG_CLUT: u32 = 63u;   // the CLUT slot
 
 fn pw(p: u32, i: u32) -> u32 { return prims[p * PRIM_WORDS + i]; }
@@ -343,9 +343,45 @@ fn texel(p: u32, uu: i32, vv: i32) -> vec4<u32> {
     return vec4<u32>(c & 0xFFu, (c >> 8u) & 0xFFu, (c >> 16u) & 0xFFu, c >> 24u);
 }
 
+// Whether a texel at that Q is filtered (bilinear), as TEX1 says: the
+// level of detail decides between the magnifying and the minifying filter.
+fn linear(p: u32, q: f32) -> bool {
+    let f = pw(p, REG_FLAGS);
+    let k = f32(i32(((f >> 16u) & 0xFFFu) << 20u) >> 20u) / 16.0;
+    var lod = k;
+    if (((f >> 8u) & 1u) == 0u) {
+        lod = log2(1.0 / abs(q)) * f32(1u << ((f >> 9u) & 3u)) + k;
+    }
+    if (lod <= 0.0) { return ((f >> 11u) & 1u) != 0u; }
+    let mmin = (f >> 12u) & 7u;
+    return mmin == 1u || mmin == 4u || mmin == 5u;
+}
+
+// The texel at (u, v), filtered or not (draw.rs's sample).
+fn sample(p: u32, tc: vec3<f32>) -> vec4<u32> {
+    if (!linear(p, tc.z)) {
+        return texel(p, i32(floor(tc.x)), i32(floor(tc.y)));
+    }
+    // The four texels around (u - 0.5, v - 0.5), weighted in sixteenths;
+    // a hair under a sixteenth counts as on it (draw.rs's SIXTEENTH_SLACK).
+    let fu = i32(floor((tc.x - 0.5) * 16.0 + 0.015625));
+    let fv = i32(floor((tc.y - 0.5) * 16.0 + 0.015625));
+    let u0 = fu >> 4u;
+    let v0 = fv >> 4u;
+    let a = u32(fu & 15);
+    let b = u32(fv & 15);
+    let t00 = texel(p, u0, v0);
+    let t10 = texel(p, u0 + 1, v0);
+    let t01 = texel(p, u0, v0 + 1);
+    let t11 = texel(p, u0 + 1, v0 + 1);
+    let top = t00 * (16u - a) + t10 * a;
+    let bottom = t01 * (16u - a) + t11 * a;
+    return (top * (16u - b) + bottom * b) >> vec4<u32>(8u);
+}
+
 // --- The pixel pipeline (draw.rs's fragment) ------------------------------------
 
-fn shade(p: u32, x: u32, y: u32, z_in: u32, color: vec4<u32>, tc: vec2<f32>, fog_in: u32) {
+fn shade(p: u32, x: u32, y: u32, z_in: u32, color: vec4<u32>, tc: vec3<f32>, fog_in: u32) {
     let prim = pw(p, REG_PRIM);
     let fge = ((prim >> 5u) & 1u) != 0u;
     let abe = ((prim >> 6u) & 1u) != 0u;
@@ -355,7 +391,7 @@ fn shade(p: u32, x: u32, y: u32, z_in: u32, color: vec4<u32>, tc: vec2<f32>, fog
     var b = color.z;
     var a = color.w;
     if (tme) {
-        let t = texel(p, i32(floor(tc.x)), i32(floor(tc.y)));
+        let t = sample(p, tc);
         let t1 = pw(p, REG_TEX0_HI);
         let tcc = ((t1 >> 2u) & 1u) != 0u;
         let tfx = (t1 >> 3u) & 3u;
@@ -529,10 +565,10 @@ fn draw(@builtin(global_invocation_id) id: vec3<u32>) {
             let f = pw(p, 47u);
             color = vec4<u32>(f & 0xFFu, (f >> 8u) & 0xFFu, (f >> 16u) & 0xFFu, f >> 24u);
         }
-        var tc = vec2<f32>(0.0);
+        var tc = vec3<f32>(0.0, 0.0, 1.0);
         if ((pw(p, REG_PRIM) & 16u) != 0u) {
             if ((pw(p, REG_PRIM) & 0x100u) != 0u) {
-                tc = vec2<f32>(plane(p, 8u, i, j) / 16.0, plane(p, 9u, i, j) / 16.0);
+                tc = vec3<f32>(plane(p, 8u, i, j) / 16.0, plane(p, 9u, i, j) / 16.0, 1.0);
             } else {
                 var q = plane(p, 7u, i, j);
                 if (q == 0.0) { q = 1.0; }
@@ -540,7 +576,7 @@ fn draw(@builtin(global_invocation_id) id: vec3<u32>) {
                 let t1 = pw(p, REG_TEX0_HI);
                 let w = f32(1u << min(field(t0, 26u, 4u), 10u));
                 let h = f32(1u << min(field(t0, 30u, 2u) | (field(t1, 0u, 2u) << 2u), 10u));
-                tc = vec2<f32>(plane(p, 5u, i, j) / q * w, plane(p, 6u, i, j) / q * h);
+                tc = vec3<f32>(plane(p, 5u, i, j) / q * w, plane(p, 6u, i, j) / q * h, q);
             }
         }
         let fog = u32(max(plane(p, 10u, i, j), 0.0));

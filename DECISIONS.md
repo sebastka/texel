@@ -671,5 +671,5 @@ The GS filters textures as TEX1 says: the level of detail is K (LCM set) or log2
 
 - **Bilinear** (MMAG 1; MMIN 1, 4 or 5): the four texels around (u − ½, v − ½), weighted in sixteenths as the GS does, each wrapped and looked up in the CLUT before blending, alpha too.
 - **Mipmaps** are not drawn: MMIN's mipmapping modes filter the base level as their names say (linear or nearest).
-- **The GPU GS does not filter yet**: the two differ on filtered textures (`compare` counts them).
-- **Checked**: a test magnifying a two-texel texture both ways.
+- **The GPU GS filters the same way** (TEX1's fields travel in the primitive's flags word). Both floor the weights' coordinates with a slack of 1/64 of a sixteenth, so that a coordinate a hair under a sixteenth by float rounding (f32 on the GPU, f64 in software) weighs the same in both.
+- **Checked**: a test magnifying a two-texel texture both ways; the GPU tests draw filtered sprites (magnified and shrunk) and a triangle whose Q varies (both filters), memories equal to the software GS's.

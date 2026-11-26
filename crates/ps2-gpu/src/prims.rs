@@ -107,7 +107,14 @@ fn registers(
     words[59] = r.texa as u32;
     words[60] = field(r.texa, 32, 8);
     words[61] = r.fogcol as u32;
-    words[62] = field(r.fba, 0, 1) | (field(r.colclamp, 0, 1) << 1);
+    // Flags: FBA, COLCLAMP; TEX1's LCM, L, MMAG, MMIN and K, for filtering.
+    words[62] = field(r.fba, 0, 1)
+        | (field(r.colclamp, 0, 1) << 1)
+        | (field(r.tex1, 0, 1) << 8)
+        | (field(r.tex1, 19, 2) << 9)
+        | (field(r.tex1, 5, 1) << 11)
+        | (field(r.tex1, 6, 3) << 12)
+        | (field(r.tex1, 32, 12) << 16);
     words[63] = clut;
     // Frame and depth buffers: whole pages, down to the last row drawn.
     let rows = (y1.max(1) as u32).div_ceil(32);
