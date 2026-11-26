@@ -122,6 +122,18 @@ pub struct Vif {
     /// states (their format is positional): handlers clear it at once.
     #[serde(skip)]
     pub int: bool,
+    /// Stalled by a code's IRQ bit (STAT's VIS) once it and its data were
+    /// done, until FBRST's STC: the words given since wait in `held`.
+    /// ERR's MII (`mask_irq`) masks the stall and the interrupt. Not in
+    /// save states (a handler lifts a stall at once).
+    #[serde(skip)]
+    pub stalled: bool,
+    #[serde(skip)]
+    pub held: Vec<u32>,
+    #[serde(skip)]
+    stall_next: bool,
+    #[serde(skip)]
+    pub mask_irq: bool,
     /// Microprograms started, for diagnostics.
     pub calls: u64,
     /// VIF1's MSKPATH3: path 3 masked (GIF_STAT's M3P). Not in save
@@ -160,6 +172,10 @@ impl Vif {
             written: 0,
             irq: false,
             int: false,
+            stalled: false,
+            held: Vec::new(),
+            stall_next: false,
+            mask_irq: false,
             calls: 0,
             mask_path3: false,
             watch: None,
@@ -167,21 +183,52 @@ impl Vif {
         }
     }
 
-    /// Feeds words to the VIF.
-    pub fn write(&mut self, words: &[u32], vu: &mut impl VuSink) {
+    /// Feeds words to the VIF: those it took (all, unless a code with its
+    /// IRQ bit stalled it: the rest are for after the stall, see `held`).
+    pub fn write(&mut self, words: &[u32], vu: &mut impl VuSink) -> usize {
         let mut i = 0;
-        while i < words.len() {
+        while i < words.len() && !self.stalled {
             // UNPACK's data, vectors at a time, from the words themselves.
             if matches!(self.pending, Pending::Unpack(_)) && self.bytes.is_empty() {
                 let n = self.unpack_words(&words[i..], vu);
                 if n > 0 {
                     i += n;
+                    self.check_stall();
                     continue;
                 }
             }
             self.word(words[i], vu);
             i += 1;
+            self.check_stall();
         }
+        i
+    }
+
+    /// A code with its IRQ bit, done with its data: the VIF stalls.
+    fn check_stall(&mut self) {
+        if self.stall_next && matches!(self.pending, Pending::None) {
+            self.stall_next = false;
+            self.stalled = true;
+        }
+    }
+
+    /// FBRST's STC: the stall lifted (and STAT's INT cleared); the words
+    /// held meanwhile, to give the VIF again.
+    pub fn resume(&mut self) -> Vec<u32> {
+        self.int = false;
+        self.stalled = false;
+        std::mem::take(&mut self.held)
+    }
+
+    /// FBRST's RST: whatever was under way dropped.
+    pub fn reset(&mut self) {
+        self.int = false;
+        self.stalled = false;
+        self.stall_next = false;
+        self.held.clear();
+        self.pending = Pending::None;
+        self.buffer.clear();
+        self.bytes.clear();
     }
 
     /// UNPACK, with no bits left over from earlier words: unpacks the
@@ -275,9 +322,12 @@ impl Vif {
         let cmd = (w >> 24) & 0x7F;
         let num = (w >> 16) & 0xFF;
         let imm = w & 0xFFFF;
-        if w & (1 << 31) != 0 {
+        // The IRQ bit: an interrupt, and a stall once the code is done
+        // (unless ERR's MII masks them).
+        if w & (1 << 31) != 0 && !self.mask_irq {
             self.irq = true;
             self.int = true;
+            self.stall_next = true;
         }
         match cmd {
             0x00 => {}
@@ -573,7 +623,7 @@ impl Vif {
 mod tests {
     use super::*;
 
-    fn feed(vif: &mut Vif, vu: &mut Vu, words: &[u32]) {
+    fn feed(vif: &mut Vif, vu: &mut Vu, words: &[u32]) -> usize {
         let mut gif = Gif::default();
         let mut gs = Gs::default();
         vif.write(
@@ -583,7 +633,7 @@ mod tests {
                 gif: &mut gif,
                 gs: &mut gs,
             },
-        );
+        )
     }
 
     /// UNPACKs fed in chunks (vectors at a time, `unpack_words`) do what
@@ -655,6 +705,31 @@ mod tests {
                 "round {round}: VIF state differs"
             );
         }
+    }
+
+    /// A code's IRQ bit stalls the VIF once the code and its data are
+    /// done, until STC; ERR's MII masks it.
+    #[test]
+    fn irq_bits_stall_until_stc() {
+        let mut vif = Vif::new(1);
+        let mut vu = Vu::new(1);
+        // UNPACK V4-32 with its IRQ bit, 1 vector at 10; then STMOD 1.
+        let words = [0x0100_0101, 0xEC01_000A, 1, 2, 3, 4, 0x0500_0001];
+        assert_eq!(feed(&mut vif, &mut vu, &words), 6);
+        assert!(vif.stalled && vif.int && vif.irq);
+        assert_eq!(vu.read_q(10), [1, 2, 3, 4]);
+        // Stalled, it takes nothing.
+        assert_eq!(feed(&mut vif, &mut vu, &words[6..]), 0);
+        assert_eq!(vif.mode, 0);
+        assert!(vif.resume().is_empty());
+        assert!(!vif.stalled && !vif.int);
+        assert_eq!(feed(&mut vif, &mut vu, &words[6..]), 1);
+        assert_eq!(vif.mode, 1);
+        // Masked: neither stall nor interrupt.
+        vif.irq = false;
+        vif.mask_irq = true;
+        assert_eq!(feed(&mut vif, &mut vu, &[0x8000_0000, 0x0500_0002]), 2);
+        assert!(!vif.stalled && !vif.irq && vif.mode == 2);
     }
 
     #[test]

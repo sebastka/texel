@@ -726,3 +726,12 @@ Midnight Club 3: DUB Edition Remix is a dual-layer DVD: its movies (`\VIDEO\ROCK
 - **The break**: Redump's images hold both layers in a row and do not record where the second starts. Its volume descriptor (`CD001`) sits where the first layer's volume ends (its size in the first descriptor), and its volume 16 sectors before. CDVDMAN takes the second layer's start from the table of contents (the first layer's last sector + 1) and asks for its sectors 16 before what it computes from it: the descriptor's sector is that start.
 - **The table of contents** gives two layers with opposite track paths (byte 14: 0x30), so the sector numbers run on across both; DVD sectors' headers carry their layer (bit 0 of their first byte).
 - **Only that disc** in the library is dual-layer (8.5 GB): other DVDs' tables of contents are as before.
+
+## D91. A VIFcode's IRQ bit stalls the VIF
+
+007: Nightfire stayed black: its movie player sends each frame as a VIF1 chain whose codes carry their IRQ bit, and its VIF1 interrupt handler, run once per such code, writes the next GS registers, starts the next GIF chunk, sets the frame's status when its lists are done, then lifts the stall (FBRST's STC). The VIF went on without stalling: the interrupts merged into one, the handler ran once, and the game waited for the frame's status forever.
+
+- **The stall**: a code with its IRQ bit raises the interrupt and sets STAT's INT (D85), as before, and stalls the VIF once the code and its data are done (STAT's VIS, bit 10); ERR's MII masks both. The words given meanwhile wait in the VIF (its FIFO); its DMA channel stops between quadwords. STC lifts the stall: the words held go first, then the chain goes on. RST drops them.
+- **VU1 elsewhere** (D57): the engine's VIF1 gets the words the EE side's took, in one go, and does not stall itself.
+- **Not in save states**, like INT (their format is positional): handlers lift a stall at once, a state saved during one is unlikely.
+- **Nightfire** now shows its language choice, the MGM movie, its title and the first mission's loading screen.

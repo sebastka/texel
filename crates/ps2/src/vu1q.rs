@@ -216,6 +216,9 @@ fn execute(ops: &[u8], vu: &mut Vu, gif: &mut Gif, gs: &mut Gs, vif: &mut Vif, w
                 let n = r.u32() as usize;
                 words.clear();
                 words.extend(r.bytes(4 * n).as_chunks::<4>().0.iter().map(|w| u32::from_le_bytes(*w)));
+                // The EE side's VIF1 stalls (these are the words it took
+                // in one go): not this one.
+                vif.mask_irq = true;
                 vif.write(words, &mut d);
             }
             op::REPORT => {
@@ -479,16 +482,24 @@ impl Vu1Queue {
     /// VIF1's words: to `vif`, acting on VU1 (`vu`) here or, with VU1
     /// elsewhere, to the engine's VIF1 too (`vif` then keeps only its
     /// registers and counts).
+    /// Stalled by a code's IRQ bit, `vif` keeps the words it did not take
+    /// (`Vif::held`); the engine gets only those it took (its feed here
+    /// queues nothing then: the order is the same).
     pub fn vif1(&mut self, vif: &mut Vif, vu: &mut Vu, words: &[u32]) {
-        if self.backend.is_some() {
+        let took = if vif.stalled {
+            0
+        } else {
+            vif.write(words, &mut self.feed(vu))
+        };
+        vif.held.extend_from_slice(&words[took..]);
+        if self.backend.is_some() && took > 0 {
             self.begin();
-            self.ops.elements(op::VIF, 0, 0, 0, &[], words.len() as u32);
-            for w in words {
+            self.ops.elements(op::VIF, 0, 0, 0, &[], took as u32);
+            for w in &words[..took] {
                 self.ops.put(&w.to_le_bytes());
             }
             self.end();
         }
-        vif.write(words, &mut self.feed(vu));
     }
 
     /// Runs VU1 on `backend` from now on (None: here), from the state of

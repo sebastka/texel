@@ -561,14 +561,7 @@ impl Bus {
             0x1000_4000..0x1000_7000 if width == 16 => {
                 let words: [u32; 4] = std::array::from_fn(|k| (value >> (32 * k)) as u32);
                 match pa & 0xF000 {
-                    0x4000 => self.vif0.write(
-                        &words,
-                        &mut Direct {
-                            vu: &mut self.vu0,
-                            gif: &mut self.gif,
-                            gs: &mut self.gs,
-                        },
-                    ),
+                    0x4000 => self.vif_write(0, &words),
                     0x5000 => {
                         self.vu1q.vif1(&mut self.vif1, &mut self.vu1, &words);
                         self.path3_mask_by_dma = false;
@@ -623,9 +616,12 @@ impl Bus {
                 stat
             }
             SIO_ISR => 0,
-            // The VIFs' STAT: INT (bit 11) after a code with its IRQ bit.
-            VIF0_STAT => self.regs.get(&pa).copied().unwrap_or(0) | u32::from(self.vif0.int) << 11,
-            VIF1_STAT => self.regs.get(&pa).copied().unwrap_or(0) | u32::from(self.vif1.int) << 11,
+            // The VIFs' STAT: INT (bit 11) after a code with its IRQ bit,
+            // VIS (bit 10) while that stalls the VIF.
+            VIF0_STAT | VIF1_STAT => {
+                let vif = if pa == VIF0_STAT { &self.vif0 } else { &self.vif1 };
+                self.regs.get(&pa).copied().unwrap_or(0) | u32::from(vif.int) << 11 | u32::from(vif.stalled) << 10
+            }
             IPU_CMD => self.ipu.read_cmd().0,
             IPU_CMD_HI => u32::from(self.ipu.read_cmd().1) << 31,
             IPU_CTRL => self.ipu.read_ctrl(),
@@ -656,13 +652,25 @@ impl Bus {
     fn hw_write32(&mut self, pa: u32, value: u32) {
         match pa {
             0x1000_0000..0x1000_2000 => self.timers.write(pa - 0x1000_0000, value),
-            // FBRST: STC (cancel a stall) and RST clear STAT's INT.
+            // FBRST: RST drops what the VIF was doing; STC lifts the stall
+            // a code's IRQ bit left (and STAT's INT), the words held
+            // meanwhile go on, then the channel's DMA.
             VIF0_FBRST | VIF1_FBRST if value & 0b1001 != 0 => {
-                if pa == VIF0_FBRST {
-                    self.vif0.int = false;
+                let ch = u32::from(pa == VIF1_FBRST);
+                if value & 1 != 0 {
+                    self.vif_mut(ch).reset();
                 } else {
-                    self.vif1.int = false;
+                    let held = self.vif_mut(ch).resume();
+                    self.vif_write(ch, &held);
                 }
+                if !self.vif_mut(ch).stalled && self.reg(CHANNELS[ch as usize].0) & CHCR_STR != 0 {
+                    self.run_dma(ch);
+                }
+            }
+            // ERR's MII: codes' IRQ bits neither interrupt nor stall.
+            VIF0_ERR | VIF1_ERR => {
+                self.regs.insert(pa, value);
+                self.vif_mut(u32::from(pa == VIF1_ERR)).mask_irq = value & 1 != 0;
             }
             IPU_CMD => {
                 if let Some((log, taken, _)) = &mut self.ipu_sources {
@@ -816,6 +824,8 @@ const VIF0_STAT: u32 = 0x1000_3800;
 const VIF0_FBRST: u32 = 0x1000_3810;
 const VIF1_STAT: u32 = 0x1000_3C00;
 const VIF1_FBRST: u32 = 0x1000_3C10;
+const VIF0_ERR: u32 = 0x1000_3820;
+const VIF1_ERR: u32 = 0x1000_3C20;
 const IPU_CMD: u32 = 0x1000_2000;
 const IPU_CMD_HI: u32 = 0x1000_2004;
 const IPU_CTRL: u32 = 0x1000_2010;
@@ -1150,6 +1160,11 @@ impl Bus {
         let (skip, run) = (sqwc & 0xFF, (sqwc >> 16) & 0xFF);
         let mut in_run = 0;
         for _ in 0..0x40_0000 {
+            // A VIF stalled by a code's IRQ bit takes no more: the channel
+            // waits, until STC (see `hw_write32`).
+            if ch <= 1 && self.vif_mut(ch).stalled {
+                return;
+            }
             let chcr = self.reg(base);
             let chain = (chcr >> 2) & 3 == 1 && ch != 8;
             let qwc = self.reg(base + QWC) & 0xFFFF;
@@ -1229,14 +1244,7 @@ impl Bus {
     /// Where a channel's data goes.
     fn dma_sink(&mut self, ch: u32, words: &[u32], q: u128) {
         match ch {
-            0 => self.vif0.write(
-                words,
-                &mut Direct {
-                    vu: &mut self.vu0,
-                    gif: &mut self.gif,
-                    gs: &mut self.gs,
-                },
-            ),
+            0 => self.vif_write(0, words),
             1 => self.vu1q.vif1(&mut self.vif1, &mut self.vu1, words),
             2 => {
                 self.sync_vu1(Why::Gif);
@@ -1250,6 +1258,32 @@ impl Bus {
                 self.write128(SCRATCHPAD + (sadr & 0x3FF0), q);
             }
         }
+    }
+
+    /// Words for VIF0 or VIF1 (`ch`), from DMA or its FIFO: those a stall
+    /// leaves are held (`Vif::held`).
+    fn vif_write(&mut self, ch: u32, words: &[u32]) {
+        if ch == 1 {
+            self.vu1q.vif1(&mut self.vif1, &mut self.vu1, words);
+            return;
+        }
+        let took = if self.vif0.stalled {
+            0
+        } else {
+            self.vif0.write(
+                words,
+                &mut Direct {
+                    vu: &mut self.vu0,
+                    gif: &mut self.gif,
+                    gs: &mut self.gs,
+                },
+            )
+        };
+        self.vif0.held.extend_from_slice(&words[took..]);
+    }
+
+    fn vif_mut(&mut self, ch: u32) -> &mut Vif {
+        if ch == 0 { &mut self.vif0 } else { &mut self.vif1 }
     }
 
     /// Runs VU1's queued work (see `vu1q`): before anything reads or
