@@ -44,6 +44,16 @@ pub const REG_NAMES: [&str; 16] = [
 ];
 
 impl Privileged {
+    /// Whether the CRTC is set for PAL: SYNCV's parts (front porch, back
+    /// porch, sync, display, in half-lines) make 625 half-lines a field
+    /// for PAL, 525 for NTSC.
+    pub fn pal(&self) -> bool {
+        let v = self.regs[6];
+        let part = |lo: u32, bits: u32| (v >> lo) & ((1 << bits) - 1);
+        let half_lines = part(0, 10) + part(10, 10) + part(20, 12) + part(32, 10) + part(42, 11) + part(53, 11);
+        (600..=650).contains(&half_lines)
+    }
+
     /// Starts a vertical blank: the VSINT event, and the next field.
     pub fn vblank(&mut self) {
         self.csr |= CSR_VSINT;

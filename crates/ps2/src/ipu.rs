@@ -703,9 +703,26 @@ pub struct Trace {
     removed: u64,
     /// The running command's first bit (it may stall and go on).
     start: Option<u64>,
-    /// Commands done: code, options, first and next bit (of the stream),
-    /// whether it failed (ECD), and its result (VDEC, FDEC).
-    pub commands: Vec<(u32, u32, u64, u64, bool, u32)>,
+    /// Commands done.
+    pub commands: Vec<TraceCommand>,
+    /// The frame now, for the commands (set by the bus).
+    pub frame: u64,
+}
+
+/// A command the IPU ran, in its trace.
+#[derive(Debug, Clone)]
+pub struct TraceCommand {
+    pub code: u32,
+    pub opt: u32,
+    /// Its first and next bit, of the stream.
+    pub start: u64,
+    pub end: u64,
+    /// Whether it failed (ECD).
+    pub err: bool,
+    /// Its result (VDEC, FDEC).
+    pub data: u32,
+    /// The frame it ended in.
+    pub frame: u64,
 }
 
 impl Trace {
@@ -931,8 +948,16 @@ impl Ipu {
                 base + ended
             };
             let start = t.start.take().unwrap_or(end);
-            t.commands
-                .push((job.code, job.opt, start, end, self.dec.ctrl & CTRL_ECD != 0, self.data));
+            let frame = t.frame;
+            t.commands.push(TraceCommand {
+                code: job.code,
+                opt: job.opt,
+                start,
+                end,
+                err: self.dec.ctrl & CTRL_ECD != 0,
+                data: self.data,
+                frame,
+            });
         }
         // What is behind the bit pointer is gone.
         while self.pos >= 128 && !self.input.is_empty() {

@@ -68,10 +68,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if std::env::var("IPUTRACE").is_ok() {
         ps2.bus.ipu.trace = Some(Box::default());
         ps2.bus.ipu_sources = Some((Vec::new(), 0, 0));
-        // IPUWATCH=address: writes to those 64 bytes, in the same log.
+        // IPUWATCH=address,...: writes to those lines of 64 bytes, in the
+        // same log.
         ps2.bus.ipu_watch = std::env::var("IPUWATCH")
-            .ok()
-            .and_then(|a| u32::from_str_radix(&a, 16).ok());
+            .unwrap_or_default()
+            .split(',')
+            .filter_map(|a| u32::from_str_radix(a, 16).ok())
+            .collect();
     }
     // TRANSFERS=1: the GS's transfers, from the start (reported with
     // DRAWS).
@@ -478,8 +481,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let lines: String = t
             .commands
             .iter()
-            .map(|(code, opt, start, end, err, data)| {
-                format!("{code:X} {opt:07X} {start} {end} {} {data:08X}\n", u8::from(*err))
+            .map(|c| {
+                format!(
+                    "{:X} {:07X} {} {} {} {:08X} {}\n",
+                    c.code,
+                    c.opt,
+                    c.start,
+                    c.end,
+                    u8::from(c.err),
+                    c.data,
+                    c.frame
+                )
             })
             .collect();
         std::fs::write(format!("{path}.txt"), lines)?;
@@ -766,7 +778,7 @@ fn dump_draws(ps2: &mut Ps2, frames: u64) {
         let (a, b) = v.split_once(',')?;
         Some((u32::from_str_radix(a, 16).ok()?, u32::from_str_radix(b, 16).ok()?))
     });
-    ps2.run(frames * texel_ps2::bus::FRAME_CYCLES);
+    ps2.run(frames * ps2.bus.frame_cycles());
     let commands = ps2.bus.gs.take_commands();
     let kicks = ps2.bus.vu1.kicks.take().unwrap_or_default();
     // The context's changes, and the draws near the origin in the main

@@ -625,3 +625,26 @@ The EE's DMA has a memory FIFO (D_CTRL's MFD): the scratchpad's channel (8) writ
 - **The scratchpad's channel**, with the memory FIFO on, writes into the ring, its address wrapping; when it is done, a started drain goes on.
 - **The drain** reads its tags and their data in the ring: addresses that follow a tag (its data, the next tag) wrap however far past the end they land; a tag's own pointers (a REF's data) are taken as they are, a NEXT's wrapped if in the ring. It stalls when its TADR reaches the scratchpad channel's address (MFIFO empty: D_STAT bit 14, which can raise INT1), its DMA still started.
 - **Checked**: tests of a drain catching up and of wrapping at the ring's end; Tekken 4 reaches its memory-card prompt, Midnight Club II its intro (whose movie then stops: another matter).
+
+## D79. The IOP's DMA registers take halfwords
+
+The IOP's sound library writes an SPU2 channel's BCR as two halfwords: the block size (16 words) once, then the block count before each transfer. Texel stored each write as the whole register, so the count's write cleared the size, and every sound transfer moved a sixteenth of its data (768 bytes rather than 12 KiB). Movie players feed their sound in such halves and time the picture by them: GTA III's sound ran sixteen times too fast, and its movies dropped pictures to keep up.
+
+- **Partial writes** (bytes, halfwords) to the IOP's DMA registers keep the bytes they do not cover. A channel starts on a write of CHCR's start bit, as before.
+- **Checked**: a test of BCR written in halves and of CHCR's halves; GTA III's movie sound plays at 12 KiB per transfer, its halves alternating every 64 ms of console time.
+
+## D80. PAL timing
+
+Texel ran every PS2 game at NTSC timing: 60 frames a second, 262 lines. PAL games set the GS's CRTC for 50 (SYNCV: 625 half-lines a field, against NTSC's 525), and pace themselves by the vertical blanks: GTA III's movies, timed by their sound at the real pace and shown at the vertical blanks, judged their pictures late and skipped ahead by whole GOPs, searching the stream byte by byte.
+
+- **The bus takes its timing from SYNCV**: 625 half-lines make PAL, 50 frames a second, 15,625 lines a second, the vertical blank from line 288; anything else keeps NTSC's values as before (the BIOS starts at NTSC's).
+- **The web build** steps a frame of the game's timing (`runFrame`), and `isPal` follows the game: the page paces 50 frames a second once it is PAL, and its status says so.
+- **Checked**: a test of SYNCV's two settings and of 50 vertical blanks a second; GTA III's movies decode 25 pictures a second, without a skip.
+
+## D81. A restarted chain ends as its tag said
+
+A DMA channel in chain mode keeps its last tag's upper half in CHCR. Started again with data left (QWC), it moves that data, then ends if the tag was an end tag (a source chain's REFE or END, a destination chain's END), or asked for an interrupt with TIE set; it reads the next tag otherwise. Texel always read the next tag. GTA III feeds the IPU from a ring of REF tags, a REFE marking the newest data, and restarts the channel inside that block after each picture's colour conversion, with CHCR's tag saying REFE: the channel ran on through the ring's stale tags into last lap's data, and the movies broke into blocks once the IPU caught up with the disc.
+
+- **A chain started with QWC left** ends after it when CHCR's tag says so; with QWC 0 it reads a tag first, as before.
+- **Checked**: a test restarting a source chain with each kind of tag; GTA III's intro movies play to the end (30 seconds of console time) without an IPU error, where there were 49.
+- Found with traces of the drive's commands, the IOP's transfers, the IPU's input stream and channel 4's tags (`CDVDREADS`, `IPUTRACE`, `IPUWATCH` in the boot example), and a comparison with the movie files' video.

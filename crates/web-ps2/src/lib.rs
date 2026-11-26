@@ -15,7 +15,6 @@
 mod jit;
 
 use texel_ps2::Ps2;
-use texel_ps2::bus::FRAME_CYCLES;
 #[cfg(target_arch = "wasm32")]
 use texel_ps2::gs::Rendering;
 use wasm_bindgen::prelude::*;
@@ -286,11 +285,12 @@ impl Ps2Emulator {
         }
     }
 
-    /// Runs a frame's worth of time (1/60 s), then reads the picture out
-    /// (in software) or sends the frame's drawing to the GPU.
+    /// Runs a frame's worth of time (1/60 s, or 1/50 s once the game sets
+    /// PAL timing), then reads the picture out (in software) or sends the
+    /// frame's drawing to the GPU.
     #[wasm_bindgen(js_name = runFrame)]
     pub fn run_frame(&mut self) {
-        self.ps2.run(FRAME_CYCLES);
+        self.ps2.run(self.ps2.bus.frame_cycles());
         // The blocks compiled in the frame go to the browser.
         if let Some(jit) = &mut self.ps2.ee.jit {
             jit.end_frame();
@@ -346,10 +346,10 @@ impl Ps2Emulator {
         js_sys::Int16Array::from(&self.audio[..])
     }
 
-    /// Frames are paced at 60 per second for now, PAL consoles included.
+    /// Whether the game runs at PAL timing (frames paced at 50 a second).
     #[wasm_bindgen(getter, js_name = isPal)]
     pub fn is_pal(&self) -> bool {
-        false
+        self.ps2.bus.pal()
     }
 
     #[wasm_bindgen(js_name = setResolutionScale)]

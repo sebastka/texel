@@ -244,6 +244,8 @@ export class Player {
         this.cb.onStatus("Running");
         break;
       case "stats":
+        // A PS2 game sets PAL timing itself, after the BIOS.
+        this.pal = msg.pal;
         if (!this.paused) {
           const gpu = this.renderer ? ` · ${this.renderer}` : "";
           this.cb.onStatus(`${msg.fps.toFixed(0)} fps · ${msg.width}×${msg.height}${this.autoNote}${this.pal ? " · PAL" : ""}${gpu}`);

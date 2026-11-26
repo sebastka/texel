@@ -41,6 +41,11 @@ pub const FRAME_CYCLES: u64 = EE_CLOCK / 60;
 const LINE_CYCLES: u64 = FRAME_CYCLES / 262;
 /// The vertical blank starts with line 240.
 const VBLANK_START: u64 = LINE_CYCLES * 240;
+/// PAL: 50 fields a second, of 312.5 lines (15,625 a second); the
+/// vertical blank starts after 288.
+pub const PAL_FRAME_CYCLES: u64 = EE_CLOCK / 50;
+const PAL_LINE_CYCLES: u64 = EE_CLOCK / 15_625;
+const PAL_VBLANK_START: u64 = PAL_LINE_CYCLES * 288;
 
 // Hardware registers.
 pub const INTC_STAT: u32 = 0x1000_F000;
@@ -182,10 +187,10 @@ pub struct Bus {
     /// the quadwords taken so far, the next address.
     #[serde(skip)]
     pub ipu_sources: Option<IpuSources>,
-    /// Diagnostics: 64 bytes whose writes go into `ipu_sources` (taken,
-    /// address, low 32 bits | 1 << 61).
+    /// Diagnostics: lines of 64 bytes whose writes go into `ipu_sources`
+    /// (taken, address, low 32 bits | 1 << 61).
     #[serde(skip)]
-    pub ipu_watch: Option<u32>,
+    pub ipu_watch: Vec<u32>,
 }
 
 impl Bus {
@@ -244,7 +249,7 @@ impl Bus {
             path3_mask_by_dma: false,
             ba6: 0,
             ipu_sources: None,
-            ipu_watch: None,
+            ipu_watch: Vec::new(),
         }
     }
 
@@ -274,9 +279,10 @@ impl Bus {
         self.bus_remainder += cycles;
         let bus_cycles = self.bus_remainder / 2;
         self.bus_remainder %= 2;
+        let (frame_cycles, line_cycles, vblank_start) = self.timing();
         self.line_pos += cycles;
-        let hblanks = self.line_pos / LINE_CYCLES;
-        self.line_pos %= LINE_CYCLES;
+        let hblanks = self.line_pos / line_cycles;
+        self.line_pos %= line_cycles;
         self.timers.advance(bus_cycles, hblanks, &mut self.intc);
         self.iop_remainder += cycles;
         let iop_cycles = self.iop_remainder / IOP_CLOCK_DIVIDER;
@@ -284,14 +290,14 @@ impl Bus {
         self.iop.advance(iop_cycles, hblanks);
         let before = self.frame_pos;
         self.frame_pos += cycles;
-        if before < VBLANK_START && self.frame_pos >= VBLANK_START {
+        if before < vblank_start && self.frame_pos >= vblank_start {
             self.intc.raise(Interrupt::VblankStart);
             self.iop.intc.raise(iop::irq::VBLANK_START);
             self.sync_vu1(Why::VBlank);
             self.gs.vblank();
         }
-        if self.frame_pos >= FRAME_CYCLES {
-            self.frame_pos -= FRAME_CYCLES;
+        if self.frame_pos >= frame_cycles {
+            self.frame_pos -= frame_cycles;
             self.frames += 1;
             self.ee_cycles_hint = self.frames as u32;
             self.intc.raise(Interrupt::VblankEnd);
@@ -300,6 +306,25 @@ impl Bus {
         // The vertical blanks only: the timers' interrupts come at once.
         let blanks = 1 << Interrupt::VblankStart as u32 | 1 << Interrupt::VblankEnd as u32;
         self.intc.fresh = self.intc.stat & !raised & blanks;
+    }
+
+    /// Whether the video timing is PAL's (as the GS's CRTC is set).
+    pub fn pal(&self) -> bool {
+        self.gs.privileged.pal()
+    }
+
+    /// A frame (a field), in EE cycles, at the video timing now.
+    pub fn frame_cycles(&self) -> u64 {
+        self.timing().0
+    }
+
+    /// A frame, a line and the start of the vertical blank, in EE cycles.
+    fn timing(&self) -> (u64, u64, u64) {
+        if self.pal() {
+            (PAL_FRAME_CYCLES, PAL_LINE_CYCLES, PAL_VBLANK_START)
+        } else {
+            (FRAME_CYCLES, LINE_CYCLES, VBLANK_START)
+        }
     }
 
     fn note_unknown(&mut self, addr: u32) {
@@ -346,8 +371,7 @@ impl Bus {
 
     pub fn write<const N: usize>(&mut self, pa: u32, data: [u8; N]) {
         let pa = pa & !(N as u32 - 1);
-        if let Some(w) = self.ipu_watch
-            && pa.wrapping_sub(w) < 64
+        if self.ipu_watch.iter().any(|&w| pa.wrapping_sub(w) < 64)
             && let Some((log, taken, _)) = &mut self.ipu_sources
         {
             let mut low = [0u8; 4];
@@ -644,7 +668,18 @@ impl Bus {
                 match started {
                     Some(SIF0) => self.sif0_end = false,
                     Some(ch) => {
-                        self.chain_end[ch as usize] = false;
+                        // A chain started with data left (QWC) goes on from
+                        // the tag CHCR keeps: after an end tag (REFE or END;
+                        // a destination chain's END), or one asking for an
+                        // interrupt with TIE set, it stops once that data is
+                        // through. GTA III's movies restart the IPU's input
+                        // so, in the block their last REFE gave.
+                        let id = value >> 28 & 7;
+                        let end_tag = id == 7 || (id == 0 && ch != 8);
+                        let irq = value >> 31 != 0 && value & CHCR_TIE != 0;
+                        let chain = value >> 2 & 3 == 1;
+                        let qwc = self.reg(pa + QWC) & 0xFFFF;
+                        self.chain_end[ch as usize] = chain && qwc > 0 && (end_tag || irq);
                         self.chain_stack[ch as usize].clear();
                         *self.dma_starts.entry((pa, value & 0x4C)).or_insert(0) += 1;
                         match ch {
@@ -836,6 +871,9 @@ impl Bus {
     /// from DMA channel 4, drains its output to channel 3; its interrupt.
     fn run_ipu(&mut self) {
         let mut ipu = std::mem::take(&mut self.ipu);
+        if let Some(t) = ipu.trace.as_mut() {
+            t.frame = self.frames;
+        }
         ipu.run(&mut || self.ipu_pull());
         while ipu.wants_input() {
             match self.ipu_pull() {
@@ -1203,6 +1241,57 @@ fn is_known_register(pa: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// PAL timing once the game sets the CRTC's SYNCV for it (625
+    /// half-lines a field): 50 frames a second, rather than 60 (GTA III's
+    /// movies dropped pictures, their clock ahead of the vertical blanks).
+    #[test]
+    fn syncv_sets_pal_timing() {
+        let mut bus = Bus::new(&[]);
+        assert!(!bus.pal());
+        assert_eq!(bus.frame_cycles(), EE_CLOCK / 60);
+        bus.write64(0x1200_0060, 0x00A9_0005_0210_1401);
+        assert!(bus.pal());
+        assert_eq!(bus.frame_cycles(), EE_CLOCK / 50);
+        let frames = bus.frames;
+        for _ in 0..50 {
+            bus.advance(EE_CLOCK / 50);
+        }
+        assert_eq!(bus.frames - frames, 50);
+        // NTSC's values: 525 half-lines.
+        bus.write64(0x1200_0060, 0x00C7_8006_01A0_1801);
+        assert!(!bus.pal());
+    }
+
+    /// A source chain restarted with data left stops after it when CHCR's
+    /// tag is an end tag (REFE), and goes on to the next tag otherwise.
+    #[test]
+    fn a_restarted_chain_ends_as_its_tag_says() {
+        let to_spr = CHANNELS[9].0;
+        for (chcr, quadwords) in [(0x0000_0105, 2u32), (0x3000_0105, 3)] {
+            let mut bus = Bus::new(&[]);
+            bus.write32(D_CTRL, 1);
+            // Two quadwords left at 0x1000; the next tag: a REFE of one at 0x3000.
+            for k in 0..3 {
+                bus.write128(0x1000 + 16 * k, u128::from(k) + 1);
+            }
+            bus.write128(0x3000, 3);
+            bus.write64(0x2000, 0x3000 << 32 | 1);
+            bus.write32(to_spr + MADR, 0x1000);
+            bus.write32(to_spr + QWC, 2);
+            bus.write32(to_spr + TADR, 0x2000);
+            bus.write32(to_spr + 0x80, 0);
+            bus.write32(to_spr, chcr);
+            let got: Vec<u128> = (0..4).map(|k| bus.read128(SCRATCHPAD + 16 * k)).collect();
+            let want: Vec<u128> = [1, 2, 3, 0]
+                .iter()
+                .enumerate()
+                .map(|(k, &v)| if k < quadwords as usize { v } else { 0 })
+                .collect();
+            assert_eq!(got, want, "CHCR {chcr:08X}");
+            assert_eq!(bus.read32(to_spr) & CHCR_STR, 0);
+        }
+    }
 
     /// VIF1's MSKPATH3 shows in GIF_STAT (M3P), as games wait for it;
     /// GIF_MODE's mask too (M3R).

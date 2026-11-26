@@ -178,6 +178,8 @@ It prints what the BIOS kernel writes to its debug port (its start-up log) and w
 | `DRAWS=frames` | What the GS was asked to draw over that many more frames, and the writes of FRAME, XYOFFSET, TEX0 and TEX2 by GIF path |
 | `PROG=hex`, `FINDXY=x,y` | VU1's runs from there; which GIF path sent a vertex |
 | `VIFWATCH=from,to` | VIF1's UNPACKs writing VU1 memory there (quadwords, hex), their vectors, and the programs started |
+| `CDVDREADS=1` | Every drive command, in order with the drive's DMA, the SIF0 transfers and the SPU2's DMA |
+| `IPUTRACE=path`, `IPUWATCH=hex,…` | The IPU's input stream (`path.bin`), its commands with their bits and frames (`path.txt`), and channel 4's sources, tags and restarts (`path.src`), with the writes to those lines of 64 bytes |
 | `TRANSFERS=1`, `DRAWSTATE=1` (with `DRAWS`) | The GS's transfers from the start, in order (destination, format, size, how much data was not zero, its EE address); the draws by state (kind, TEX0, ALPHA, TEST, FRAME) |
 
 The GS on the GPU (`crates/ps2-gpu`, with wgpu: Vulkan, Metal or DirectX 12 natively, WebGPU in browsers) is checked against the software GS: `cargo run --release -p texel-ps2-gpu --example compare -- PS2-BIOS [SECONDS] [OUT_DIR]` boots a BIOS with both and prints, every second, how many GS memory words differ (`PAGES=1`: by page), writing both displayed frames (`GPU_ONLY=1`: the GPU alone, to measure it; it takes `DISC`, `MC1` and `PRESS` too). Its tests (`cargo test -p texel-ps2-gpu`) draw with both and compare the whole GS memory; without a GPU, they pass and say so.

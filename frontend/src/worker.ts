@@ -409,7 +409,13 @@ function tick() {
       }
     }
     if (now - statsAt >= 1000) {
-      post({ type: "stats", fps: (frames * 1000) / (now - statsAt), width: emu.frameWidth, height: emu.frameHeight });
+      post({
+        type: "stats",
+        fps: (frames * 1000) / (now - statsAt),
+        width: emu.frameWidth,
+        height: emu.frameHeight,
+        pal: emu.isPal,
+      });
       frames = 0;
       statsAt = now;
       adaptScale();
