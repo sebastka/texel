@@ -13,6 +13,6 @@ export function showBuild(footer: HTMLElement) {
   footer.replaceChildren(
     "Build ",
     h("a.external.mono", { href: `${repository}/commit/${commit}`, target: "_blank", rel: "noreferrer" }, commit.slice(0, 7)),
-    import.meta.env.VITE_DIRTY ? " with local changes" : "",
+    { changes: " with local changes", unknown: ", local changes unknown" }[String(import.meta.env.VITE_DIRTY ?? "")] ?? "",
   );
 }
