@@ -209,13 +209,20 @@ impl Gif {
             0xE => {
                 let r = (w(2) & 0xFF) as u8;
                 if let Some(log) = self.context_log.as_mut()
-                    && matches!(r, reg::FRAME_1 | reg::XYOFFSET_1)
+                    && matches!(r, reg::FRAME_1 | reg::XYOFFSET_1 | reg::TEX0_1 | reg::TEX2_1)
                 {
                     log.push((self.path, r, q as u64, gs.recorded()));
                 }
                 gs.write_reg(r, q as u64);
             }
             0xF => {}
+            // TEX0 in a packed list: logged with the context (diagnostics).
+            0x6 => {
+                if let Some(log) = self.context_log.as_mut() {
+                    log.push((self.path, reg::TEX0_1, q as u64, gs.recorded()));
+                }
+                gs.write_reg(desc, q as u64);
+            }
             _ => gs.write_reg(desc, q as u64),
         }
     }

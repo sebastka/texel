@@ -48,12 +48,17 @@ mod simd {
     pub const F32X4_REPLACE: u32 = 0x20;
     pub const I32X4_EQ: u32 = 0x37;
     pub const I32X4_NE: u32 = 0x38;
+    pub const I32X4_LT_S: u32 = 0x39;
+    pub const I32X4_GT_S: u32 = 0x3B;
     pub const F32X4_LT: u32 = 0x43;
     pub const F32X4_GT: u32 = 0x44;
     pub const AND: u32 = 0x4E;
     pub const OR: u32 = 0x50;
+    pub const XOR: u32 = 0x51;
     pub const BITSELECT: u32 = 0x52;
     pub const I32X4_BITMASK: u32 = 0xA4;
+    pub const I32X4_SHR_S: u32 = 0xAC;
+    pub const I32X4_SUB: u32 = 0xB1;
     pub const F32X4_NEG: u32 = 0xE1;
     pub const F32X4_ADD: u32 = 0xE4;
     pub const F32X4_SUB: u32 = 0xE5;
@@ -882,8 +887,9 @@ impl Emitter {
         self.code.local_set(VT);
     }
 
-    /// MAX, MINI: ties give the second operand (as the interpreter has it);
-    /// no flags.
+    /// MAX, MINI, as the interpreter's (`vu::minmax`): the operands' bits
+    /// as they are (not sanitized: denormals kept), compared as
+    /// sign-magnitude integers; ties give the second operand; no flags.
     fn minmax(
         &mut self,
         fs: usize,
@@ -893,15 +899,47 @@ impl Emitter {
         mask: u32,
         max: bool,
     ) -> Option<(Option<usize>, u32, bool)> {
-        self.operands(fs, ft);
-        self.operand(src);
+        self.load_vu_v128(vf(fs));
+        self.code.local_set(VS);
+        match src {
+            Src::T => self.load_vu_v128(vf(ft)),
+            Src::Lane(k) => {
+                self.load_vu_v128(vf(ft));
+                self.lane_op(simd::F32X4_EXTRACT, k);
+                self.simd(simd::F32X4_SPLAT);
+            }
+            Src::I => {
+                self.load_vu_i32(field(offset_of!(Vu, i)));
+                self.simd(simd::I32X4_SPLAT);
+            }
+            Src::Q => {
+                self.load_vu_i32(field(offset_of!(Vu, q)));
+                self.simd(simd::I32X4_SPLAT);
+            }
+        }
         self.code.local_set(VZ);
-        // s where s > t (max) or s < t (min), else t.
-        self.code.local_get(VS).local_get(VZ).local_get(VS).local_get(VZ);
-        self.simd(if max { simd::F32X4_GT } else { simd::F32X4_LT });
+        // s where key(s) > key(t) (max) or < (min), else t.
+        self.code.local_get(VS).local_get(VZ);
+        self.order_key(VS);
+        self.order_key(VZ);
+        self.simd(if max { simd::I32X4_GT_S } else { simd::I32X4_LT_S });
         self.simd(simd::BITSELECT);
         self.code.local_set(VUP);
         Some((Some(fd), mask, false))
+    }
+
+    /// Pushes `local`'s lanes as MAX and MINI order them (`vu::order_key`):
+    /// the magnitude, negated where the sign is set.
+    fn order_key(&mut self, local: u32) {
+        self.code.local_get(local);
+        self.splat_i32(0x7FFF_FFFF);
+        self.simd(simd::AND);
+        self.code.local_get(local).i32_const(31);
+        self.simd(simd::I32X4_SHR_S);
+        self.code.local_tee(VX);
+        self.simd(simd::XOR);
+        self.code.local_get(VX);
+        self.simd(simd::I32X4_SUB);
     }
 
     /// OPMSUB (ACC - cross) and OPMULA (the cross product): fs.yzx * ft.zxy,

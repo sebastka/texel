@@ -500,7 +500,13 @@ impl IopBus {
             self.out.push(v as u8);
             return;
         }
-        self.io_write(pa & !3, v << ((pa & 3) * 8), N);
+        let shift = (pa & 3) * 8;
+        let mask = if N >= 4 {
+            u32::MAX
+        } else {
+            ((1u32 << (8 * N)) - 1) << shift
+        };
+        self.io_write(pa & !3, v << shift, mask);
     }
 
     fn io_read(&mut self, pa: u32) -> u32 {
@@ -514,6 +520,13 @@ impl IopBus {
             0x1D00_0000..0x1D00_0070 => self.sif.iop_read(pa - 0x1D00_0000),
             0x1F80_8200..0x1F80_8300 => self.sio2.read(pa - 0x1F80_8200),
             0x1F80_1600..0x1F80_1700 => self.usb.read(pa - 0x1F80_1600),
+            // The expansion bay (DEV9): its revision (the halfword at
+            // 0x146E) says a bay, 0x3x, as on every model but the first
+            // Japanese ones (PCMCIA, 0x2x); its device's registers (the
+            // network adapter's SPEED chip, at 0x10000000) read 0: nothing
+            // plugged in. Games load the bay's driver for their online
+            // modes, and wait for its answer.
+            0x1F80_146C => (self.regs.get(&pa).copied().unwrap_or(0) & 0xFFFF) | 0x30 << 16,
             0x1F80_1070 => self.intc.stat,
             0x1F80_1074 => self.intc.mask,
             0x1F80_1078 => std::mem::take(&mut self.intc.ctrl),
@@ -537,20 +550,27 @@ impl IopBus {
         }
     }
 
-    fn io_write(&mut self, pa: u32, v: u32, width: usize) {
+    /// A write to an I/O register at `pa` (word-aligned): of the bytes in
+    /// `mask`, with `v` in their lanes.
+    fn io_write(&mut self, pa: u32, v: u32, mask: u32) {
         if let Some((t, reg)) = Timers::select(pa) {
             return self.timers.write(t, reg, v);
         }
         if let Some((ch, reg)) = Dma::select(pa) {
+            // Halfword writes keep the other half: the sound library writes
+            // BCR's block size and count apart.
+            let v = (self.dma.ch[ch][reg] & !mask) | (v & mask);
             self.dma.ch[ch][reg] = v;
-            if reg == 2 && v & CHCR_BUSY != 0 && (ch == 9 || ch == 10) {
+            // A channel starts on a write of its start bit.
+            let start = reg == 2 && mask & CHCR_BUSY != 0 && v & CHCR_BUSY != 0;
+            if start && (ch == 9 || ch == 10) {
                 self.sif.log_tag(
                     if ch == 9 { "IOP start ch9" } else { "IOP start ch10" },
                     v,
                     self.dma.ch[ch][3],
                 );
             }
-            if reg == 2 && v & CHCR_BUSY != 0 && ch != 9 && ch != 10 {
+            if start && ch != 9 && ch != 10 {
                 // No data moves yet. Channels 4 and 7 (the SPU2's two
                 // cores) take time, as the sound libraries expect to see
                 // them under way; the others are done at once.
@@ -592,7 +612,7 @@ impl IopBus {
             0x1F80_157C => self.dma.dmacinten = v,
             0xFFFE_0130 => self.cache_ctrl = v,
             _ => {
-                if !self.regs.contains_key(&pa) && width == 4 {
+                if !self.regs.contains_key(&pa) && mask == u32::MAX {
                     self.note_unknown(pa);
                 }
                 self.regs.insert(pa, v);
@@ -635,6 +655,10 @@ impl IopBus {
         let madr = self.dma.ch[ch][0] as usize;
         let len = 4 * words as usize;
         let at = |k: usize| (madr + k) & (IOP_RAM_SIZE - 1);
+        if let Some(log) = &mut self.cdvd.read_log {
+            let kind = u32::from(self.spu2.auto_dma(core)) | u32::from(self.spu2.dma_reads(core)) << 1;
+            log.push((0xFD, madr as u32, bcr, ch as u32, kind));
+        }
         if self.spu2.dma_reads(core) {
             let data = self.spu2.dma_read(core, len);
             for (k, b) in data.into_iter().enumerate() {
@@ -679,6 +703,9 @@ impl IopBus {
                 self.dma.cdvd_log.pop_front();
             }
             self.dma.cdvd_log.push_back((madr, block.len(), self.dma.ch[3][1]));
+            if let Some(log) = &mut self.cdvd.read_log {
+                log.push((0xFF, madr, n as u32, self.dma.ch[3][1], self.cdvd.blocks.len() as u32));
+            }
             if self.dma.cdvd_bytes == 0 {
                 self.dma.complete(3, &mut self.intc);
             }
@@ -717,6 +744,16 @@ impl IopBus {
                 let tag = self.ram_word(tadr);
                 let words = self.ram_word(tadr + 4);
                 self.sif.log_tag("IOP sif0", tag, words);
+                let ee = [self.ram_word(tadr + 8), self.ram_word(tadr + 12)];
+                let first: [u32; 4] = std::array::from_fn(|k| self.ram_word((tag & 0xFF_FFFF) + 4 * k as u32));
+                let more: [u32; 4] = std::array::from_fn(|k| self.ram_word((tag & 0xFF_FFFF) + 16 + 4 * k as u32));
+                if let Some(log) = &mut self.cdvd.read_log {
+                    log.push((0xFE, tag, words, ee[1], ee[0]));
+                    if words <= 16 {
+                        log.push((0xFC, first[0], first[1], first[2], first[3]));
+                        log.push((0xFC, more[0], more[1], more[2], more[3]));
+                    }
+                }
                 for k in 0..4 {
                     let w = self.ram_word(tadr + 8 + 4 * k);
                     self.sif.sif0.push_back(w);
@@ -870,6 +907,23 @@ mod tests {
         assert_eq!(intc.stat & (1 << 4), 1 << 4);
         assert_ne!(timers.read(0, 4) & MODE_TARGET_REACHED, 0);
         assert_eq!(timers.read(0, 4) & MODE_TARGET_REACHED, 0);
+    }
+
+    /// The sound library writes an SPU2 channel's BCR as two halfwords,
+    /// block size then count: both stay (GTA III's movie sound took a
+    /// sixteenth of its data per transfer, and the movie skipped ahead to
+    /// keep up). A halfword write to CHCR's low half starts nothing.
+    #[test]
+    fn dma_registers_take_halfwords() {
+        let mut bus = IopBus::new(&[]);
+        bus.store16(0xBF80_10C4, 16);
+        bus.store16(0xBF80_10C6, 0xC0);
+        assert_eq!(bus.dma.ch[4][1], 0x00C0_0010);
+        bus.store16(0xBF80_10C8, 0x0201);
+        assert_eq!(bus.dma.ch[4][2], 0x0201);
+        bus.store32(0xBF80_10C0, 0x1000);
+        bus.store16(0xBF80_10CA, (CHCR_BUSY >> 16) as u16);
+        assert_eq!(bus.dma.ch[4][2], CHCR_BUSY | 0x0201);
     }
 
     #[test]

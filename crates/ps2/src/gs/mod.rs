@@ -116,6 +116,16 @@ pub struct Gs {
     pub rendering: Rendering,
     #[serde(skip)]
     commands: Vec<Command>,
+    /// Diagnostics, when set: the transfers started (direction, then the
+    /// destination's base, width, format, position and size, the source's
+    /// base, width and format, the 64-bit words of data the transfer
+    /// received and how many were not zero, and the EE address its first
+    /// data came from, by GIF DMA), the first million.
+    #[serde(skip)]
+    pub transfer_log: Option<Vec<[u32; 14]>>,
+    /// Diagnostics: the EE address of the GIF DMA's current quadword.
+    #[serde(skip)]
+    pub dma_source: u32,
 }
 
 fn no_clut() -> [u32; 256] {
@@ -138,6 +148,8 @@ impl Default for Gs {
             drawn: 0,
             rendering: Rendering::Software,
             commands: Vec::new(),
+            transfer_log: None,
+            dma_source: 0,
         }
     }
 }
@@ -382,6 +394,29 @@ impl Gs {
     // --- Transfers -------------------------------------------------------------
 
     fn start_transfer(&mut self, dir: u32) {
+        if self.transfer_log.as_ref().is_some_and(|l| l.len() < 1_000_000) {
+            let (dbp, dbw, dpsm, dx, dy, w, h) = self.transfer_target();
+            let b = self.regs[reg::BITBLTBUF as usize];
+            let entry = [
+                dir,
+                dbp,
+                dbw,
+                dpsm,
+                dx,
+                dy,
+                w,
+                h,
+                field(b, 0, 14),
+                field(b, 16, 6),
+                field(b, 24, 6),
+                0,
+                0,
+                0,
+            ];
+            if let Some(l) = self.transfer_log.as_mut() {
+                l.push(entry);
+            }
+        }
         self.transfer = Transfer::default();
         match dir {
             0 => self.transfer.active = true,
@@ -411,6 +446,14 @@ impl Gs {
     fn hwreg(&mut self, data: u64) {
         if !self.transfer.active {
             return;
+        }
+        let source = self.dma_source;
+        if let Some(last) = self.transfer_log.as_mut().and_then(|l| l.last_mut()) {
+            if last[11] == 0 {
+                last[13] = source;
+            }
+            last[11] += 1;
+            last[12] += u32::from(data != 0);
         }
         let (dbp, dbw, dpsm, dx, dy, w, h) = self.transfer_target();
         if w == 0 || h == 0 {

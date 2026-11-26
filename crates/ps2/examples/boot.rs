@@ -31,6 +31,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => return Err("not a PlayStation 2 BIOS".into()),
     }
     let mut ps2 = Ps2::new(&bios);
+    if std::env::var("CDVDREADS").is_ok() {
+        ps2.bus.iop.cdvd.read_log = Some(Vec::new());
+    }
     // What the IOP's modules print.
     ps2.iop_printf = Some(Default::default());
     // NOGFX=1: draw nothing (faster, when frames do not matter).
@@ -59,6 +62,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Ok(path) = std::env::var("LOAD") {
         ps2.load_state(&std::fs::read(&path)?)?;
         println!("Loaded {path}");
+    }
+    // IPUTRACE=path: the IPU's input stream (path.bin) and its commands
+    // (path.txt), for another decoder to compare.
+    if std::env::var("IPUTRACE").is_ok() {
+        ps2.bus.ipu.trace = Some(Box::default());
+        ps2.bus.ipu_sources = Some((Vec::new(), 0, 0));
+        // IPUWATCH=address: writes to those 64 bytes, in the same log.
+        ps2.bus.ipu_watch = std::env::var("IPUWATCH")
+            .ok()
+            .and_then(|a| u32::from_str_radix(&a, 16).ok());
+    }
+    // TRANSFERS=1: the GS's transfers, from the start (reported with
+    // DRAWS).
+    if std::env::var("TRANSFERS").is_ok() {
+        ps2.bus.gs.transfer_log = Some(Vec::new());
     }
     // VU1THREAD=1: VU1 in a thread of its own (see `vu1q`).
     if std::env::var("VU1THREAD").is_ok() {
@@ -437,6 +455,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     println!("VU1 queue {:?}", ps2.bus.vu1q.stats);
     println!("GIF quadwords by path {:?}", ps2.bus.gif.qwords);
+    println!(
+        "Path 3: GIF_MODE {:08X}, VIF1's MSKPATH3 {}; GIF DMA CHCR {:08X} MADR {:08X} QWC {:X} TADR {:08X}; D_CTRL {:08X}",
+        ps2.bus.register(0x1000_3010),
+        ps2.bus.vif1.mask_path3,
+        ps2.bus.register(0x1000_A000),
+        ps2.bus.register(0x1000_A010),
+        ps2.bus.register(0x1000_A020),
+        ps2.bus.register(0x1000_A030),
+        ps2.bus.register(0x1000_E000)
+    );
     let ipu = &ps2.bus.ipu;
     println!(
         "IPU commands (BCLR IDEC BDEC VDEC FDEC SETIQ SETVQ CSC PACK SETTH) {:?}, errors {}, busy {}, output {} quadwords",
@@ -445,6 +473,51 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ipu.busy(),
         ipu.output.len()
     );
+    if let (Ok(path), Some(t)) = (std::env::var("IPUTRACE"), &ipu.trace) {
+        std::fs::write(format!("{path}.bin"), &t.stream)?;
+        let lines: String = t
+            .commands
+            .iter()
+            .map(|(code, opt, start, end, err, data)| {
+                format!("{code:X} {opt:07X} {start} {end} {} {data:08X}\n", u8::from(*err))
+            })
+            .collect();
+        std::fs::write(format!("{path}.txt"), lines)?;
+        if let Some((log, _, _)) = &ps2.bus.ipu_sources {
+            let lines: String = log
+                .iter()
+                .map(|&(at, a, tag)| match tag {
+                    0 => format!("{at} {a:08X}\n"),
+                    t if t >> 61 == 1 => format!("{at} write {a:08X} {:08X} ({} bytes)\n", t as u32, (t >> 32) & 0xFF),
+                    t if t >> 62 == 1 => format!("{at} BP {a:08X} IFC {} FP {}\n", (t >> 8) & 0xFF, t & 0xFF),
+                    t if t >> 63 != 0 => format!(
+                        "{at} {a:08X} start CHCR {:08X} after {:08X}\n",
+                        t as u32,
+                        (t >> 32) as u32 & 0x7FFF_FFFF
+                    ),
+                    t => format!("{at} {a:08X} tag {t:016X}\n"),
+                })
+                .collect();
+            std::fs::write(format!("{path}.src"), lines)?;
+        }
+        println!(
+            "IPU trace: {} bytes of stream, {} commands",
+            t.stream.len(),
+            t.commands.len()
+        );
+    }
+    for (code, opt, started, failed, next) in &ipu.error_log {
+        println!(
+            "  IPU error: command {code:X} options {opt:08X}, from bit {started} to {failed} (+{}), then {next:08X}",
+            failed.saturating_sub(*started)
+        );
+    }
+    if let Some((ctrl, words)) = &ipu.error_input {
+        println!("  IPU first non-intra BDEC error: IPU_CTRL {ctrl:08X}, input:");
+        for q in words {
+            println!("    {q:032X}");
+        }
+    }
     let mut gs_regs: BTreeMap<u32, u64> = BTreeMap::new();
     for &(off, v) in &ps2.bus.gs.privileged.writes {
         gs_regs.insert(off, v);
@@ -533,6 +606,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "TLB {i:2}: mask {:08X} hi {:08X} lo0 {:08X} lo1 {:08X}",
                 e.page_mask, e.entry_hi, e.entry_lo0, e.entry_lo1
             );
+        }
+    }
+    if let Some(log) = &ps2.bus.iop.cdvd.read_log {
+        for &(cmd, lsn, count, left, waiting) in log {
+            if cmd == 0xFC {
+                println!("    words {lsn:08X} {count:08X} {left:08X} {waiting:08X}");
+                continue;
+            }
+            if cmd == 0xFD {
+                println!(
+                    "  SPU2DMA ch{left} {lsn:08X} BCR {count:08X} (auto {}, read {})",
+                    waiting & 1,
+                    waiting >> 1
+                );
+                continue;
+            }
+            if cmd == 0xFE {
+                println!("  SIF0 {lsn:08X} {count} words to EE {left:08X} (EE tag {waiting:08X})");
+                continue;
+            }
+            if cmd == 0xFF {
+                println!("  DMA3 {lsn:08X} {count} bytes (BCR {left:08X}, waiting {waiting})");
+                continue;
+            }
+            println!("  READ {cmd:02X} {lsn} {count} (previous left {left}, waiting {waiting})");
         }
     }
     if std::env::var("CDVDCMDS").is_ok() {
@@ -654,6 +752,12 @@ fn dump_draws(ps2: &mut Ps2, frames: u64) {
     ps2.bus.gs.rendering = texel_ps2::gs::Rendering::Record;
     ps2.bus.gs.take_commands();
     ps2.bus.vu1.kicks = Some(Vec::new());
+    // VIFWATCH=from,to: VIF1's UNPACKs writing VU1 memory there
+    // (quadwords, hex), and the programs started.
+    ps2.bus.vif1.watch = std::env::var("VIFWATCH").ok().and_then(|v| {
+        let (a, b) = v.split_once(',')?;
+        Some((u32::from_str_radix(a, 16).ok()?, u32::from_str_radix(b, 16).ok()?))
+    });
     ps2.bus.vu1.trace_from = std::env::var("PROG")
         .ok()
         .and_then(|v| u32::from_str_radix(&v, 16).ok());
@@ -668,7 +772,7 @@ fn dump_draws(ps2: &mut Ps2, frames: u64) {
     // The context's changes, and the draws near the origin in the main
     // view's (offset 0x7000) between them.
     let log = ps2.bus.gif.context_log.take().unwrap_or_default();
-    println!("--- FRAME_1 / XYOFFSET_1 writes (path, register, value, at command):");
+    println!("--- FRAME_1 / XYOFFSET_1 / TEX0_1 / TEX2_1 writes (path, register, value, at command):");
     let near = |c: &Command| {
         matches!(c, Command::Draw { regs, vertices, .. }
         if regs.xyoffset & 0xFFFF == 0x7000 && vertices.iter().any(|v| v.x < 0x100 || v.y < 0x100))
@@ -795,6 +899,32 @@ fn dump_draws(ps2: &mut Ps2, frames: u64) {
             println!("CODE {pc:04x} {hi:08x} {lo:08x}");
         }
     }
+    if let Some(log) = &ps2.bus.gs.transfer_log {
+        println!(
+            "--- GS transfers ({}), in order (repeats folded): dir, to (base width format x y w h), \
+             from (base width format), data words (non-zero), the data's EE address (GIF DMA)",
+            log.len()
+        );
+        let mut k = 0;
+        while k < log.len() {
+            let t = log[k];
+            let mut n = 1;
+            while k + n < log.len() && log[k + n] == t {
+                n += 1;
+            }
+            println!(
+                "  {n:4}x dir {} to {:#06x} w{} psm {:#04x} ({},{}) {}x{} from {:#06x} w{} psm {:#04x}: {} words ({} non-zero) at {:#010x}",
+                t[0], t[1], t[2], t[3], t[4], t[5], t[6], t[7], t[8], t[9], t[10], t[11], t[12], t[13]
+            );
+            k += n;
+        }
+    }
+    if ps2.bus.vif1.watch.is_some() {
+        println!("--- VIF1 writes watched ({}):", ps2.bus.vif1.watched.len());
+        for line in &ps2.bus.vif1.watched {
+            println!("{line}");
+        }
+    }
     println!("--- VU1 programs (start: packets, vertices, off-screen ones)");
     for (start, (n, v, bad)) in &by_program {
         println!("  {start:#06x}: {n} packets, {v} vertices, {bad} off");
@@ -830,6 +960,37 @@ fn dump_draws(ps2: &mut Ps2, frames: u64) {
         "--- draws over {frames} frames: {} commands, by kind {kinds:?}",
         commands.len()
     );
+    // DRAWSTATE=1: the draws by their state (kind, PRIM's flags, TEX0,
+    // ALPHA, TEST, FRAME), with one vertex of each group.
+    if std::env::var("DRAWSTATE").is_ok() {
+        type State = (u32, u64, u64, u64, u64, u64);
+        let mut groups: std::collections::BTreeMap<State, (usize, Option<texel_ps2::gs::Vertex>)> =
+            std::collections::BTreeMap::new();
+        for c in &commands {
+            if let Command::Draw { kind, regs, vertices } = c {
+                let key = (*kind, regs.prim & 0x7F8, regs.tex0, regs.alpha, regs.test, regs.frame);
+                let g = groups.entry(key).or_insert((0, None));
+                g.0 += 1;
+                if g.1.is_none() {
+                    g.1 = vertices.first().copied();
+                }
+            }
+        }
+        let mut list: Vec<_> = groups.into_iter().collect();
+        list.sort_by_key(|(_, (n, _))| std::cmp::Reverse(*n));
+        println!("--- draws by state ({} states):", list.len());
+        for ((kind, flags, tex0, alpha, test, frame), (n, v)) in list.iter().take(24) {
+            println!(
+                "  {n:5} kind {kind} prim flags {flags:#05x} TEX0 {tex0:#018x} ALPHA {alpha:#012x} TEST {test:#07x} FRAME {frame:#012x}"
+            );
+            if let Some(v) = v {
+                println!(
+                    "        vertex rgba {:?} st {:.3},{:.3} q {:.3} uv {:#x},{:#x}",
+                    v.rgba, v.s, v.t, v.q, v.u, v.v
+                );
+            }
+        }
+    }
     let mut ctx: Vec<_> = contexts.into_iter().collect();
     ctx.sort_by_key(|(_, (n, _))| std::cmp::Reverse(*n));
     for ((frame, off, sc), (n, near)) in ctx.iter().take(14) {

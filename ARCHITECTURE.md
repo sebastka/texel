@@ -122,11 +122,11 @@ Controllers come from the keyboard and the Gamepad API (`input.ts`, `gamepad.ts`
 | Emotion Engine | MIPS R5900: interpreter with COP0 (exceptions, TLB), the FPU, the MMI SIMD instructions; compiled to WebAssembly in browsers, a block at a time, 64 blocks to a module compiled in the background (D30, D70) |
 | Vector units | VU0 (macro mode, as the EE's COP2, and microprograms) and VU1: interpreter with the flags' pipeline, microprograms compiled to WebAssembly (four lanes at once, in its SIMD) (D49). VU1's work is queued until the EE side needs it, and can run in its own worker (D57) |
 | VIF0, VIF1 | UNPACK (all formats, masks, modes), MPG, MSCAL/MSCNT, DIRECT, double buffering |
-| GIF | Paths 1 to 3: PACKED, REGLIST and IMAGE |
+| GIF | Paths 1 to 3: PACKED, REGLIST and IMAGE; path 3 waits while masked (GIF_MODE, VIF1's MSKPATH3), as GIF_STAT reports (D76) |
 | Graphics Synthesizer | Software rasteriser (sprites, triangles, lines, textures in every format, CLUTs, blending, depth and alpha tests, fog), transfers both ways, privileged registers; on the GPU through WebGPU: the software GS records what it is asked, `crates/ps2-gpu` draws it (D25, D28, D29) |
 | IPU | MPEG-1/2 decoding (BDEC, IDEC, VDEC, FDEC), colour conversion (CSC, PACK), its DMA channels: movies play (D60) |
-| DMA, INTC, timers | The EE's channels (normal, chain, interleave), interrupt controller (a vertical blank's interrupt waits for the next read of INTC_STAT, D59), four timers |
-| I/O processor | `crates/ps1`'s CPU, with its own memory map, interrupts, six timers and DMA; the SIF between it and the EE (D24); a USB host controller (OHCI) with nothing plugged in, for games loading Sony's USB driver (D72) |
+| DMA, INTC, timers | The EE's channels (normal, chain, interleave, the memory FIFO: D78), interrupt controller (a vertical blank's interrupt waits for the next read of INTC_STAT, D59), four timers |
+| I/O processor | `crates/ps1`'s CPU, with its own memory map, interrupts, six timers and DMA; the SIF between it and the EE (D24); a USB host controller (OHCI) with nothing plugged in, for games loading Sony's USB driver (D72); an expansion bay with nothing plugged in (D77) |
 | CDVD | N commands (reads of CD and DVD sectors, the end once DMA has the data, D61), S commands (clock, region, EEPROM), disc changes; after a fast boot, the system configuration the browser would have set (D73) |
 | SPU2 | Two cores of 24 voices (the PS1's SPU's), sound memory, DMA, reverb (D33) |
 | SIO2 | Controllers (DualShock 2, pressure-sensitive buttons included, D71) and memory cards (8 MiB, with ECC; formatted by the server) (D32) |
@@ -175,8 +175,10 @@ It prints what the BIOS kernel writes to its debug port (its start-up log) and w
 | `PACKETS=1`, `TAGS=1` | The SIF's commands and DMA tags |
 | `CODE=start,end`, `FIND=imm`, `IOPFIND=imm` | EE memory (hex); EE or IOP loads and stores with that offset |
 | `CDVDCMDS=1`, `CARDLOG=1`, `SIO2TRACE=1`, `USBLOG=1` | The drive's commands; the cards'; SIO2's registers; the USB controller's first accesses |
-| `DRAWS=frames` | What the GS was asked to draw over that many more frames |
+| `DRAWS=frames` | What the GS was asked to draw over that many more frames, and the writes of FRAME, XYOFFSET, TEX0 and TEX2 by GIF path |
 | `PROG=hex`, `FINDXY=x,y` | VU1's runs from there; which GIF path sent a vertex |
+| `VIFWATCH=from,to` | VIF1's UNPACKs writing VU1 memory there (quadwords, hex), their vectors, and the programs started |
+| `TRANSFERS=1`, `DRAWSTATE=1` (with `DRAWS`) | The GS's transfers from the start, in order (destination, format, size, how much data was not zero, its EE address); the draws by state (kind, TEX0, ALPHA, TEST, FRAME) |
 
 The GS on the GPU (`crates/ps2-gpu`, with wgpu: Vulkan, Metal or DirectX 12 natively, WebGPU in browsers) is checked against the software GS: `cargo run --release -p texel-ps2-gpu --example compare -- PS2-BIOS [SECONDS] [OUT_DIR]` boots a BIOS with both and prints, every second, how many GS memory words differ (`PAGES=1`: by page), writing both displayed frames (`GPU_ONLY=1`: the GPU alone, to measure it; it takes `DISC`, `MC1` and `PRESS` too). Its tests (`cargo test -p texel-ps2-gpu`) draw with both and compare the whole GS memory; without a GPU, they pass and say so.
 

@@ -119,6 +119,16 @@ pub struct Vif {
     pub irq: bool,
     /// Microprograms started, for diagnostics.
     pub calls: u64,
+    /// VIF1's MSKPATH3: path 3 masked (GIF_STAT's M3P). Not in save
+    /// states: games mask it around a transfer, never across frames.
+    #[serde(skip)]
+    pub mask_path3: bool,
+    /// Diagnostics: VU memory's quadwords to watch (from, to), and what
+    /// wrote there: UNPACKs, their vectors, programs started.
+    #[serde(skip)]
+    pub watch: Option<(u32, u32)>,
+    #[serde(skip)]
+    pub watched: Vec<String>,
 }
 
 impl Vif {
@@ -145,6 +155,9 @@ impl Vif {
             written: 0,
             irq: false,
             calls: 0,
+            mask_path3: false,
+            watch: None,
+            watched: Vec::new(),
         }
     }
 
@@ -296,10 +309,24 @@ impl Vif {
                 self.written = 0;
                 self.bytes.clear();
                 self.pending = Pending::Unpack(n);
+                if let Some((from, to)) = self.watch
+                    && self.watched.len() < 4000
+                    && self.addr <= to
+                    && self.addr + n * self.wl.max(self.cl).max(1) >= from
+                {
+                    let line = format!(
+                        "UNPACK {w:08x} at {:#05x} n {n} cl {} wl {} mode {} mask {:08x} row {:x?} col {:x?} tops {:#x}",
+                        self.addr, self.cl, self.wl, self.mode, self.mask, self.row, self.col, self.tops
+                    );
+                    self.watched.push(line);
+                }
                 // Vectors that need no input (filling writes) go out now.
                 self.unpack_fill(vu);
             }
-            // NOP, MSKPATH3, FLUSHE, FLUSH, FLUSHA: nothing to wait for.
+            // MSKPATH3 (VIF1): path 3 masked (bit 15) or not; games wait
+            // for GIF_STAT to show it.
+            0x06 if self.index == 1 => self.mask_path3 = imm & 0x8000 != 0,
+            // NOP, FLUSHE, FLUSH, FLUSHA: nothing to wait for.
             _ => {}
         }
     }
@@ -307,6 +334,10 @@ impl Vif {
     /// MSCAL/MSCNT: TOP and ITOP for the program, double buffering on VIF1,
     /// then the program runs.
     fn start(&mut self, pc: Option<u32>, vu: &mut impl VuSink) {
+        if self.watch.is_some() && self.watched.len() < 4000 {
+            self.watched
+                .push(format!("START {pc:x?} tops {:#x} itops {:#x}", self.tops, self.itops));
+        }
         let mut top = None;
         if self.index == 1 {
             top = Some(self.tops as u16);
@@ -483,6 +514,13 @@ impl Vif {
             self.addr + self.written
         };
         let masked = (self.code >> 24) & 0x10 != 0;
+        if let Some((from, to)) = self.watch
+            && (from..=to).contains(&(dest & 0x3FF))
+            && self.watched.len() < 4000
+        {
+            self.watched
+                .push(format!("  write {:#05x} data {data:x?}", dest & 0x3FF));
+        }
         if !masked && self.mode == 0 {
             // The lanes given, as they are.
             vu.write_lanes(dest, data);
