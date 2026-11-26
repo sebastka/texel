@@ -77,11 +77,21 @@ fn branches_end_with_their_delay_slot() {
         r(0x08, 0, 31, 0),
         r(0x09, 31, 8, 0),
     ] {
+        // Jumps end blocks; conditional branches do not (the block leaves
+        // when they are taken).
+        let jump = matches!(b >> 26, 0x00 | 0x02 | 0x03);
         // A load before the branch (landing after it), and in its slot.
-        assert_eq!(check(0x8001_0000, &[lw, b, lw, 0, 0], true), 3);
+        assert_eq!(check(0x8001_0000, &[lw, b, lw, 0, 0], true), if jump { 3 } else { 5 });
         // A slot left to the interpreter.
-        assert_eq!(check(0xbfc0_0100, &[b, r(0x18, 0, 8, 9), 0], true), 2);
+        assert_eq!(check(0xbfc0_0100, &[b, r(0x18, 0, 8, 9), 0], true), if jump { 2 } else { 3 });
     }
     // A branch in a delay slot: the block ends before the first.
     assert_eq!(check(0x8001_0000, &[0, i(0x04, 0, 0, 1), i(0x04, 0, 0, 1)], true), 1);
+    // A branch back to the block's start ends it (a loop), as does a slot
+    // the block stops after.
+    assert_eq!(check(0x8001_0000, &[lw, i(0x05, 8, 0, 0xfffe), 0, 0], true), 3);
+    assert_eq!(check(0x8001_0000, &[i(0x05, 8, 0, 3), r(0x0c, 0, 0, 0), 0], true), 2);
+    // Several conditional branches in a block, up to a jump.
+    let words = [i(0x05, 8, 0, 3), 0, i(0x04, 8, 9, 5), lw, 0, r(0x08, 0, 31, 0), 0, 0];
+    assert_eq!(check(0x8001_0000, &words, true), 7);
 }

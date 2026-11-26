@@ -1,6 +1,7 @@
 //! A block of CPU code compiled to one WebAssembly function: from its first
-//! instruction to the delay slot of its first branch (or `MAX_LEN`
-//! instructions). The function takes the CPU and the bus (their addresses
+//! instruction to the delay slot of its first jump or branch back to its
+//! start (or `MAX_LEN` instructions), leaving at the conditional branches
+//! before taken. The function takes the CPU and the bus (their addresses
 //! in this module's memory) and returns the instructions it ran.
 //!
 //! Each instruction: its fetch's cycles (through the instruction cache, as
@@ -405,6 +406,11 @@ fn branch_target(i: u32, at: u32) -> Option<u32> {
     }
 }
 
+/// Whether a branch is conditional (not a jump: J, JAL, JR, JALR).
+fn conditional(i: u32) -> bool {
+    matches!(i >> 26, 0x01 | 0x04..=0x07)
+}
+
 /// What an instruction is, for compiling.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Class {
@@ -458,17 +464,27 @@ pub fn compile(
     exec: u32,
     layout: &Layout,
 ) -> Option<Compiled> {
-    // How many instructions: to the first branch's delay slot (a branch
-    // with no delay slot here, or a branch in it, ends the block before).
+    // How many instructions: to the delay slot of the first jump, or of
+    // the first branch back to the block's start (a loop, see `back`). A
+    // block goes on after other conditional branches, as when they are
+    // not taken, and leaves for their destination when they are: fewer,
+    // longer blocks (their dispatch cost what they ran, in profiles). A
+    // branch with no delay slot here, or a branch in it, ends the block
+    // before it.
     let mut len = 0;
     while len < words.len().min(MAX_LEN) {
         match class(words[len]) {
             Class::Branch => {
-                let slot_ok = len + 1 < words.len() && class(words[len + 1]) != Class::Branch;
-                if slot_ok {
-                    len += 2;
+                let slot = words.get(len + 1).map(|&w| class(w));
+                if slot.is_none_or(|s| s == Class::Branch) {
+                    break;
                 }
-                break;
+                let (branch, at) = (words[len], pc.wrapping_add(4 * len as u32));
+                len += 2;
+                let goes_on = conditional(branch) && branch_target(branch, at) != Some(pc) && slot != Some(Class::Stop);
+                if !goes_on {
+                    break;
+                }
             }
             Class::Stop => {
                 len += 1;
@@ -797,7 +813,16 @@ pub fn compile(
             }
         }
         if in_delay {
-            break;
+            if k + 1 == len {
+                break;
+            }
+            // A conditional branch: taken, the block leaves for its
+            // destination; not, it goes on.
+            e.c.local_get(TAKEN).if_();
+            e.depth += 1;
+            e.leave(After::Delay, landing);
+            e.depth -= 1;
+            e.c.op(op::END);
         }
         in_delay = false;
     }

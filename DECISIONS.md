@@ -697,3 +697,13 @@ Every page's footer says which commit the app was built from, linked to it on Gi
 
 - **At build time** (`scripts/build-env.sh`, run by `pnpm run build`): Vite's environment gets the commit (`TEXEL_COMMIT`, else git's HEAD), whether the tree had changes, and the repository (`TEXEL_REPOSITORY`, else the project's). No Node types in the project: the script passes them, not the Vite config.
 - **The image** is built without `.git`: its web stage takes `TEXEL_COMMIT` and `TEXEL_REPOSITORY` as build arguments, which CI and the release workflow set from the run.
+
+## D88. Fewer, longer compiled blocks
+
+Spyro the Dragon slowed down in heavy scenes on an Apple M1 (Linux, Firefox, no WebGPU): its emulation took 10 ms a frame on average, but often over 30 at worst, against a PAL frame's 20. The status line now says so: the second's emulation time per frame, on average and at most, against the frame's budget. In profiles, a third of the emulation went to going from one compiled block to the next, against a seventh to the blocks themselves; and the slowest frames were those with new code to compile.
+
+- **Blocks start where blocks start.** The compiler was asked before every instruction the interpreter ran, so code not compiled yet started a block at each of its instructions: those compiled, mostly never run again, were dropped as RAM changed. It is now asked after a jump, a branch or a compiled block only. Spyro compiles 10,254 blocks instead of 42,800, and drops 115 instead of 2,168; in Firefox, its slowest frame went from 126 ms to 19.
+- **Blocks go on after conditional branches**, as when not taken, and leave when they are: a block ends at a jump (J, JAL, JR, JALR), at a branch back to its start (a loop, run inside the block as before), or after 64 instructions. Blocks run 7.3 instructions on average instead of 6.1.
+- **Chained**: after a compiled block, the next one runs at once while the peripherals have nothing due and the frame is not over, as the frame's loop would have run it, without going through it.
+- **Measured** in Firefox on the development machine, Spyro the Dragon for 120 s: 4.65 ms a frame on average to 4.43, the 99th percentile from 11.1 to 10.7. Compiled and interpreted consoles stay the same (`check-ps1-compiler.mjs`, 60 s each of Spyro the Dragon, Spyro: Year of the Dragon, Crash Bandicoot, CTR and Tekken 3).
+- **What is left**: a quarter of a heavy frame draws the native picture, in the emulation worker even with a drawing worker (D40): games read it back, the drawing worker's textures come from it, and the GPU's drawing time is counted from the pixels it draws.

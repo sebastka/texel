@@ -180,36 +180,12 @@ impl Jit {
             return false;
         };
         let pc = cpu.pc;
+        if let Some(ran) = self.call(cpu, bus, pc, cause) {
+            return ran;
+        }
         let entry = self.blocks.entry(pc).or_insert(Entry::Cold(0));
         match entry {
-            Entry::Interpreted | Entry::Queued => return false,
-            Entry::Compiled {
-                func,
-                pa,
-                code,
-                writes,
-                icache,
-            } => {
-                let now = page_writes(bus, *pa, code.len());
-                if now != *writes {
-                    if code_at(bus, *pa, code.len()) != Some(&code[..]) {
-                        self.backend.release(*func);
-                        *entry = Entry::Cold(0);
-                        self.stats.invalidated += 1;
-                        return false;
-                    }
-                    *writes = now;
-                }
-                if *icache != bus.icache_enabled() {
-                    return false;
-                }
-                let func = *func;
-                cpu.set_cause(cause);
-                let n = self.backend.call(func, cpu, bus);
-                self.stats.runs += 1;
-                self.stats.in_blocks += u64::from(n);
-                return true;
-            }
+            Entry::Interpreted | Entry::Queued | Entry::Compiled { .. } => return false,
             Entry::Cold(n) if *n + 1 < HOT => {
                 *n += 1;
                 return false;
@@ -266,6 +242,62 @@ impl Jit {
             self.flush();
         }
         false
+    }
+
+    /// Runs blocks as `run`, then the compiled ones after them, while
+    /// nothing else would run between them in `run_frame`'s loop: the
+    /// peripherals have nothing due (`bus.deadline`), the frame is not
+    /// over, and each may start. The same as returning after each block,
+    /// without the way through the loop.
+    pub fn run_chained(&mut self, cpu: &mut Cpu, bus: &mut Bus) -> bool {
+        if !self.run(cpu, bus) {
+            return false;
+        }
+        while bus.pending < bus.deadline && !bus.gpu.frame_ready {
+            let Some(cause) = cpu.plain_start(bus.irq_active()) else {
+                break;
+            };
+            if self.call(cpu, bus, cpu.pc, cause) != Some(true) {
+                break;
+            }
+        }
+        true
+    }
+
+    /// Runs the compiled block at `pc`, if its code is still there and it
+    /// may run (`cause`: the CPU's, see `Cpu::plain_start`): whether it
+    /// ran; `None`: no block compiled there.
+    fn call(&mut self, cpu: &mut Cpu, bus: &mut Bus, pc: u32, cause: u32) -> Option<bool> {
+        let entry = self.blocks.get_mut(&pc)?;
+        let Entry::Compiled {
+            func,
+            pa,
+            code,
+            writes,
+            icache,
+        } = entry
+        else {
+            return None;
+        };
+        let now = page_writes(bus, *pa, code.len());
+        if now != *writes {
+            if code_at(bus, *pa, code.len()) != Some(&code[..]) {
+                self.backend.release(*func);
+                *entry = Entry::Cold(0);
+                self.stats.invalidated += 1;
+                return Some(false);
+            }
+            *writes = now;
+        }
+        if *icache != bus.icache_enabled() {
+            return Some(false);
+        }
+        let func = *func;
+        cpu.set_cause(cause);
+        let n = self.backend.call(func, cpu, bus);
+        self.stats.runs += 1;
+        self.stats.in_blocks += u64::from(n);
+        Some(true)
     }
 
     /// Puts the modules compiled since in use, then sends the blocks

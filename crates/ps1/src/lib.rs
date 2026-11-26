@@ -247,13 +247,14 @@ impl System {
         // interpreter, without a lookup for each instruction).
         let mut block_start = true;
         while !self.bus.gpu.frame_ready && budget > 0 {
-            // A compiled block counts its cycles into `pending` itself.
+            // A compiled block counts its cycles into `pending` itself (the
+            // blocks after it too, run on while nothing else is due).
             let compiled = block_start
                 && self.exe.is_none()
                 && self
                     .jit
                     .as_mut()
-                    .is_some_and(|jit| jit.run(&mut self.cpu, &mut self.bus));
+                    .is_some_and(|jit| jit.run_chained(&mut self.cpu, &mut self.bus));
             let cycles = if compiled {
                 0
             } else {
