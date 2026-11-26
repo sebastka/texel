@@ -69,6 +69,15 @@ code,
   font-size: 13px;
 }
 
+/* --- Footer: the build ---------------------------------------------------------- */
+
+#build {
+  padding: 24px 16px 16px;
+  text-align: center;
+  color: var(--muted);
+  font-size: 12px;
+}
+
 /* --- Header -------------------------------------------------------------------- */
 
 header {

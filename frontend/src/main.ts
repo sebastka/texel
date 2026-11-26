@@ -30,6 +30,7 @@ import {
   type VerifyState,
 } from "./meta";
 import { controlsDiagram } from "./controls";
+import { showBuild } from "./build";
 import { h, type Child } from "./dom";
 import { gamepadChip } from "./gamepad-ui";
 import { Player } from "./player";
@@ -39,6 +40,7 @@ import { roomBar, saveName, savedName } from "./room";
 import { Room, wsUrl, type RoomGame } from "./room-link";
 
 const app = document.querySelector<HTMLDivElement>("#app")!;
+showBuild(document.querySelector<HTMLElement>("#build")!);
 
 const BIOS_KEY = "texel.bios";
 
