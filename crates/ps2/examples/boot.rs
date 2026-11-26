@@ -285,14 +285,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
-    // FIND=imm: kernel stores and loads with that offset (16-bit), in RAM.
+    // FIND=imm: loads, stores, LUI, ADDIU and ORI with that 16-bit
+    // immediate, anywhere in RAM.
     if let Some(imm) = std::env::var("FIND")
         .ok()
         .and_then(|v| u32::from_str_radix(&v, 16).ok())
     {
-        for a in (0..0x0010_0000u32).step_by(4) {
+        for a in (0..0x0200_0000u32).step_by(4) {
             let w = ps2.bus.read32(a);
-            if w & 0xFFFF == imm && matches!(w >> 26, 0x23 | 0x2B | 0x0F | 0x09) {
+            // Loads and stores (LW, SW), LUI, ADDIU and ORI with that immediate.
+            if w & 0xFFFF == imm && matches!(w >> 26, 0x23 | 0x2B | 0x0F | 0x09 | 0x0D) {
                 println!("  {:08X}: {w:08X} op {:02X}", 0x8000_0000 | a, w >> 26);
             }
         }
