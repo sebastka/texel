@@ -609,4 +609,62 @@ mod tests {
         assert_eq!(gs.mem.read(psm::CT32, 0, 1, 5, 3), 0x4444_4444);
         assert!(!gs.transfer.active);
     }
+
+    /// Two quads at the same Z overlapping, the depth test GEQUAL: the
+    /// second draws over the first everywhere, its Z (flat) staying exactly
+    /// the vertices' (Liberty City Stories' glyphs lost their overlap).
+    #[test]
+    fn flat_z_passes_gequal_over_a_neighbour() {
+        let mut gs = Gs::default();
+        gs.write_reg(reg::FRAME_1, 1 << 16);
+        gs.write_reg(reg::SCISSOR_1, (63 << 16) | (63 << 48));
+        // Z24 at block 64; ZTE, GEQUAL.
+        gs.write_reg(reg::ZBUF_1, 2 | (1 << 24));
+        gs.write_reg(reg::TEST_1, (1 << 16) | (2 << 17));
+        gs.write_reg(reg::PRMODECONT, 1);
+        gs.write_reg(reg::PRIM, 3);
+        let xyz = |x: f64, y: f64| (x * 16.0) as u64 | ((y * 16.0) as u64) << 16 | 0xFF_FFFE << 32;
+        for (x0, color) in [(4.5, 0x8000_00FFu64), (16.5, 0x8000_FF00)] {
+            let (x1, y0, y1) = (x0 + 15.0, 2.5, 28.5);
+            gs.write_reg(reg::RGBAQ, color);
+            for (x, y) in [(x0, y0), (x1, y0), (x1, y1), (x0, y1), (x0, y0), (x1, y1)] {
+                gs.write_reg(reg::XYZ2, xyz(x, y));
+            }
+        }
+        for y in 3..28 {
+            for x in 17..20 {
+                assert_eq!(gs.mem.read(psm::CT32, 0, 1, x, y) & 0xFF_FFFF, 0xFF00, "pixel {x},{y}");
+            }
+        }
+    }
+
+    /// TEX1's MMAG = linear: a 2×1 texture (black, white) stretched over 4
+    /// pixels blends the two between their centers; nearest, it does not.
+    #[test]
+    fn bilinear_filtering_when_magnifying() {
+        for (tex1, third) in [(1 | 1 << 5, 0x7F_7F7F), (1, 0xFF_FFFF)] {
+            let mut gs = Gs::default();
+            gs.write_reg(reg::FRAME_1, 1 << 16);
+            gs.write_reg(reg::SCISSOR_1, (63 << 16) | (63 << 48));
+            gs.write_reg(reg::TEST_1, 0);
+            gs.write_reg(reg::PRMODECONT, 1);
+            // The texture at block 32, 64 wide: black then white.
+            gs.write_reg(reg::BITBLTBUF, (32 << 32) | (1 << 48));
+            gs.write_reg(reg::TRXPOS, 0);
+            gs.write_reg(reg::TRXREG, 2 | (1 << 32));
+            gs.write_reg(reg::TRXDIR, 0);
+            gs.write_reg(reg::HWREG, 0x80FF_FFFF_8000_0000);
+            // 2×1 (TW 1, TH 0), CT32, TCC, decal; TEX1: LCM (LOD = K = 0).
+            gs.write_reg(reg::TEX0_1, 32 | (1 << 14) | (1 << 26) | (1 << 34) | (1 << 35));
+            gs.write_reg(reg::TEX1_1, tex1);
+            gs.write_reg(reg::PRIM, 6 | (1 << 4) | (1 << 8));
+            gs.write_reg(reg::UV, 0);
+            gs.write_reg(reg::XYZ2, 0);
+            gs.write_reg(reg::UV, (2 * 16) | (16 << 16));
+            gs.write_reg(reg::XYZ2, (4 * 16) | (16 << 16));
+            let row: Vec<u32> = (0..4).map(|x| gs.mem.read(psm::CT32, 0, 1, x, 0) & 0xFF_FFFF).collect();
+            assert_eq!(row[1], 0, "TEX1 {tex1:#x}: {row:x?}");
+            assert_eq!(row[2], third, "TEX1 {tex1:#x}: {row:x?}");
+        }
+    }
 }

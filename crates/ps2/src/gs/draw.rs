@@ -28,6 +28,14 @@ struct Texture {
     ta0: u32,
     ta1: u32,
     aem: bool,
+    /// TEX1: the level of detail from K alone (LCM), or from Q, L and K;
+    /// bilinear filtering when magnifying (MMAG) and when minifying (MMIN
+    /// 1, 4 or 5: the base level only, mipmaps not drawn).
+    lcm: bool,
+    l: u32,
+    k: f64,
+    mag_linear: bool,
+    min_linear: bool,
 }
 
 /// The drawing environment of a primitive.
@@ -86,7 +94,10 @@ impl Gs {
         let fogcol = r[reg::FOGCOL as usize];
         let tex = tme.then(|| {
             let t = r[reg::TEX0_1 as usize + c];
+            let t1 = r[reg::TEX1_1 as usize + c];
             let clamp = r[reg::CLAMP_1 as usize + c];
+            // K: signed, 4 fractional bits.
+            let k = f64::from(((field(t1, 32, 12) << 20) as i32) >> 20) / 16.0;
             Texture {
                 tbp: field(t, 0, 14),
                 tbw: field(t, 14, 6),
@@ -106,6 +117,11 @@ impl Gs {
                 ta0: field(texa, 0, 8),
                 ta1: field(texa, 32, 8),
                 aem: field(texa, 15, 1) != 0,
+                lcm: field(t1, 0, 1) != 0,
+                l: field(t1, 19, 2),
+                k,
+                mag_linear: field(t1, 5, 1) != 0,
+                min_linear: matches!(field(t1, 6, 3), 1 | 4 | 5),
             }
         });
         Env {
@@ -163,7 +179,7 @@ impl Gs {
     fn draw_point(&mut self, e: &Env, v: &Vertex) {
         let x = (v.x as i32 - e.ofx + 8) >> 4;
         let y = (v.y as i32 - e.ofy + 8) >> 4;
-        let (u, t) = self.texcoord(
+        let tc = self.texcoord(
             e,
             f64::from(v.s),
             f64::from(v.t),
@@ -171,7 +187,7 @@ impl Gs {
             f64::from(v.u),
             f64::from(v.v),
         );
-        self.fragment(e, x, y, v.z, v.rgba.map(u32::from), (u, t), u32::from(v.fog));
+        self.fragment(e, x, y, v.z, v.rgba.map(u32::from), tc, u32::from(v.fog));
     }
 
     fn draw_line(&mut self, e: &Env, a: &Vertex, b: &Vertex) {
@@ -205,7 +221,7 @@ impl Gs {
             } else {
                 b.rgba.map(u32::from)
             };
-            let (u, t) = self.texcoord(
+            let tc = self.texcoord(
                 e,
                 lerp(f64::from(a.s), f64::from(b.s)),
                 lerp(f64::from(a.t), f64::from(b.t)),
@@ -214,7 +230,7 @@ impl Gs {
                 lerp(f64::from(a.v), f64::from(b.v)),
             );
             let fog = lerp(f64::from(a.fog), f64::from(b.fog)) as u32;
-            self.fragment(e, x, y, z, color, (u, t), fog);
+            self.fragment(e, x, y, z, color, tc, fog);
         }
     }
 
@@ -234,6 +250,7 @@ impl Gs {
         let color = b.rgba.map(u32::from);
         // Texel coordinates along each axis, from a to b: linear in x and y.
         let (mut u0, mut du, mut v0, mut dv) = (0.0, 0.0, 0.0, 0.0);
+        let q = if e.fst || b.q == 0.0 { 1.0 } else { f64::from(b.q) };
         if let Some(tex) = &e.tex {
             let (ua, ub, va, vb) = if e.fst {
                 (
@@ -268,7 +285,7 @@ impl Gs {
             let v = v0 + dv * f64::from(y - py0);
             let mut u = u0;
             for x in px0..px1 {
-                self.fragment(e, x, y, b.z, color, (u, v), fog);
+                self.fragment(e, x, y, b.z, color, (u, v, q), fog);
                 u += du;
             }
         }
@@ -339,13 +356,19 @@ impl Gs {
             attr(&|q| f64::from(q.fog)),
         ];
         let flat = v[2].rgba.map(u32::from);
+        // Z stays within the vertices' range: interpolated in floats and
+        // truncated, a flat 0xFFFFFE came out 0xFFFFFD in places, failing
+        // a GEQUAL test against a neighbour's (Liberty City Stories' text,
+        // its glyphs' quads overlapping).
+        let zmin = v.iter().take(3).map(|q| f64::from(q.z)).fold(f64::MAX, f64::min);
+        let zmax = v.iter().take(3).map(|q| f64::from(q.z)).fold(0.0, f64::max);
         let mut row_vals: [f64; 11] = planes.map(|p| p.0);
         for y in py0..py1 {
             let mut w = w_row;
             let mut vals = row_vals;
             for x in px0..px1 {
                 if w[0] + bias[0] >= 0 && w[1] + bias[1] >= 0 && w[2] + bias[2] >= 0 {
-                    let z = vals[0].clamp(0.0, f64::from(u32::MAX)) as u32;
+                    let z = vals[0].clamp(zmin, zmax) as u32;
                     let color = if e.iip {
                         [1, 2, 3, 4].map(|k| vals[k].clamp(0.0, 255.0) as u32)
                     } else {
@@ -372,16 +395,49 @@ impl Gs {
 
     // --- Textures ------------------------------------------------------------------
 
-    /// Texel coordinates, from STQ or UV (12.4).
-    fn texcoord(&self, e: &Env, s: f64, t: f64, q: f64, u: f64, v: f64) -> (f64, f64) {
+    /// Texel coordinates, from STQ or UV (12.4), and Q (1 with UV), for the
+    /// level of detail.
+    fn texcoord(&self, e: &Env, s: f64, t: f64, q: f64, u: f64, v: f64) -> (f64, f64, f64) {
         match &e.tex {
-            None => (0.0, 0.0),
-            Some(_) if e.fst => (u / 16.0, v / 16.0),
+            None => (0.0, 0.0, 1.0),
+            Some(_) if e.fst => (u / 16.0, v / 16.0, 1.0),
             Some(tex) => {
                 let q = if q == 0.0 { 1.0 } else { q };
-                (s / q * f64::from(tex.w), t / q * f64::from(tex.h))
+                (s / q * f64::from(tex.w), t / q * f64::from(tex.h), q)
             }
         }
+    }
+
+    /// Whether a texel at that Q is filtered (bilinear): the level of
+    /// detail decides between the magnifying and the minifying filter.
+    fn linear(tex: &Texture, q: f64) -> bool {
+        let lod = if tex.lcm {
+            tex.k
+        } else {
+            (1.0 / q.abs()).log2() * f64::from(1 << tex.l) + tex.k
+        };
+        if lod <= 0.0 { tex.mag_linear } else { tex.min_linear }
+    }
+
+    /// The texel at (u, v), filtered or not, as RGBA8.
+    fn sample(&self, tex: &Texture, (u, v, q): (f64, f64, f64)) -> [u32; 4] {
+        if !Self::linear(tex, q) {
+            return self.texel(tex, u.floor() as i32, v.floor() as i32);
+        }
+        // Bilinear: the four texels around (u - 0.5, v - 0.5), weighted
+        // with 4 fractional bits.
+        let fu = ((u - 0.5) * 16.0).floor() as i32;
+        let fv = ((v - 0.5) * 16.0).floor() as i32;
+        let (u0, v0, a, b) = (fu >> 4, fv >> 4, (fu & 15) as u32, (fv & 15) as u32);
+        let t00 = self.texel(tex, u0, v0);
+        let t10 = self.texel(tex, u0 + 1, v0);
+        let t01 = self.texel(tex, u0, v0 + 1);
+        let t11 = self.texel(tex, u0 + 1, v0 + 1);
+        std::array::from_fn(|c| {
+            let top = t00[c] * (16 - a) + t10[c] * a;
+            let bottom = t01[c] * (16 - a) + t11[c] * a;
+            (top * (16 - b) + bottom * b) >> 8
+        })
     }
 
     fn wrap(mode: u32, c: i32, size: i32, min: i32, max: i32) -> i32 {
@@ -438,7 +494,7 @@ impl Gs {
     // --- The pixel pipeline -----------------------------------------------------------
 
     #[allow(clippy::too_many_arguments)]
-    fn fragment(&mut self, e: &Env, x: i32, y: i32, z: u32, color: [u32; 4], tc: (f64, f64), fog: u32) {
+    fn fragment(&mut self, e: &Env, x: i32, y: i32, z: u32, color: [u32; 4], tc: (f64, f64, f64), fog: u32) {
         if x < e.sx0 || x > e.sx1 || y < e.sy0 || y > e.sy1 || x < 0 || y < 0 {
             return;
         }
@@ -446,7 +502,7 @@ impl Gs {
         let [mut r, mut g, mut b, mut a] = color;
         // Texture function.
         if let Some(tex) = &e.tex {
-            let [tr, tg, tb, ta] = self.texel(tex, tc.0.floor() as i32, tc.1.floor() as i32);
+            let [tr, tg, tb, ta] = self.sample(tex, tc);
             let modulate = |t: u32, f: u32| ((t * f) >> 7).min(255);
             (r, g, b, a) = match tex.tfx {
                 0 => (

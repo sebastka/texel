@@ -656,3 +656,20 @@ While an EE DMA channel runs (STR set), a write to its CHCR changes STR alone: t
 - **A write to a running channel's CHCR** takes its STR bit alone (stopping it, or nothing); a stopped channel's takes the whole value, as before.
 - **Checked**: a test stopping a running chain; Midnight Club II's intro movies play to the end (25 seconds of console time, 30 pictures a second) without an IPU error, where they froze after four seconds; GTA III's as before.
 - Found by logging, with the IPU's trace, what started and stopped channel 4 and the IPU's commands, each with the EE instruction that wrote it, and reading the movie library's code there.
+
+## D83. Interpolated Z stays within the triangle's
+
+The software GS interpolates a triangle's Z in floats and truncates it. A flat Z (every vertex 0xFFFFFE) came out 0xFFFFFD in places, a hair under, and failed a GEQUAL test against the 0xFFFFFE a neighbour had written: GTA Liberty City Stories draws its text as quads at one Z, each glyph's overlapping the last by a few pixels, and every glyph lost that strip (the GPU GS, exact, drew them whole).
+
+- **Z is clamped to the range of the triangle's vertices** before truncating: a flat Z is exact, and no interpolated Z leaves the triangle's.
+- **Checked**: a test of two overlapping quads at one Z with GEQUAL (failing before); Liberty City Stories' memory card message as the GPU GS draws it.
+- Found by drawing the game with both GSes (`compare` in `crates/ps2-gpu`): the font in GS memory was whole (`TEXDUMP` in the boot example), the GPU's text too.
+
+## D84. Bilinear filtering in the software GS
+
+The GS filters textures as TEX1 says: the level of detail is K (LCM set) or log2(1/Q)·2^L + K; at or under 0 the magnifying filter applies (MMAG), above it the minifying one (MMIN). Texel had only nearest. Text, menus and full-screen copies shown smaller or larger than their textures are drawn bilinear by most games: Liberty City Stories draws its small text from its large font, filtered.
+
+- **Bilinear** (MMAG 1; MMIN 1, 4 or 5): the four texels around (u − ½, v − ½), weighted in sixteenths as the GS does, each wrapped and looked up in the CLUT before blending, alpha too.
+- **Mipmaps** are not drawn: MMIN's mipmapping modes filter the base level as their names say (linear or nearest).
+- **The GPU GS does not filter yet**: the two differ on filtered textures (`compare` counts them).
+- **Checked**: a test magnifying a two-texel texture both ways.

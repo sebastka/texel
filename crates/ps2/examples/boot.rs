@@ -476,6 +476,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ipu.busy(),
         ipu.output.len()
     );
+    // TEXDUMP=TEX0 (hex): that texture as it is in GS memory, to texture.pgm
+    // (4- and 8-bit indices, scaled to grey) or texture.ppm (colours).
+    if let Some(tex0) = std::env::var("TEXDUMP")
+        .ok()
+        .and_then(|v| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok())
+    {
+        let field = |lo: u32, n: u32| ((tex0 >> lo) & ((1 << n) - 1)) as u32;
+        let (tbp, tbw, psm) = (field(0, 14), field(14, 6), field(20, 6));
+        let (w, h) = (1u32 << field(26, 4), 1u32 << field(30, 4));
+        let mem = &ps2.bus.gs.mem;
+        let indexed = matches!(psm, 0x13 | 0x14 | 0x1B | 0x24 | 0x2C);
+        let mut out = if indexed {
+            format!("P5\n{w} {h}\n255\n").into_bytes()
+        } else {
+            format!("P6\n{w} {h}\n255\n").into_bytes()
+        };
+        let scale = if matches!(psm, 0x14 | 0x24 | 0x2C) { 17 } else { 1 };
+        for y in 0..h {
+            for x in 0..w {
+                let v = mem.read(psm, tbp, tbw, x, y);
+                if indexed {
+                    out.push((v * scale).min(255) as u8);
+                } else {
+                    out.extend_from_slice(&[v as u8, (v >> 8) as u8, (v >> 16) as u8]);
+                }
+            }
+        }
+        let first: Vec<String> = (0..w.min(16))
+            .map(|x| format!("{:08X}", mem.read(psm, tbp, tbw, x, 0)))
+            .collect();
+        println!("  first row, raw: {}", first.join(" "));
+        let path = if indexed { "texture.pgm" } else { "texture.ppm" };
+        std::fs::write(path, out)?;
+        println!("Texture {tex0:#x}: {w}x{h}, format {psm:#x}, at block {tbp:#x} (width {tbw}), in {path}");
+    }
     if let (Ok(path), Some(t)) = (std::env::var("IPUTRACE"), &ipu.trace) {
         std::fs::write(format!("{path}.bin"), &t.stream)?;
         let lines: String = t
@@ -989,32 +1024,48 @@ fn dump_draws(ps2: &mut Ps2, frames: u64) {
         commands.len()
     );
     // DRAWSTATE=1: the draws by their state (kind, PRIM's flags, TEX0,
-    // ALPHA, TEST, FRAME), with one vertex of each group.
+    // TEX1, ALPHA, TEST, FRAME), with the first vertices of each group (up to 12).
     if std::env::var("DRAWSTATE").is_ok() {
-        type State = (u32, u64, u64, u64, u64, u64);
-        let mut groups: std::collections::BTreeMap<State, (usize, Option<texel_ps2::gs::Vertex>)> =
+        type State = (u32, u64, u64, u64, u64, u64, u64);
+        let mut groups: std::collections::BTreeMap<State, (usize, Vec<texel_ps2::gs::Vertex>)> =
             std::collections::BTreeMap::new();
         for c in &commands {
             if let Command::Draw { kind, regs, vertices } = c {
-                let key = (*kind, regs.prim & 0x7F8, regs.tex0, regs.alpha, regs.test, regs.frame);
-                let g = groups.entry(key).or_insert((0, None));
+                let key = (
+                    *kind,
+                    regs.prim & 0x7F8,
+                    regs.tex0,
+                    regs.tex1,
+                    regs.alpha,
+                    regs.test,
+                    regs.frame,
+                );
+                let g = groups.entry(key).or_insert((0, Vec::new()));
                 g.0 += 1;
-                if g.1.is_none() {
-                    g.1 = vertices.first().copied();
+                if g.1.len() < 12 {
+                    g.1.extend(vertices.iter().copied());
                 }
             }
         }
         let mut list: Vec<_> = groups.into_iter().collect();
         list.sort_by_key(|(_, (n, _))| std::cmp::Reverse(*n));
         println!("--- draws by state ({} states):", list.len());
-        for ((kind, flags, tex0, alpha, test, frame), (n, v)) in list.iter().take(24) {
+        for ((kind, flags, tex0, tex1, alpha, test, frame), (n, vs)) in list.iter().take(24) {
             println!(
-                "  {n:5} kind {kind} prim flags {flags:#05x} TEX0 {tex0:#018x} ALPHA {alpha:#012x} TEST {test:#07x} FRAME {frame:#012x}"
+                "  {n:5} kind {kind} prim flags {flags:#05x} TEX0 {tex0:#018x} TEX1 {tex1:#x} ALPHA {alpha:#012x} TEST {test:#07x} FRAME {frame:#012x}"
             );
-            if let Some(v) = v {
+            for v in vs {
                 println!(
-                    "        vertex rgba {:?} st {:.3},{:.3} q {:.3} uv {:#x},{:#x}",
-                    v.rgba, v.s, v.t, v.q, v.u, v.v
+                    "        vertex xy {:.2},{:.2} z {:#x} rgba {:?} st {:.4},{:.4} q {:.3} uv {:.2},{:.2}",
+                    f64::from(v.x) / 16.0,
+                    f64::from(v.y) / 16.0,
+                    v.z,
+                    v.rgba,
+                    v.s,
+                    v.t,
+                    v.q,
+                    f64::from(v.u) / 16.0,
+                    f64::from(v.v) / 16.0
                 );
             }
         }
