@@ -65,6 +65,40 @@ impl DiscKind {
 pub struct Inserted {
     pub medium: Medium,
     pub kind: DiscKind,
+    /// A dual-layer DVD: where its second layer starts, as the drive's
+    /// table of contents gives it (see `layer_break`).
+    pub layer1: Option<u32>,
+}
+
+impl Inserted {
+    pub fn new(mut medium: Medium, kind: DiscKind) -> Self {
+        let layer1 = if kind == DiscKind::Dvd {
+            layer_break(&mut medium)
+        } else {
+            None
+        };
+        Self { medium, kind, layer1 }
+    }
+}
+
+/// A dual-layer DVD's second layer (its images hold both layers in a row):
+/// the sector its volume descriptor is in, which is where the first
+/// layer's volume ends. The drive's table of contents puts the second
+/// layer's start there (the first layer's last sector after it), and
+/// CDVDMAN asks for its sectors 16 before what it computes from that: its
+/// volume's first sector is 16 before its descriptor, as on any disc.
+fn layer_break(medium: &mut Medium) -> Option<u32> {
+    let mut pvd = [0u8; DATA_SECTOR_SIZE];
+    medium.read_data(16, &mut pvd).ok()?;
+    if &pvd[1..6] != b"CD001" {
+        return None;
+    }
+    let size = u32::from_le_bytes([pvd[80], pvd[81], pvd[82], pvd[83]]);
+    if size <= 16 || size >= medium.layout.lead_out() {
+        return None;
+    }
+    medium.read_data(size, &mut pvd).ok()?;
+    (pvd[0] == 1 && &pvd[1..6] == b"CD001").then_some(size)
 }
 
 impl std::fmt::Debug for Inserted {
@@ -507,15 +541,23 @@ impl Cdvd {
         match disc.kind {
             DiscKind::Dvd => {
                 let mut toc = vec![0u8; 2064];
-                // Single layer: book type DVD-ROM, one layer, its data area
-                // from 0x30000 to its end (sector numbers + 0x30000).
+                // Book type DVD-ROM, its data area from 0x30000 (sector
+                // numbers + 0x30000): a single layer's to its end.
                 toc[0] = 0x04;
                 toc[1] = 0x02;
                 toc[2] = 0xF2;
                 toc[4] = 0x86;
                 toc[5] = 0x72;
                 toc[17] = 0x03;
-                let last = end - 1 + 0x30000;
+                let last = match disc.layer1 {
+                    // Two layers, opposite track paths (numbered on across
+                    // both), the first one's last sector.
+                    Some(layer1) => {
+                        toc[14] = 0x30;
+                        layer1 - 1
+                    }
+                    None => end - 1,
+                } + 0x30000;
                 toc[20..24].copy_from_slice(&last.to_be_bytes());
                 toc
             }
@@ -549,10 +591,11 @@ impl Cdvd {
         let mut raw = [0u8; RAW_SECTOR_SIZE];
         let ok = match block {
             2064 => {
-                // Layer 0 (+ 0x20), the sector number + 0x30000 (big-endian),
-                // then the data.
+                // The layer (+ 0x20), the sector number + 0x30000 (big-
+                // endian), then the data. CDVDMAN asks for the second
+                // layer's sectors 16 before its start (see `layer_break`).
                 let id = (lsn + 0x30000).to_be_bytes();
-                out[0] = 0x20;
+                out[0] = 0x20 | u8::from(disc.layer1.is_some_and(|l| lsn + 16 >= l));
                 out[1..4].copy_from_slice(&id[1..4]);
                 let mut data = [0u8; DATA_SECTOR_SIZE];
                 let ok = disc.medium.read_data(lsn, &mut data).is_ok();
@@ -821,10 +864,7 @@ mod tests {
             }
         }
         let layout = texel_disc::Layout::single_file("disc.iso", u64::from(sectors) * 2048).expect("a layout");
-        Inserted {
-            medium: Disc::new(layout, Box::new(Pattern)),
-            kind,
-        }
+        Inserted::new(Disc::new(layout, Box::new(Pattern)), kind)
     }
 
     #[test]
@@ -856,5 +896,44 @@ mod tests {
         assert_eq!(b[0].len(), 2064);
         assert_eq!(b[0][..4], [0x20, 0x03, 0x00, 0x05]);
         assert_eq!(b[2][12], 7);
+    }
+
+    /// A dual-layer DVD (both layers in its image): the table of contents
+    /// gives two layers and the first one's last sector, the second
+    /// layer's sectors their layer in their headers.
+    #[test]
+    fn dual_layer_dvds_give_their_layer_break() {
+        struct Image(Vec<u8>);
+        impl FileReader for Image {
+            fn read_at(&mut self, _: usize, offset: u64, buf: &mut [u8]) -> Result<(), texel_disc::ReadError> {
+                let at = offset as usize;
+                buf.copy_from_slice(&self.0[at..at + buf.len()]);
+                Ok(())
+            }
+        }
+        // 80 sectors: the first layer's volume is 40, the second's
+        // descriptor at 40 (its volume from 24).
+        let mut image = vec![0u8; 80 * DATA_SECTOR_SIZE];
+        for (at, size) in [(16, 40u32), (40, 40)] {
+            let pvd = &mut image[at * DATA_SECTOR_SIZE..][..DATA_SECTOR_SIZE];
+            pvd[0] = 1;
+            pvd[1..6].copy_from_slice(b"CD001");
+            pvd[80..84].copy_from_slice(&size.to_le_bytes());
+        }
+        let layout = texel_disc::Layout::single_file("disc.iso", image.len() as u64).expect("a layout");
+        let mut c = Cdvd::default();
+        c.insert(Some(Inserted::new(
+            Disc::new(layout, Box::new(Image(image))),
+            DiscKind::Dvd,
+        )));
+        let toc = c.toc();
+        assert_eq!(toc[14] & 0x70, 0x30);
+        assert_eq!(toc[20..24], (39 + 0x30000u32).to_be_bytes());
+        assert_eq!(c.read_block(23, 2064)[0], 0x20);
+        assert_eq!(c.read_block(24, 2064)[..4], [0x21, 0x03, 0x00, 24]);
+        // A single layer: no break.
+        c.insert(Some(disc(100, DiscKind::Dvd)));
+        assert_eq!(c.toc()[14], 0);
+        assert_eq!(c.toc()[20..24], (99 + 0x30000u32).to_be_bytes());
     }
 }

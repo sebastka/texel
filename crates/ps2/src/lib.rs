@@ -231,7 +231,7 @@ impl Ps2 {
             .first()
             .is_some_and(|t| t.mode == texel_disc::TrackMode::Mode1Cooked);
         let kind = if dvd { cdvd::DiscKind::Dvd } else { cdvd::DiscKind::Cd };
-        self.bus.iop.cdvd.insert(Some(cdvd::Inserted { medium, kind }));
+        self.bus.iop.cdvd.insert(Some(cdvd::Inserted::new(medium, kind)));
         self.boot = fast_boot.then(|| cnf.boot.clone());
         Ok(cnf)
     }

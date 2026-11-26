@@ -718,3 +718,11 @@ With a drawing worker (D40), the emulation worker still drew every primitive at 
 - **Not in netplay rooms**: rollback keeps the machine every frame. It starts once the drawing worker is up, after an upload of the whole VRAM, and survives resets and loaded states.
 - **Checked**: a test drawing the same scene both ways at 1× and 2× with precise geometry (textures with masked texels, shaded, textured and precise triangles, a semi-transparent quad, a rectangle, a line, a fill, a masked copy and transfer, VRAM read back mid-way), comparing the GPU's timing, VRAM and the scaled pictures; and `check-ps1-deferred.mjs`, which runs a game both ways and compares the machines' state and the pictures every second: Spyro the Dragon for 130 s, Spyro: Year of the Dragon, Crash Bandicoot, CTR, Driver and Tekken 3 for 60 s, at 1× with precise geometry and at 2×.
 - **Measured** in Firefox on the development machine, Spyro the Dragon for 120 s at 1× with precise geometry, the drawing in a worker of its own: 4.31 ms a frame on average to 3.74, the 90th percentile from 8.6 to 7.4, the 99th from 10.3 to 9.0; the heaviest seconds from 6.8 to 6.5, where the CPU is most of what is left.
+
+## D90. Dual-layer DVDs
+
+Midnight Club 3: DUB Edition Remix is a dual-layer DVD: its movies (`\VIDEO\ROCKSTAR.PSS`, …) are in the second layer's file system only, and the drive described every DVD as single-layer, so the game could not open them and skipped them. Its CDVDMAN (from its IOP update image, IOPRP280.IMG; the BIOS's has no layers) reads the layers from the table of contents.
+
+- **The break**: Redump's images hold both layers in a row and do not record where the second starts. Its volume descriptor (`CD001`) sits where the first layer's volume ends (its size in the first descriptor), and its volume 16 sectors before. CDVDMAN takes the second layer's start from the table of contents (the first layer's last sector + 1) and asks for its sectors 16 before what it computes from it: the descriptor's sector is that start.
+- **The table of contents** gives two layers with opposite track paths (byte 14: 0x30), so the sector numbers run on across both; DVD sectors' headers carry their layer (bit 0 of their first byte).
+- **Only that disc** in the library is dual-layer (8.5 GB): other DVDs' tables of contents are as before.
