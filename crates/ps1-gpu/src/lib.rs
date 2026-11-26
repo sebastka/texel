@@ -401,6 +401,9 @@ impl GpuRenderer {
                 ));
             }
             Command::Triangle { .. } | Command::Precise { .. } | Command::Rect { .. } | Command::Line { .. } => {}
+            // Deferred drawing is for the software replay only (the GPU
+            // reads its native VRAM from the recorder).
+            Command::Target { .. } | Command::Deferred { .. } | Command::Vertices { .. } => {}
         }
     }
 

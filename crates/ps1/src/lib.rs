@@ -28,7 +28,7 @@ pub use gpu::Picture;
 /// What the GPU records for another renderer (see `System::set_gpu_recording`).
 pub mod gpu_record {
     pub use crate::gpu::replay::Replay;
-    pub use crate::gpu::{Command, Display, ExactVertex, PixelMode, Prim, Spans};
+    pub use crate::gpu::{Command, Display, ExactVertex, PixelMode, Prim, Spans, VramFetch};
 }
 pub use sio::{MEMCARD_SIZE, MemoryCard, button};
 
@@ -175,10 +175,12 @@ impl System {
         let region = self.bus.cdrom.region;
         let scale = self.bus.gpu.scale();
         let recording = self.bus.gpu.recording();
+        let deferred = self.bus.gpu.deferred().then(|| self.bus.gpu.take_fetch()).flatten();
         self.bus = Bus::new(bios);
         self.bus.gpu.set_scale(scale);
         if recording {
             self.bus.gpu.set_recording(true);
+            self.bus.gpu.set_deferred(deferred);
         }
         self.bus.cdrom.region = region;
         self.bus.cdrom.insert_disc(disc);
@@ -434,6 +436,21 @@ impl System {
         self.bus.gpu.set_recording(on);
     }
 
+    /// Recording, the native VRAM drawn by the recording's renderer too
+    /// (`Some`: how to fetch it from there when something reads it), not
+    /// here: see `Gpu::set_deferred`. What the console computes does not
+    /// change.
+    pub fn set_gpu_deferred(&mut self, fetch: Option<gpu::VramFetch>) {
+        self.bus.gpu.set_deferred(fetch);
+    }
+
+    /// Deferred drawing: brings the native VRAM up to date from the
+    /// renderer's (before reading the machine's state from outside: a
+    /// save state, a checksum, a rollback's state).
+    pub fn sync_vram(&mut self) {
+        self.bus.gpu.sync_vram();
+    }
+
     /// Precise geometry (an enhancement, when recording): the GTE keeps its
     /// projections' exact positions and depths, and triangles made of them
     /// are recorded with them, to draw without the console's rounding
@@ -469,7 +486,8 @@ impl System {
     pub fn take_gpu_commands_for_replay(&mut self) -> Vec<gpu_record::Command> {
         let mut commands = self.bus.gpu.take_commands();
         let d = self.bus.gpu.display();
-        if d.depth24 && !d.off {
+        // Deferred, the renderer's native VRAM is its own (exact).
+        if d.depth24 && !d.off && !self.bus.gpu.deferred() {
             const WIDTH: usize = 1024;
             for row in 0..d.h {
                 let y = (d.y + row) % 512;
@@ -669,6 +687,9 @@ impl System {
         }
         if self.bus.gpu.recording() {
             bus.gpu.set_recording(true);
+            if self.bus.gpu.deferred() {
+                bus.gpu.set_deferred(self.bus.gpu.take_fetch());
+            }
         }
         self.bus = bus;
         self.cpu = snapshot.cpu;

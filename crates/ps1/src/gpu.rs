@@ -185,7 +185,25 @@ pub struct Gpu {
     /// polygons during the next one).
     #[serde(skip)]
     exact_frame: u32,
+    /// Recording, the native VRAM drawn by the recording's renderer only
+    /// (see `set_deferred`), and whether this one is behind it.
+    #[serde(skip)]
+    defer: bool,
+    #[serde(skip)]
+    stale: bool,
+    #[serde(skip)]
+    fetch: Option<VramFetch>,
+    /// Deferred: the VRAMs primitives were last recorded for (native,
+    /// scaled; see `Command::Target`).
+    #[serde(skip)]
+    target: (bool, bool),
 }
+
+/// Brings a native VRAM up to date from the renderer the drawing is
+/// recorded for (see `Gpu::set_deferred`): it is given the commands
+/// recorded since the last ones it was sent, draws them, and writes its
+/// native VRAM into the slice.
+pub type VramFetch = Box<dyn FnMut(Vec<Command>, &mut [u16])>;
 
 /// An exact projection: the position it was rounded to (packed as SXY),
 /// its x, y and depth, and the frame it was made in.
@@ -220,6 +238,10 @@ impl Gpu {
         self.dirty = old.dirty;
         self.exact = old.exact.take();
         self.exact_frame = old.exact_frame;
+        self.defer = old.defer;
+        self.stale = old.stale;
+        self.fetch = old.fetch.take();
+        self.target = old.target;
     }
 
     pub fn new() -> Self {
@@ -266,6 +288,10 @@ impl Gpu {
             dirty: None,
             exact: None,
             exact_frame: 0,
+            defer: false,
+            stale: false,
+            fetch: None,
+            target: (false, true),
         };
         gpu.reset();
         gpu
@@ -345,6 +371,9 @@ impl Gpu {
     }
 
     pub fn read_data(&mut self) -> u32 {
+        if self.store.is_some() {
+            self.sync_vram();
+        }
         if let Some(mut t) = self.store.take() {
             let mut v = 0;
             for half in 0..2 {
@@ -585,6 +614,8 @@ impl Gpu {
     /// is still drawn here (exact, and what games read back). Recording
     /// starts with the whole native VRAM, scaled up.
     pub fn set_recording(&mut self, on: bool) {
+        self.sync_vram();
+        self.defer = false;
         self.record = on;
         self.commands.clear();
         self.dirty = None;
@@ -595,6 +626,55 @@ impl Gpu {
 
     pub fn recording(&self) -> bool {
         self.record
+    }
+
+    /// Recording, the native VRAM drawn by the recording's renderer too,
+    /// rather than here (`Some`): here, each primitive is recorded at
+    /// native resolution as well, and only the pixels it covers counted
+    /// (they time the GPU); CPU to VRAM transfers and copies are recorded
+    /// with their mask checks left to the renderer. The native VRAM here
+    /// is brought up to date from the renderer's (`fetch`) when something
+    /// reads it: the game (VRAM to CPU transfers), a save state
+    /// (`sync_vram`). `None`: drawn here again, from the renderer's.
+    pub fn set_deferred(&mut self, fetch: Option<VramFetch>) {
+        self.sync_vram();
+        let on = fetch.is_some() && self.record;
+        self.fetch = fetch;
+        if on == self.defer {
+            return;
+        }
+        if on {
+            // The renderer's native VRAM from this one, as it is.
+            self.dirty = Some([0, 0, VRAM_WIDTH as i32 - 1, VRAM_HEIGHT as i32 - 1]);
+            self.send_dirty();
+        }
+        self.dirty = None;
+        self.defer = on;
+        self.target = (false, true);
+        self.commands.push(Command::Deferred { on });
+    }
+
+    pub fn deferred(&self) -> bool {
+        self.defer
+    }
+
+    /// The renderer's fetch (see `set_deferred`), taken (another GPU
+    /// takes over: a state loaded).
+    pub(crate) fn take_fetch(&mut self) -> Option<VramFetch> {
+        self.fetch.take()
+    }
+
+    /// Deferred drawing (see `set_deferred`): the native VRAM brought up to
+    /// date, from the renderer's.
+    pub fn sync_vram(&mut self) {
+        if !self.stale {
+            return;
+        }
+        self.stale = false;
+        let commands = std::mem::take(&mut self.commands);
+        if let Some(fetch) = &mut self.fetch {
+            fetch(commands, &mut self.vram);
+        }
     }
 
     /// Precise geometry, when recording: triangles whose vertices the GTE
@@ -626,12 +706,19 @@ impl Gpu {
 
     /// Recording: the whole native VRAM, then a scaled copy of it.
     fn resync(&mut self) {
-        self.commands.clear();
-        self.dirty = Some([0, 0, VRAM_WIDTH as i32 - 1, VRAM_HEIGHT as i32 - 1]);
-        self.send_dirty();
+        // Deferred, the renderer's native VRAM is its own, exact: what was
+        // recorded is still to draw there.
+        if !self.defer {
+            self.commands.clear();
+            self.dirty = Some([0, 0, VRAM_WIDTH as i32 - 1, VRAM_HEIGHT as i32 - 1]);
+            self.send_dirty();
+        }
         self.commands.push(Command::Rescale {
             scale: self.scale as u32,
         });
+        // From here, the renderer knows how its native VRAM is kept.
+        self.target = (false, true);
+        self.commands.push(Command::Deferred { on: self.defer });
     }
 
     /// Marks a native area as drawn (recording), inclusive.
@@ -734,7 +821,8 @@ impl Gpu {
     /// A pixel of a CPU to VRAM transfer (`index` in it, recording).
     fn write_pixel_masked(&mut self, x: usize, y: usize, v: u16, transfer: (u32, u32, u32, u32), index: u32) {
         let at = y * VRAM_WIDTH + x;
-        let skip = self.check_mask && self.vram[at] & 0x8000 != 0;
+        // Deferred: the renderer checks the mask (this VRAM is behind).
+        let skip = !self.defer && self.check_mask && self.vram[at] & 0x8000 != 0;
         let v = v | (u16::from(self.set_mask) << 15);
         if self.record {
             self.mark_dirty([x as i32, y as i32, x as i32, y as i32]);
@@ -765,6 +853,10 @@ impl Gpu {
                 });
             }
         }
+        if self.defer {
+            self.stale = true;
+            return;
+        }
         if skip {
             return;
         }
@@ -778,7 +870,10 @@ impl Gpu {
         let y0 = (w[1] >> 16) & 0x1ff;
         let width = ((w[2] & 0x3ff) + 0xf) & !0xf;
         let height = (w[2] >> 16) & 0x1ff;
-        for y in 0..height {
+        // Deferred: drawn by the renderer only.
+        let height_here = if self.defer { 0 } else { height };
+        self.stale |= self.defer && width > 0 && height > 0;
+        for y in 0..height_here {
             let vy = ((y0 + y) & 0x1ff) as usize;
             for x in 0..width {
                 let vx = ((x0 + x) & 0x3ff) as usize;
@@ -809,6 +904,11 @@ impl Gpu {
         // Recording: which pixels the mask kept, as the native VRAM was.
         let mut skipped = Vec::new();
         let recorded = (src.x, src.y, dst.x, dst.y, src.w, src.h);
+        // Deferred: copied by the renderer only, its mask its own.
+        if self.defer {
+            self.stale = true;
+            src.i = src.w * src.h;
+        }
         while let (Some((sx, sy)), Some((dx, dy))) = (src.next(), dst.next()) {
             let v = self.vram[sy * VRAM_WIDTH + sx];
             let p = &mut self.vram[dy * VRAM_WIDTH + dx];
@@ -862,6 +962,9 @@ impl Gpu {
     /// timing).
     fn draw(&mut self, mode: &DrawMode, f: impl Fn(&mut Raster)) -> u64 {
         let area = (self.area_x1, self.area_y1, self.area_x2, self.area_y2);
+        if self.defer {
+            return self.draw_deferred(area, f);
+        }
         let mut native = Raster {
             target: &mut self.vram,
             tex: None,
@@ -874,6 +977,9 @@ impl Gpu {
             pixels: 0,
             bounds: None,
             rec: None,
+            count: false,
+            precise: false,
+            both: false,
         };
         f(&mut native);
         let pixels = native.pixels;
@@ -897,6 +1003,9 @@ impl Gpu {
                 pixels: 0,
                 bounds: None,
                 rec: Some(&mut self.commands),
+                count: false,
+                precise: true,
+                both: false,
             };
             f(&mut rec);
             return pixels;
@@ -915,10 +1024,73 @@ impl Gpu {
                 pixels: 0,
                 bounds: None,
                 rec: None,
+                count: false,
+                precise: false,
+                both: false,
             };
             f(&mut hires);
         }
         pixels
+    }
+
+    /// Deferred drawing (see `set_deferred`): the primitive recorded for the
+    /// renderer's native VRAM (as drawn here, without precise geometry),
+    /// its pixels counted as drawing them would; then for its scaled VRAM.
+    /// At native resolution, the same, once for both (but precise
+    /// triangles: see `Raster::both`).
+    fn draw_deferred(&mut self, area: (i32, i32, i32, i32), f: impl Fn(&mut Raster)) -> u64 {
+        self.stale = true;
+        let both = self.scale == 1;
+        self.retarget(true, both);
+        let mut native = Raster {
+            target: &mut [],
+            tex: None,
+            scale: 1,
+            stride: VRAM_WIDTH,
+            area,
+            check_mask: self.check_mask,
+            set_mask: self.set_mask,
+            tex_window: self.tex_window,
+            pixels: 0,
+            bounds: None,
+            rec: Some(&mut self.commands),
+            count: true,
+            precise: both,
+            both,
+        };
+        f(&mut native);
+        let pixels = native.pixels;
+        if both {
+            return pixels;
+        }
+        self.retarget(false, true);
+        let s = self.scale as i32;
+        let mut rec = Raster {
+            target: &mut [],
+            tex: None,
+            scale: s,
+            stride: VRAM_WIDTH * self.scale,
+            area: (area.0 * s, area.1 * s, area.2 * s + s - 1, area.3 * s + s - 1),
+            check_mask: self.check_mask,
+            set_mask: self.set_mask,
+            tex_window: self.tex_window,
+            pixels: 0,
+            bounds: None,
+            rec: Some(&mut self.commands),
+            count: false,
+            precise: true,
+            both: false,
+        };
+        f(&mut rec);
+        pixels
+    }
+
+    /// Deferred: the VRAMs the primitives recorded next are for.
+    fn retarget(&mut self, native: bool, scaled: bool) {
+        if self.target != (native, scaled) {
+            self.target = (native, scaled);
+            self.commands.push(Command::Target { native, scaled });
+        }
     }
 
     /// Charges GPU work: `pixels` drawn at `per_pixel` GPU cycles each, plus
@@ -1234,6 +1406,15 @@ struct Raster<'a> {
     bounds: Option<[i32; 4]>,
     /// Recording: primitives go there, set up, rather than drawn.
     rec: Option<&'a mut Vec<Command>>,
+    /// Pixels counted, not drawn (recording, see `Gpu::set_deferred`).
+    count: bool,
+    /// Recording: triangles from the GTE's exact projections recorded as
+    /// such (`Command::Precise`).
+    precise: bool,
+    /// Recording for both VRAMs, at native resolution (see
+    /// `Gpu::draw_deferred`): a precise triangle is recorded for each
+    /// apart, the native one as the console draws it.
+    both: bool,
 }
 
 impl Raster<'_> {
@@ -1249,7 +1430,15 @@ impl Raster<'_> {
         });
     }
 
-    fn triangle(&mut self, mut v: [Vertex; 3], mode: &DrawMode) {
+    fn triangle(&mut self, v: [Vertex; 3], mode: &DrawMode) {
+        let prim = Prim::new(mode, self.tex_window);
+        self.triangle_prim(v, prim, mode.textured, mode.shaded);
+    }
+
+    /// A triangle (native coordinates), its pixels' mode worked out.
+    fn triangle_prim(&mut self, mut v: [Vertex; 3], prim: Prim, textured: bool, shaded: bool) {
+        // As given (deferred drawing records it so: see `Command::Vertices`).
+        let given = v;
         let min_x = v.iter().map(|p| p.x).min().unwrap_or(0);
         let max_x = v.iter().map(|p| p.x).max().unwrap_or(0);
         let min_y = v.iter().map(|p| p.y).min().unwrap_or(0);
@@ -1321,7 +1510,6 @@ impl Raster<'_> {
         let start = |p: (i64, i64, i64)| p.0 + p.1 * i64::from(xs - x0) + p.2 * i64::from(ys - y0);
         let planes = [pr, pg, pb, pu, pv];
         let attr_row = planes.map(start);
-        let prim = Prim::new(mode, self.tex_window);
         let spans = Spans {
             row,
             steps: [e0, e1, e2],
@@ -1334,13 +1522,49 @@ impl Raster<'_> {
             ye,
         };
         if let Some(rec) = &mut self.rec {
-            let pixel = PixelMode::new(mode, prim, self.check_mask, self.set_mask, self.scale);
-            let precise = precise_triangle(&v, s, self.area, pixel);
-            rec.push(precise.unwrap_or(Command::Triangle { pixel, spans }));
+            let pixel = PixelMode {
+                prim,
+                textured,
+                shaded,
+                check_mask: self.check_mask,
+                set_mask: self.set_mask,
+                scale: self.scale,
+            };
+            let precise = if self.precise {
+                precise_triangle(&v, s, self.area, pixel)
+            } else {
+                None
+            };
+            // Deferred, at native resolution: the vertices, for the
+            // renderer to set the triangle up (fewer numbers than its
+            // spans, which take a while to encode).
+            let plain = if self.count {
+                Command::Vertices {
+                    pixel,
+                    v: given.map(|p| [p.x, p.y, p.r, p.g, p.b, p.u, p.v]),
+                    area: [self.area.0, self.area.1, self.area.2, self.area.3],
+                }
+            } else {
+                Command::Triangle { pixel, spans }
+            };
+            match precise {
+                Some(p) if self.both => rec.extend([
+                    Command::Target { native: true, scaled: false },
+                    plain,
+                    Command::Target { native: false, scaled: true },
+                    p,
+                    Command::Target { native: true, scaled: true },
+                ]),
+                Some(p) => rec.push(p),
+                None => rec.push(plain),
+            }
+            if self.count {
+                self.count_spans(&spans);
+            }
             return;
         }
         // Loops specialised for what the primitive interpolates.
-        match (mode.textured, mode.shaded) {
+        match (textured, shaded) {
             (true, true) => self.triangle_spans::<true, true>(spans, &prim),
             (true, false) => self.triangle_spans::<true, false>(spans, &prim),
             (false, true) => self.triangle_spans::<false, true>(spans, &prim),
@@ -1365,24 +1589,7 @@ impl Raster<'_> {
         } = sp;
         let n = i64::from(xe - xs);
         for y in ys..=ye {
-            // Steps k from xs: edge i is w + a * k, non-negative inside.
-            let (mut lo, mut hi) = (0i64, n);
-            for (w, (a, _)) in row.iter().zip(&steps) {
-                let (w, a) = (*w, *a);
-                if a > 0 {
-                    if w < 0 {
-                        lo = lo.max((-w + a - 1) / a);
-                    }
-                } else if a < 0 {
-                    if w < 0 {
-                        hi = -1;
-                    } else {
-                        hi = hi.min(w / -a);
-                    }
-                } else if w < 0 {
-                    hi = -1;
-                }
-            }
+            let (lo, hi) = span(&row, &steps, n);
             if lo <= hi {
                 let mut attr = attr_row;
                 for (a, p) in attr.iter_mut().zip(&planes) {
@@ -1457,6 +1664,21 @@ impl Raster<'_> {
         }
     }
 
+    /// A triangle's pixels, counted (see `triangle_spans`).
+    fn count_spans(&mut self, sp: &Spans) {
+        let n = i64::from(sp.xe - sp.xs);
+        let mut row = sp.row;
+        for _ in sp.ys..=sp.ye {
+            let (lo, hi) = span(&row, &sp.steps, n);
+            if lo <= hi {
+                self.pixels += (hi - lo + 1) as u64;
+            }
+            for (w, (_, dy)) in row.iter_mut().zip(&sp.steps) {
+                *w += dy;
+            }
+        }
+    }
+
     fn rect(&mut self, v: Vertex, width: i32, height: i32, flip: (bool, bool), mode: &DrawMode) {
         let s = self.scale;
         let (x0, y0) = (v.x * s, v.y * s);
@@ -1482,6 +1704,9 @@ impl Raster<'_> {
                 color: (v.r, v.g, v.b),
                 flip,
             });
+            if self.count && ys <= ye {
+                self.pixels += ((ye - ys + 1) * (xe - xs + 1)) as u64;
+            }
             return;
         }
         self.touch([xs, ys, xe, ye]);
@@ -1546,6 +1771,10 @@ impl Raster<'_> {
                 b: (bx, by, b.r, b.g, b.b),
                 area: [self.area.0, self.area.1, self.area.2, self.area.3],
             });
+            if self.count {
+                let prim = Prim::new(mode, self.tex_window);
+                self.line_scaled((ax, ay, a.r, a.g, a.b), (bx, by, b.r, b.g, b.b), mode.shaded, &prim);
+            }
             return;
         }
         let prim = Prim::new(mode, self.tex_window);
@@ -1702,6 +1931,9 @@ impl Raster<'_> {
             return;
         }
         self.pixels += 1;
+        if self.count {
+            return;
+        }
         self.touch([x, y, x, y]);
         let idx = y as usize * self.stride + x as usize;
         let dither = self
@@ -1865,6 +2097,15 @@ pub enum Command {
     Rescale { scale: u32 },
     /// A triangle, set up for its rows (see `Spans`).
     Triangle { pixel: PixelMode, spans: Spans },
+    /// A triangle at native resolution, as given (deferred drawing, see
+    /// `Gpu::set_deferred`): its vertices (x, y with the drawing offset,
+    /// colour, texture coordinates) and the drawing area (inclusive). Set
+    /// up where it is drawn, as here.
+    Vertices {
+        pixel: PixelMode,
+        v: [[i32; 7]; 3],
+        area: [i32; 4],
+    },
     /// A triangle from the GTE's exact projections (precise geometry): its
     /// vertices (scaled), in order (positive area), and the box drawn
     /// (inclusive, within the drawing area).
@@ -1913,6 +2154,14 @@ pub enum Command {
         set_mask: bool,
         skipped: Vec<u32>,
     },
+    /// The VRAMs the primitives that follow are drawn into: the native one
+    /// (at native resolution, see `Gpu::set_deferred`), the scaled one, or
+    /// both (at native resolution, the same; the native one first).
+    Target { native: bool, scaled: bool },
+    /// Deferred drawing on or off (see `Gpu::set_deferred`): fills, copies
+    /// and CPU to VRAM transfers go to the native VRAM too, their masks
+    /// checked there (`skipped` and bit 16 unset).
+    Deferred { on: bool },
     /// Pixels of a CPU to VRAM transfer to `x, y` (`w` by `h`, wrapping),
     /// from pixel `first` on: each the value written (mask bit set as
     /// asked), and in bit 16 whether the native destination's mask kept it.
@@ -1941,6 +2190,32 @@ pub struct ExactVertex {
 /// A triangle as `Command::Precise`, when all its vertices have exact
 /// positions and its area is still positive with them (else the rounded
 /// triangle is drawn). `v` is scaled already (`scale`), in drawing order.
+/// A triangle's row (see `Raster::triangle_spans`): its edge functions at
+/// its first column and their steps along it, `n` columns after the first:
+/// the steps from the first column where all three are non-negative, first
+/// and last (empty when the first is after the last).
+#[inline(always)]
+fn span(row: &[i64; 3], steps: &[(i64, i64); 3], n: i64) -> (i64, i64) {
+    let (mut lo, mut hi) = (0i64, n);
+    for (w, (a, _)) in row.iter().zip(steps) {
+        let (w, a) = (*w, *a);
+        if a > 0 {
+            if w < 0 {
+                lo = lo.max((-w + a - 1) / a);
+            }
+        } else if a < 0 {
+            if w < 0 {
+                hi = -1;
+            } else {
+                hi = hi.min(w / -a);
+            }
+        } else if w < 0 {
+            hi = -1;
+        }
+    }
+    (lo, hi)
+}
+
 fn precise_triangle(v: &[Vertex; 3], scale: i32, area: (i32, i32, i32, i32), pixel: PixelMode) -> Option<Command> {
     let s = scale as f32;
     // Each vertex where it is exactly, else where it was rounded to (with
@@ -2259,6 +2534,103 @@ mod tests {
         let mut frame = Vec::new();
         scaled.gp1(0x0300_0000);
         assert_eq!(scaled.render_display(&mut frame), (512, 480));
+    }
+
+    /// GP0 words drawing a bit of everything into masked pixels: a texture
+    /// (some texels with the mask bit), shaded and textured triangles, a
+    /// semi-transparent quad, a rectangle, a line, a fill, a copy and a
+    /// transfer with the mask checked.
+    fn scene() -> Vec<u32> {
+        let xy = |x: u32, y: u32| x | (y << 16);
+        let tpage = 1 | (2 << 7);
+        let mut w = vec![0xe300_0000, 0xe400_0000 | (511 << 10) | 1023];
+        w.extend([0xa000_0000, xy(64, 0), xy(16, 16)]);
+        w.extend((0..128u32).map(|i| i.wrapping_mul(0x9e37_79b9) ^ if i % 3 == 0 { 0x8000_8000 } else { 0 }));
+        w.extend([0xe600_0002, 0xe100_0200 | tpage]);
+        w.extend([0x3000_00ff, xy(60, 2), 0x0000_ff00, xy(90, 10), 0x00ff_0000, xy(70, 30)]);
+        w.extend([0xe600_0001]);
+        w.extend([0x2480_8080, xy(100, 100), 0, xy(140, 100), (tpage << 16) | 15, xy(100, 140), 15 << 8]);
+        let semi = tpage | (1 << 5);
+        w.extend([0x2e80_8080, xy(120, 90), 0, xy(170, 95), (semi << 16) | 15, xy(115, 150), 15 << 8, xy(175, 140), 0x0f0f]);
+        w.extend([0xe100_0000 | tpage, 0x6480_8080, xy(200, 10), 0, xy(20, 20)]);
+        w.extend([0x5000_00ff, xy(10, 200), 0x00ff_ff00, xy(150, 260)]);
+        w.extend([0x0200_ff00, xy(300, 300), xy(32, 16)]);
+        w.extend([0xe600_0002, 0x8000_0000, xy(60, 0), xy(100, 105), xy(40, 30)]);
+        w.extend([0xa000_0000, xy(100, 100), xy(8, 8)]);
+        w.extend((0..32u32).map(|i| i.wrapping_mul(0x0123_4567)));
+        w
+    }
+
+    /// Deferred drawing (see `Gpu::set_deferred`) times the GPU, reads VRAM
+    /// back and shows pictures as drawing here does: at native resolution
+    /// (primitives recorded once for both VRAMs) and scaled, with precise
+    /// geometry (a triangle's vertices projected exactly).
+    #[test]
+    fn deferred_drawing_is_drawing_here() {
+        for scale in [1, 2] {
+            deferred_drawing_at(scale);
+        }
+    }
+
+    fn deferred_drawing_at(scale: usize) {
+        use std::{cell::RefCell, rc::Rc};
+        let mut here = Gpu::new();
+        let mut there = Gpu::new();
+        let mut replay_here = replay::Replay::new();
+        let replay_there = Rc::new(RefCell::new(replay::Replay::new()));
+        for gpu in [&mut here, &mut there] {
+            gpu.set_scale(scale);
+            gpu.set_recording(true);
+            gpu.set_precise(true);
+            for (x, y) in [(100, 100), (140, 100), (100, 140)] {
+                gpu.exact_vertex(x | (y << 16), [x as f32 + 0.4, y as f32 - 0.3, 200.0 + x as f32]);
+            }
+        }
+        let r = replay_there.clone();
+        there.set_deferred(Some(Box::new(move |commands, vram: &mut [u16]| {
+            let mut r = r.borrow_mut();
+            r.apply(&commands);
+            vram.copy_from_slice(r.native());
+        })));
+        assert!(there.deferred());
+        // The scene, VRAM read back, then more drawing over it.
+        let read = |gpu: &mut Gpu| {
+            for w in scene() {
+                gpu.gp0(w);
+            }
+            gpu.gp0(0xc000_0000);
+            gpu.gp0(96 | (96 << 16));
+            gpu.gp0(64 | (64 << 16));
+            let words: Vec<u32> = (0..64 * 64 / 2).map(|_| gpu.read_data()).collect();
+            gpu.gp0(0x2000_ff00);
+            gpu.gp0(90 | (90 << 16));
+            gpu.gp0(160 | (100 << 16));
+            gpu.gp0(100 | (170 << 16));
+            words
+        };
+        let words = read(&mut here);
+        let commands = here.take_commands();
+        assert!(commands.iter().any(|c| matches!(c, Command::Precise { .. })), "no precise triangle");
+        replay_here.apply(&commands);
+        assert_eq!(read(&mut there), words);
+        assert!(there.stale);
+        replay_there.borrow_mut().apply(&there.take_commands());
+        assert_eq!(here.drawing(), there.drawing());
+        there.sync_vram();
+        assert!(here.vram == there.vram, "the native VRAMs differ at {scale}x");
+        // The scaled pictures, the whole VRAM.
+        let d = Display {
+            x: 0,
+            y: 0,
+            w: VRAM_WIDTH as u32,
+            h: VRAM_HEIGHT as u32,
+            depth24: false,
+            off: false,
+        };
+        let (mut a, mut b) = (Vec::new(), Vec::new());
+        replay_here.render_display(d, &mut a);
+        replay_there.borrow().render_display(d, &mut b);
+        assert!(a == b, "the scaled pictures differ at {scale}x");
     }
 
     #[test]

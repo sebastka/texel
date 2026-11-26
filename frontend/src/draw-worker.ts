@@ -3,6 +3,9 @@
 // it here, where a Replayer draws it in software and paints the canvas.
 // Each message carries every recording since the last one acknowledged:
 // none is dropped (they change what is drawn next), only pictures are.
+// Deferred, the native resolution is drawn here too, and the emulation
+// worker fetches it when the core reads VRAM ("vram": answered through
+// shared memory, which it waits on).
 
 import init, { Replayer } from "./wasm/texel_web.js";
 import { type Painter, painter as makePainter } from "./paint";
@@ -18,7 +21,11 @@ export type ToDrawer =
       hidden: Half | null;
       /** A screenshot wanted (PNG): for a save state. */
       screenshot: boolean;
-    };
+    }
+  /** The native VRAM wanted: after `drawings`, `commands` (for
+   * `applyCommands`); written to `shared` from byte 8, then its first
+   * 32 bits set (1, or 2: failed) and notified. */
+  | { type: "vram"; drawings: ArrayBuffer[]; commands: ArrayBuffer; shared: SharedArrayBuffer };
 
 /** "drawn": ready for more; `ms`: what drawing took. */
 export type FromDrawer =
@@ -49,8 +56,30 @@ async function draw(msg: Extract<ToDrawer, { type: "draw" }>) {
   scope.postMessage({ type: "drawn", ms, screenshot } satisfies FromDrawer);
 }
 
+/** Answers a fetch of the native VRAM (see `ToDrawer`'s "vram"). */
+function vram(msg: Extract<ToDrawer, { type: "vram" }>) {
+  const flag = new Int32Array(msg.shared, 0, 1);
+  let answer = 2;
+  try {
+    if (replayer) {
+      for (const d of msg.drawings) if (d.byteLength > 0) replayer.apply(new Uint8Array(d));
+      replayer.applyCommands(new Uint8Array(msg.commands));
+      const native = replayer.nativeVram();
+      new Uint16Array(msg.shared, 8, native.length).set(native);
+      answer = 1;
+    }
+  } finally {
+    Atomics.store(flag, 0, answer);
+    Atomics.notify(flag, 0);
+  }
+}
+
 scope.onmessage = (e: MessageEvent<ToDrawer>) => {
   const msg = e.data;
+  if (msg.type === "vram") {
+    vram(msg);
+    return;
+  }
   if (msg.type === "start") {
     void init().then((wasm) => {
       memory = wasm.memory;

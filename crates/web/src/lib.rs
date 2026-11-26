@@ -212,7 +212,8 @@ impl Emulator {
 
     /// Saves the machine's state (not the BIOS, disc or memory cards).
     #[wasm_bindgen(js_name = saveState)]
-    pub fn save_state(&self) -> Vec<u8> {
+    pub fn save_state(&mut self) -> Vec<u8> {
+        self.system.sync_vram();
         self.system.save_state()
     }
 
@@ -223,6 +224,7 @@ impl Emulator {
         if self.rewinds.len() <= slot {
             self.rewinds.resize_with(slot + 1, Default::default);
         }
+        self.system.sync_vram();
         self.system.save_rewind(&mut self.rewinds[slot]);
     }
 
@@ -329,6 +331,31 @@ impl Emulator {
         self.system.set_gpu_recording(on);
     }
 
+    /// Drawing elsewhere (see `setDrawingElsewhere`), the native resolution
+    /// too (`fetch` given), not here: only the pixels each primitive covers
+    /// are counted here (they time the GPU). When something reads VRAM (the
+    /// game, a save state), `fetch` is called with what was recorded since
+    /// the last `takeDrawing` (for `Replayer::applyCommands`), after what
+    /// was taken before, and returns the replayer's native VRAM then
+    /// (`Replayer::nativeVram`). `undefined`: drawn here again.
+    #[wasm_bindgen(js_name = setDrawingDeferred)]
+    pub fn set_drawing_deferred(&mut self, fetch: Option<js_sys::Function>) {
+        let fetch = fetch.map(|f| -> texel_ps1::gpu_record::VramFetch {
+            Box::new(move |commands, vram| {
+                let bytes = postcard::to_stdvec(&commands).unwrap_or_default();
+                let got = f.call1(&JsValue::NULL, &js_sys::Uint8Array::from(&bytes[..]));
+                // A failure is the page's to report: VRAM stays as it was.
+                if let Ok(got) = got
+                    && let Ok(native) = got.dyn_into::<js_sys::Uint16Array>()
+                    && native.length() as usize == vram.len()
+                {
+                    native.copy_to(vram);
+                }
+            })
+        });
+        self.system.set_gpu_deferred(fetch);
+    }
+
     /// The drawing recorded since the last call, and the displayed
     /// picture's place, encoded for `Replayer::apply`.
     #[wasm_bindgen(js_name = takeDrawing)]
@@ -395,7 +422,8 @@ impl Emulator {
     /// A checksum of the machine state, folded to 32 bits: equal on two
     /// machines that ran in step.
     #[wasm_bindgen(js_name = stateChecksum)]
-    pub fn state_checksum(&self) -> u32 {
+    pub fn state_checksum(&mut self) -> u32 {
+        self.system.sync_vram();
         let h = self.system.state_checksum();
         (h ^ (h >> 32)) as u32
     }
@@ -463,6 +491,22 @@ impl Replayer {
         self.replay.apply(&commands);
         self.display = Some(display);
         Ok(())
+    }
+
+    /// Runs commands from `Emulator::setDrawingDeferred`'s fetch.
+    #[wasm_bindgen(js_name = applyCommands)]
+    pub fn apply_commands(&mut self, commands: &[u8]) -> Result<(), JsError> {
+        let commands: Vec<texel_ps1::gpu_record::Command> =
+            postcard::from_bytes(commands).map_err(|e| JsError::new(&e.to_string()))?;
+        self.replay.apply(&commands);
+        Ok(())
+    }
+
+    /// The native VRAM as drawn so far (1024 by 512 pixels), for
+    /// `Emulator::setDrawingDeferred`'s fetch.
+    #[wasm_bindgen(js_name = nativeVram)]
+    pub fn native_vram(&self) -> js_sys::Uint16Array {
+        js_sys::Uint16Array::from(self.replay.native())
     }
 
     /// Renders the displayed picture (read with `frame`, sized by

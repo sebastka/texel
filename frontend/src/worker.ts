@@ -46,6 +46,11 @@ let drawer: Worker | null = null;
 let drawerReady = false;
 let drawings: ArrayBuffer[] = [];
 let screenshotWanted: ((b: Blob | null) => void) | null = null;
+/** Deferred drawing (see `updateDeferral`): on, and where the drawing
+ * worker answers a fetch of the native VRAM (a flag, then the pixels). */
+let deferred = false;
+let vramShared: SharedArrayBuffer | null = null;
+const VRAM_PIXELS = 1024 * 512;
 /** Resolution: as chosen, and as drawn (lower while emulation lags). */
 let chosenScale = 1;
 let autoScale = 1;
@@ -113,6 +118,9 @@ function joinRoom(room: RoomSnapshot) {
     gzip: (data, decompress = false) => compress(data, "gzip", decompress),
     onStarted: () => draw(),
   });
+  // Rollback keeps the machine every frame: VRAM drawn here, where it is
+  // read (the core fetches it before then).
+  updateDeferral();
   net.input = { buttons: local.buttons[0], axes: local.axes[0] };
   for (const data of netQueue) net.receive(data);
   netQueue = [];
@@ -538,6 +546,7 @@ function fromDrawer(msg: FromDrawer) {
     return;
   }
   drawerReady = true;
+  updateDeferral();
   if (msg.ms > 0) drawMs = drawMs * 0.9 + msg.ms * 0.1;
   if (screenshotWanted) {
     screenshotWanted(msg.screenshot);
@@ -545,6 +554,46 @@ function fromDrawer(msg: FromDrawer) {
   }
   // What was recorded meanwhile goes at once.
   if (drawings.length > 0) sendDrawings();
+}
+
+/**
+ * Deferred drawing: with a drawing worker, the native resolution is drawn
+ * there too, not here (where only the pixels primitives cover are counted,
+ * for the GPU's timing): a quarter of a heavy frame's emulation. When the
+ * core reads VRAM (the game, a save state), it fetches it from there
+ * (`fetchVram`). Not in netplay rooms: rollback keeps the machine every
+ * frame. Once the drawing worker is up (it answers fetches from then on).
+ */
+function updateDeferral() {
+  const e = emu as { setDrawingDeferred?: (fetch?: (commands: Uint8Array) => Uint16Array) => void } | null;
+  const want = drawer !== null && net === null && typeof SharedArrayBuffer !== "undefined" && scope.crossOriginIsolated;
+  if (!e?.setDrawingDeferred || want === deferred) return;
+  if (want) vramShared ??= new SharedArrayBuffer(8 + 2 * VRAM_PIXELS);
+  e.setDrawingDeferred(want ? fetchVram : undefined);
+  deferred = want;
+}
+
+/**
+ * The native VRAM, from the drawing worker, for the core (synchronously: it
+ * reads it in the middle of an instruction): what was recorded and not sent
+ * yet goes first, then `commands` (recorded since); this worker waits for
+ * the answer.
+ */
+function fetchVram(commands: Uint8Array): Uint16Array {
+  if (!drawer || !vramShared) throw new Error("no drawing worker to fetch VRAM from");
+  const flag = new Int32Array(vramShared, 0, 1);
+  Atomics.store(flag, 0, 0);
+  const sent = drawings;
+  drawings = [];
+  const buffer = commands.buffer as ArrayBuffer;
+  drawer.postMessage({ type: "vram", drawings: sent, commands: buffer, shared: vramShared } satisfies ToDrawer, [...sent, buffer]);
+  const waited = Atomics.wait(flag, 0, 0, 10_000);
+  if (waited === "timed-out" || Atomics.load(flag, 0) !== 1) {
+    const message = "the drawing worker did not give VRAM back";
+    post({ type: "error", message });
+    throw new Error(message);
+  }
+  return new Uint16Array(vramShared, 8, VRAM_PIXELS).slice();
 }
 
 /** The picture now, as PNG (for a save state's screenshot). */
