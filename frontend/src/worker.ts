@@ -50,6 +50,8 @@ let screenshotWanted: ((b: Blob | null) => void) | null = null;
  * worker answers a fetch of the native VRAM (a flag, then the pixels). */
 let deferred = false;
 let vramShared: SharedArrayBuffer | null = null;
+/** A fetch of VRAM failed: the machine is not to be trusted any more. */
+let vramLost = false;
 const VRAM_PIXELS = 1024 * 512;
 /** Resolution: as chosen, and as drawn (lower while emulation lags). */
 let chosenScale = 1;
@@ -562,11 +564,12 @@ function fromDrawer(msg: FromDrawer) {
  * for the GPU's timing): a quarter of a heavy frame's emulation. When the
  * core reads VRAM (the game, a save state), it fetches it from there
  * (`fetchVram`). Not in netplay rooms: rollback keeps the machine every
- * frame. Once the drawing worker is up (it answers fetches from then on).
+ * frame (back on once the room is left: a host plays on). Once the drawing
+ * worker is up (it answers fetches from then on).
  */
 function updateDeferral() {
   const e = emu as { setDrawingDeferred?: (fetch?: (commands: Uint8Array) => Uint16Array) => void } | null;
-  const want = drawer !== null && net === null && typeof SharedArrayBuffer !== "undefined" && scope.crossOriginIsolated;
+  const want = drawer !== null && (net === null || net.ended) && typeof SharedArrayBuffer !== "undefined" && scope.crossOriginIsolated;
   if (!e?.setDrawingDeferred || want === deferred) return;
   if (want) vramShared ??= new SharedArrayBuffer(8 + 2 * VRAM_PIXELS);
   e.setDrawingDeferred(want ? fetchVram : undefined);
@@ -589,7 +592,11 @@ function fetchVram(commands: Uint8Array): Uint16Array {
   drawer.postMessage({ type: "vram", drawings: sent, commands: buffer, shared: vramShared } satisfies ToDrawer, [...sent, buffer]);
   const waited = Atomics.wait(flag, 0, 0, 10_000);
   if (waited === "timed-out" || Atomics.load(flag, 0) !== 1) {
-    const message = "the drawing worker did not give VRAM back";
+    // The core's VRAM is stale from here: the game stops (at the end of
+    // this frame), and no state is saved from it.
+    vramLost = true;
+    paused = true;
+    const message = "the drawing worker did not give VRAM back: the game stopped";
     post({ type: "error", message });
     throw new Error(message);
   }
@@ -647,6 +654,7 @@ async function saveState(slot: number) {
   // Taken between frames, so the state and the screenshot match (the
   // PS2's is a promise, its GS memory read back from the GPU).
   const state = await emu.saveState();
+  if (vramLost) throw new Error("not saved: the drawing worker lost the game's VRAM");
   const shot = await screenshot();
   const body = await compress(state, "gzip");
   const resp = await fetch(`${stateUrl(slot)}?bios=${encodeURIComponent(biosId)}`, {
@@ -765,7 +773,8 @@ scope.onmessage = (e: MessageEvent<ToWorker>) => {
       schedule(0);
       break;
     case "pause":
-      paused = msg.paused;
+      // Not after a lost VRAM (see `fetchVram`): what runs on is wrong.
+      paused = msg.paused || vramLost;
       if (paused) void saveMemoryCards();
       else schedule(0);
       break;

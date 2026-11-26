@@ -292,6 +292,11 @@ export class Session {
     else this.hello();
   }
 
+  /** Left, or the room ended: a host plays on alone. */
+  get ended(): boolean {
+    return this.state === "ended";
+  }
+
   /** This member hosts the room. */
   get isHost(): boolean {
     return this.me === this.host;
