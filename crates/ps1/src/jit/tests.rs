@@ -83,7 +83,10 @@ fn branches_end_with_their_delay_slot() {
         // A load before the branch (landing after it), and in its slot.
         assert_eq!(check(0x8001_0000, &[lw, b, lw, 0, 0], true), if jump { 3 } else { 5 });
         // A slot left to the interpreter.
-        assert_eq!(check(0xbfc0_0100, &[b, r(0x18, 0, 8, 9), 0], true), if jump { 2 } else { 3 });
+        assert_eq!(
+            check(0xbfc0_0100, &[b, r(0x18, 0, 8, 9), 0], true),
+            if jump { 2 } else { 3 }
+        );
     }
     // A branch in a delay slot: the block ends before the first.
     assert_eq!(check(0x8001_0000, &[0, i(0x04, 0, 0, 1), i(0x04, 0, 0, 1)], true), 1);

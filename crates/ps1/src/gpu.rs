@@ -1549,11 +1549,20 @@ impl Raster<'_> {
             };
             match precise {
                 Some(p) if self.both => rec.extend([
-                    Command::Target { native: true, scaled: false },
+                    Command::Target {
+                        native: true,
+                        scaled: false,
+                    },
                     plain,
-                    Command::Target { native: false, scaled: true },
+                    Command::Target {
+                        native: false,
+                        scaled: true,
+                    },
                     p,
-                    Command::Target { native: true, scaled: true },
+                    Command::Target {
+                        native: true,
+                        scaled: true,
+                    },
                 ]),
                 Some(p) => rec.push(p),
                 None => rec.push(plain),
@@ -2549,9 +2558,27 @@ mod tests {
         w.extend([0xe600_0002, 0xe100_0200 | tpage]);
         w.extend([0x3000_00ff, xy(60, 2), 0x0000_ff00, xy(90, 10), 0x00ff_0000, xy(70, 30)]);
         w.extend([0xe600_0001]);
-        w.extend([0x2480_8080, xy(100, 100), 0, xy(140, 100), (tpage << 16) | 15, xy(100, 140), 15 << 8]);
+        w.extend([
+            0x2480_8080,
+            xy(100, 100),
+            0,
+            xy(140, 100),
+            (tpage << 16) | 15,
+            xy(100, 140),
+            15 << 8,
+        ]);
         let semi = tpage | (1 << 5);
-        w.extend([0x2e80_8080, xy(120, 90), 0, xy(170, 95), (semi << 16) | 15, xy(115, 150), 15 << 8, xy(175, 140), 0x0f0f]);
+        w.extend([
+            0x2e80_8080,
+            xy(120, 90),
+            0,
+            xy(170, 95),
+            (semi << 16) | 15,
+            xy(115, 150),
+            15 << 8,
+            xy(175, 140),
+            0x0f0f,
+        ]);
         w.extend([0xe100_0000 | tpage, 0x6480_8080, xy(200, 10), 0, xy(20, 20)]);
         w.extend([0x5000_00ff, xy(10, 200), 0x00ff_ff00, xy(150, 260)]);
         w.extend([0x0200_ff00, xy(300, 300), xy(32, 16)]);
@@ -2610,7 +2637,10 @@ mod tests {
         };
         let words = read(&mut here);
         let commands = here.take_commands();
-        assert!(commands.iter().any(|c| matches!(c, Command::Precise { .. })), "no precise triangle");
+        assert!(
+            commands.iter().any(|c| matches!(c, Command::Precise { .. })),
+            "no precise triangle"
+        );
         replay_here.apply(&commands);
         assert_eq!(read(&mut there), words);
         assert!(there.stale);

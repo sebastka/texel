@@ -285,9 +285,26 @@ impl Replay {
 
     /// A VRAM copy in the native VRAM, as the software GPU does it: the
     /// pixels its destination's mask kept (indices in it).
-    fn copy_native(&mut self, (sx, sy, dx, dy, w, h): (u32, u32, u32, u32, u32, u32), check_mask: bool, set_mask: bool) -> Vec<u32> {
-        let mut src = Transfer { x: sx, y: sy, w, h, i: 0 };
-        let mut dst = Transfer { x: dx, y: dy, w, h, i: 0 };
+    fn copy_native(
+        &mut self,
+        (sx, sy, dx, dy, w, h): (u32, u32, u32, u32, u32, u32),
+        check_mask: bool,
+        set_mask: bool,
+    ) -> Vec<u32> {
+        let mut src = Transfer {
+            x: sx,
+            y: sy,
+            w,
+            h,
+            i: 0,
+        };
+        let mut dst = Transfer {
+            x: dx,
+            y: dy,
+            w,
+            h,
+            i: 0,
+        };
         let mut skipped = Vec::new();
         while let (Some((fx, fy)), Some((tx, ty))) = (src.next(), dst.next()) {
             let v = self.native[fy * VRAM_WIDTH + fx];
