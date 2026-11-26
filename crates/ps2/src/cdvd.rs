@@ -165,6 +165,10 @@ fn language_defaults(zone: u8) -> [u8; 16] {
     l
 }
 
+/// An entry of `Cdvd::read_log`: a command (or 0xFF, 0xFE, 0xFD, 0xFC for
+/// the IOP's additions) and four values.
+pub type ReadLogEntry = (u8, u32, u32, u32, u32);
+
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct Cdvd {
     pub region: ConsoleRegion,
@@ -219,7 +223,7 @@ pub struct Cdvd {
     /// tag: (0xFE, IOP tag, words, EE address, EE tag); and each SPU2 DMA:
     /// (0xFD, address, BCR, channel, auto-DMA | read << 1).
     #[serde(skip)]
-    pub read_log: Option<Vec<(u8, u32, u32, u32, u32)>>,
+    pub read_log: Option<Vec<ReadLogEntry>>,
 }
 
 impl Default for Cdvd {
@@ -420,15 +424,15 @@ impl Cdvd {
 
     /// Starts N command `n_command` with `n_params`.
     fn n_command(&mut self) {
-        if self.read_log.is_some() {
-            let entry = (
-                self.n_command,
-                self.n_word(0),
-                self.n_word(4),
-                self.read.as_ref().map_or(0, |r| r.left),
-                self.blocks.len() as u32,
-            );
-            self.read_log.as_mut().unwrap().push(entry);
+        let entry = (
+            self.n_command,
+            self.n_word(0),
+            self.n_word(4),
+            self.read.as_ref().map_or(0, |r| r.left),
+            self.blocks.len() as u32,
+        );
+        if let Some(log) = &mut self.read_log {
+            log.push(entry);
         }
         self.error = 0;
         self.read = None;

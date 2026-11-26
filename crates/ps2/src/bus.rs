@@ -101,6 +101,10 @@ impl Mch {
     }
 }
 
+/// `Bus::ipu_sources`: the log, (quadwords taken, address, kind and
+/// values) entries; the quadwords taken so far; the next address.
+pub type IpuSources = (Vec<(u64, u32, u64)>, u64, u32);
+
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct Bus {
     /// Written through `write` only, once code runs compiled from it (the
@@ -177,7 +181,7 @@ pub struct Bus {
     /// | 1 << 63) at each start; and
     /// the quadwords taken so far, the next address.
     #[serde(skip)]
-    pub ipu_sources: Option<(Vec<(u64, u32, u64)>, u64, u32)>,
+    pub ipu_sources: Option<IpuSources>,
     /// Diagnostics: 64 bytes whose writes go into `ipu_sources` (taken,
     /// address, low 32 bits | 1 << 61).
     #[serde(skip)]
