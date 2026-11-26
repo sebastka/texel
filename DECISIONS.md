@@ -682,3 +682,18 @@ A VIFcode with its IRQ bit sets STAT's INT (bit 11) as well as raising the VIF's
 - **The stall is not emulated**: on the console, VIF1 waits after such a code until STC; here it goes on.
 - **Checked**: a test of INT and STC; Tekken 5's memory card dialog uploads its font every frame and shows its text (part of it garbled: the game's own glyph coordinates, both GSes drawing it the same).
 - Found with a value watch (the EE instruction storing a value), a breakpoint printing the EE's registers, and the chain tags a channel reads (`VALUEWATCH`, `BREAK`/`BREAKIF`, `TAGWATCH` in the boot example), and reading the game's code there.
+
+## D86. VU stalls count toward Q's latency
+
+The VUs stall an instruction that reads a VF register before the instruction writing it is done: four cycles for an FMAC's result (an upper instruction) or a lower instruction's VF write (LQ, MOVE, MFIR...). Texel computes results at once and ran every instruction in one cycle, so the stalls never happened; harmless, but for Q: DIV, SQRT and RSQRT deliver it after a latency in cycles, stalls included. Tekken 5's glyph program divides by a vertex's W six instructions before using Q, counting on two stalls between to make the seven cycles: without them it used the previous Q, its first vertex's Z overflowed to the far plane, and the depth test cut the next glyph along the triangle's diagonal (its text garbled at the start of each line).
+
+- **The interpreter and the compiler** both note, for each VF register, when its pending result is ready and which lanes it writes; an instruction pair reading those lanes sooner stalls till then, Q's latency going on meanwhile. The compiler emits the same checks (the registers each pair reads known when compiling, the times kept in the VU's state).
+- **Only Q counts the stalls**: the flags' four-instruction delay is still counted in instructions.
+- **Checked**: a test of a stall between a DIV and its MULQ; Tekken 5's dialog text whole; the compiler matching the interpreter on Tekken 5 and on Jak's jungle (`check-ps2-vu.mjs`, every second the same).
+
+## D87. The build in the pages' footer
+
+Every page's footer says which commit the app was built from, linked to it on GitHub, and "with local changes" when the tree had uncommitted ones: to tell which build a browser runs.
+
+- **At build time** (`scripts/build-env.sh`, run by `pnpm run build`): Vite's environment gets the commit (`TEXEL_COMMIT`, else git's HEAD), whether the tree had changes, and the repository (`TEXEL_REPOSITORY`, else the project's). No Node types in the project: the script passes them, not the Vite config.
+- **The image** is built without `.git`: its web stage takes `TEXEL_COMMIT` and `TEXEL_REPOSITORY` as build arguments, which CI and the release workflow set from the run.

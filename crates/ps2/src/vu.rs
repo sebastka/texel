@@ -6,12 +6,99 @@
 //! read the registers as they were before the pair; the upper one's result
 //! wins when both write the same register. Results are available at once
 //! (the hardware stalls on most hazards), except Q, which DIV, SQRT and
-//! RSQRT update after their latency.
+//! RSQRT update after their latency: counted in cycles, the stalls on VF
+//! registers not written yet (an FMAC's result, four cycles) included.
 //!
 //! Floats follow the PS2's rules: no infinities, NaNs or denormals.
 
 use crate::gif::Gif;
 use crate::gs::Gs;
+
+/// Cycles until an FMAC's result (or a lower instruction's VF write) can
+/// be read without stalling.
+const VF_LATENCY: u32 = 4;
+
+/// A VF register and its lanes (x = 8, y = 4, z = 2, w = 1).
+pub(crate) type VfUse = (usize, u8);
+
+/// The VF registers and lanes (x = 8, y = 4, z = 2, w = 1) an instruction
+/// pair reads and writes: (reads, writes). `lower` is None after an I bit.
+pub(crate) fn vf_use(upper: u32, lower: Option<u32>) -> (Vec<VfUse>, Vec<VfUse>) {
+    let mut reads = Vec::with_capacity(4);
+    let mut writes = Vec::with_capacity(2);
+    let dest = ((upper >> 21) & 15) as u8;
+    let (ft, fs, fd) = (
+        ((upper >> 16) & 31) as usize,
+        ((upper >> 11) & 31) as usize,
+        ((upper >> 6) & 31) as usize,
+    );
+    let lane = |f: u32| 8u8 >> (f & 3);
+    match upper & 0x3F {
+        // ADD, SUB, MADD, MSUB, MAX, MINI, MUL with a broadcast lane.
+        op @ 0x00..=0x1B => {
+            reads.extend([(fs, dest), (ft, lane(op))]);
+            writes.push((fd, dest));
+        }
+        // With Q or I.
+        0x1C..=0x27 => {
+            reads.push((fs, dest));
+            writes.push((fd, dest));
+        }
+        0x28..=0x2F => {
+            reads.extend([(fs, dest), (ft, dest)]);
+            writes.push((fd, dest));
+        }
+        0x3C..=0x3F => {
+            let o2 = ((upper >> 6) & 0x1F) << 2 | (upper & 3);
+            match o2 {
+                // ITOF, FTOI, ABS.
+                0x10..=0x17 | 0x1D => {
+                    reads.push((fs, dest));
+                    writes.push((ft, dest));
+                }
+                0x1F => reads.extend([(fs, 0b1110), (ft, 0b0001)]),
+                // To ACC, with a broadcast lane.
+                0x00..=0x0F | 0x18..=0x1B => reads.extend([(fs, dest), (ft, lane(o2))]),
+                // To ACC, with Q or I.
+                0x1C | 0x1E | 0x20..=0x27 => reads.push((fs, dest)),
+                0x28..=0x2E => reads.extend([(fs, dest), (ft, dest)]),
+                _ => {}
+            }
+        }
+        _ => {}
+    }
+    let Some(lower) = lower else {
+        return (reads, writes);
+    };
+    let dest = ((lower >> 21) & 15) as u8;
+    let (ft, fs) = (((lower >> 16) & 31) as usize, ((lower >> 11) & 31) as usize);
+    let (fsf, ftf) = ((lower >> 21) & 3, (lower >> 23) & 3);
+    match lower >> 25 {
+        0x00 => writes.push((ft, dest)),
+        0x01 => reads.push((fs, dest)),
+        0x40 if lower & 0x3C == 0x3C => match (lower & 3) | ((lower >> 4) & 0x7C) {
+            0x30 => {
+                reads.push((fs, dest));
+                writes.push((ft, dest));
+            }
+            // MR32 reads each lane's neighbour.
+            0x31 => {
+                reads.push((fs, dest >> 1 | (dest & 1) << 3));
+                writes.push((ft, dest));
+            }
+            0x34 | 0x36 | 0x3D | 0x40 | 0x41 | 0x64 => writes.push((ft, dest)),
+            0x35 | 0x37 => reads.push((fs, dest)),
+            0x38 | 0x3A => reads.extend([(fs, lane(fsf)), (ft, lane(ftf))]),
+            0x39 => reads.push((ft, lane(ftf))),
+            0x3C | 0x42 | 0x43 => reads.push((fs, lane(fsf))),
+            // The EFU's operations.
+            0x70..=0x7A | 0x7C..=0x7F => reads.push((fs, 0b1111)),
+            _ => {}
+        },
+        _ => {}
+    }
+    (reads, writes)
+}
 
 /// Bits of a float the PS2 way: the largest exponent is an ordinary
 /// number, denormals are zero.
@@ -154,6 +241,16 @@ pub struct Vu {
     pub top: u16,
     pub itop: u16,
     pub pending_q: PendingQ,
+    /// Cycles run (instructions and stalls), and when each VF register's
+    /// pending result is ready, with the lanes it writes: an instruction
+    /// reading one sooner stalls, the hardware's way, which Q's latency
+    /// counts (games time their divisions by it).
+    #[serde(skip)]
+    pub(crate) cycle: u32,
+    #[serde(skip)]
+    pub(crate) vf_ready: [u32; 32],
+    #[serde(skip)]
+    pub(crate) vf_mask: [u32; 32],
     branch: Option<u32>,
     /// Instructions run, and runs stopped for running too long (no end),
     /// for diagnostics.
@@ -225,6 +322,9 @@ impl Vu {
             top: 0,
             itop: 0,
             pending_q: PendingQ::default(),
+            cycle: 0,
+            vf_ready: [0; 32],
+            vf_mask: [0; 32],
             branch: None,
             steps: 0,
             runaways: 0,
@@ -353,6 +453,7 @@ impl Vu {
             }
             self.pc = (self.pc + 1) & wrap;
             let branch = self.branch.take();
+            self.stall(upper, lower);
             self.tick();
             self.seen = self.flag_history[(n % 4) as usize];
             let commit = self.upper(upper);
@@ -380,6 +481,37 @@ impl Vu {
             n += 1;
         }
         self.finish(n);
+    }
+
+    /// Stalls on the VF registers the pair reads that are not written yet
+    /// (Q's latency goes on meanwhile), then notes those it writes.
+    fn stall(&mut self, upper: u32, lower: u32) {
+        let (reads, writes) = vf_use(upper, (upper & (1 << 31) == 0).then_some(lower));
+        let mut stall = 0i32;
+        for &(r, m) in &reads {
+            if r != 0 && self.vf_mask[r] & u32::from(m) != 0 {
+                stall = stall.max(self.vf_ready[r].wrapping_sub(self.cycle) as i32);
+            }
+        }
+        if stall > 0 {
+            let left = self.pending_q.left;
+            if left != 0 {
+                if left <= stall as u32 {
+                    self.q = self.pending_q.value;
+                    self.pending_q = PendingQ::default();
+                } else {
+                    self.pending_q.left = left - stall as u32;
+                }
+            }
+            self.cycle = self.cycle.wrapping_add(stall as u32);
+        }
+        for &(r, m) in &writes {
+            if r != 0 {
+                self.vf_ready[r] = self.cycle.wrapping_add(VF_LATENCY);
+                self.vf_mask[r] = u32::from(m);
+            }
+        }
+        self.cycle = self.cycle.wrapping_add(1);
     }
 
     fn tick(&mut self) {
@@ -982,6 +1114,39 @@ mod tests {
         let vu = run(&[(add, sq), (NOP, LNOP)], |vu| vu.vf[1] = f([1.0; 4]));
         assert_eq!(vu.read_q(0), f([1.0; 4]));
         assert_eq!(vu.vf[1], f([2.0; 4]));
+    }
+
+    /// An instruction reading a VF register an FMAC wrote less than four
+    /// cycles before stalls, and Q's latency counts the stall: a MULQ four
+    /// instructions after a DIV gets its Q when a stall came between
+    /// (Tekken 5's glyphs: the old Q put their first vertex at the far
+    /// plane).
+    #[test]
+    fn stalls_count_toward_q() {
+        let div = (0x40 << 25) | (2 << 16) | (1 << 11) | ((0x38 >> 2) << 6) | 0x3C;
+        let add = |fd: u32, fs: u32, ft: u32| (0xF << 21) | (ft << 16) | (fs << 11) | (fd << 6) | 0x28;
+        let mulq = |fd: u32, fs: u32| (0xF << 21) | (fs << 11) | (fd << 6) | 0x1C;
+        for (reads_vf3, want) in [(true, 0.5), (false, 2.0)] {
+            // ADD vf5 = vf3 + vf3 (stalls three cycles), or vf4 + vf4.
+            let second = if reads_vf3 { add(5, 3, 3) } else { add(5, 4, 4) };
+            let vu = run(
+                &[
+                    (NOP, div),
+                    (add(3, 4, 4), LNOP),
+                    (second, LNOP),
+                    (NOP, LNOP),
+                    (mulq(6, 7) | E, LNOP),
+                    (NOP, LNOP),
+                ],
+                |vu| {
+                    vu.vf[1] = f([1.0; 4]);
+                    vu.vf[2] = f([4.0; 4]);
+                    vu.vf[7] = f([2.0; 4]);
+                    vu.q = 1f32.to_bits();
+                },
+            );
+            assert_eq!(vu.vf[6], f([want; 4]), "stall: {reads_vf3}");
+        }
     }
 
     #[test]

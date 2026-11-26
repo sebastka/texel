@@ -42,6 +42,9 @@ RUN --mount=type=cache,target=/root/.cache/pnpm,sharing=locked \
  && pnpm install --frozen-lockfile
 COPY frontend ./
 COPY --from=rust /wasm ./src/wasm
+# The commit and repository for the pages' footer (the context has no git).
+ARG TEXEL_COMMIT=""
+ARG TEXEL_REPOSITORY=""
 RUN pnpm run build
 
 # --- Runtime: a static binary, CA certificates, a non-root user -------------

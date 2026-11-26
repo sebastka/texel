@@ -746,7 +746,8 @@ impl Emitter {
     fn instruction(&mut self, pc: u32, word: u64) {
         let upper = (word >> 32) as u32;
         let lower = word as u32;
-        // Q's latency.
+        // Stalls on VF registers not written yet, then Q's latency.
+        self.stall(upper, lower);
         self.tick_q();
         // The upper instruction's result (committed after the lower one).
         let commit = self.upper(upper);
@@ -788,6 +789,73 @@ impl Emitter {
             field(offset_of!(Vu, pending_q) + offset_of!(PendingQ, value)),
             field(offset_of!(Vu, pending_q) + offset_of!(PendingQ, left)),
         )
+    }
+
+    /// The interpreter's `Vu::stall`: the cycles to wait for the VF
+    /// registers the pair reads (in T1), Q's latency going on meanwhile,
+    /// then the registers it writes noted, the cycle counted.
+    fn stall(&mut self, upper: u32, lower: u32) {
+        let (reads, writes) = crate::vu::vf_use(upper, (upper & (1 << 31) == 0).then_some(lower));
+        let ready = field(offset_of!(Vu, vf_ready));
+        let masks = field(offset_of!(Vu, vf_mask));
+        let cycle = field(offset_of!(Vu, cycle));
+        let reads: Vec<_> = reads.into_iter().filter(|&(r, _)| r != 0).collect();
+        if !reads.is_empty() {
+            self.code.i32_const(0).local_set(T1);
+            for &(r, m) in &reads {
+                let r = r as u32;
+                self.load_vu_i32(masks + 4 * r);
+                self.code.i32_const(i32::from(m)).op(op::I32_AND).if_();
+                self.load_vu_i32(ready + 4 * r);
+                self.load_vu_i32(cycle);
+                self.code
+                    .op(op::I32_SUB)
+                    .local_tee(T0)
+                    .local_get(T1)
+                    .op(op::I32_GT_S)
+                    .if_();
+                self.code.local_get(T0).local_set(T1);
+                self.code.op(op::END).op(op::END);
+            }
+            // A stall: Q lands if it was due by then, else comes closer.
+            let (value, left) = self.pending();
+            let vu = self.vu;
+            self.code.local_get(T1).i32_const(0).op(op::I32_GT_S).if_();
+            self.load_vu_i32(left);
+            self.code.local_tee(T0).if_();
+            self.code.local_get(T1).local_get(T0).op(op::I32_GE_U).if_();
+            self.store_i32(field(offset_of!(Vu, q)), |c| {
+                c.local_get(vu).mem(op::I32_LOAD, 2, value);
+            });
+            self.store_i32(left, |c| {
+                c.i32_const(0);
+            });
+            self.code.op(op::ELSE);
+            self.store_i32(left, |c| {
+                c.local_get(T0).local_get(T1).op(op::I32_SUB);
+            });
+            self.code.op(op::END).op(op::END);
+            self.store_i32(cycle, |c| {
+                c.local_get(vu)
+                    .mem(op::I32_LOAD, 2, cycle)
+                    .local_get(T1)
+                    .op(op::I32_ADD);
+            });
+            self.code.op(op::END);
+        }
+        let vu = self.vu;
+        for (r, m) in writes.into_iter().filter(|&(r, _)| r != 0) {
+            let r = r as u32;
+            self.store_i32(ready + 4 * r, |c| {
+                c.local_get(vu).mem(op::I32_LOAD, 2, cycle).i32_const(4).op(op::I32_ADD);
+            });
+            self.store_i32(masks + 4 * r, |c| {
+                c.i32_const(i32::from(m));
+            });
+        }
+        self.store_i32(cycle, |c| {
+            c.local_get(vu).mem(op::I32_LOAD, 2, cycle).i32_const(1).op(op::I32_ADD);
+        });
     }
 
     /// Q's pending value comes one instruction closer (lands at 1).

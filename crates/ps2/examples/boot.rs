@@ -931,6 +931,11 @@ fn dump_draws(ps2: &mut Ps2, frames: u64) {
     }
     let mut by_program: BTreeMap<u32, (u32, u32, u32)> = BTreeMap::new();
     let mut shown = 0;
+    // KICKZ=hex: show (as a bad packet) the first ones with a vertex at
+    // that depth, with PROG's trace.
+    let kickz = std::env::var("KICKZ")
+        .ok()
+        .and_then(|v| u32::from_str_radix(&v, 16).ok());
     for k in &kicks {
         let e = by_program.entry(k.start).or_default();
         e.0 += 1;
@@ -960,6 +965,11 @@ fn dump_draws(ps2: &mut Ps2, frames: u64) {
                         let (x, y) = (q[0] & 0xFFFF, q[1] & 0xFFFF);
                         if !(0x100..=0xF000).contains(&x) || !(0x100..=0xF000).contains(&y) {
                             e.2 += 1;
+                            bad_here += 1;
+                        }
+                        // Packed XYZF2 (4) holds Z in bits 4-27; XYZ2 (5) in all.
+                        let z = if desc == 4 { (q[2] >> 4) & 0xFF_FFFF } else { q[2] };
+                        if kickz == Some(z) {
                             bad_here += 1;
                         }
                     }
@@ -1075,8 +1085,10 @@ fn dump_draws(ps2: &mut Ps2, frames: u64) {
         commands.len()
     );
     // DRAWSTATE=1: the draws by their state (kind, PRIM's flags, TEX0,
-    // TEX1, ALPHA, TEST, FRAME), with the first vertices of each group (up to 12).
-    if std::env::var("DRAWSTATE").is_ok() {
+    // TEX1, ALPHA, TEST, FRAME), with the first vertices of each group (DRAWSTATE=n: up to n, 12 by default).
+    if let Ok(limit) = std::env::var("DRAWSTATE") {
+        // DRAWSTATE=n: up to n vertices of each group (12 otherwise).
+        let limit: usize = limit.parse().unwrap_or(12);
         type State = (u32, u64, u64, u64, u64, u64, u64);
         let mut groups: std::collections::BTreeMap<State, (usize, Vec<texel_ps2::gs::Vertex>)> =
             std::collections::BTreeMap::new();
@@ -1093,7 +1105,7 @@ fn dump_draws(ps2: &mut Ps2, frames: u64) {
                 );
                 let g = groups.entry(key).or_insert((0, Vec::new()));
                 g.0 += 1;
-                if g.1.len() < 12 {
+                if g.1.len() < limit {
                     g.1.extend(vertices.iter().copied());
                 }
             }
