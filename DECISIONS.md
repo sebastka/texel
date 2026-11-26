@@ -735,3 +735,10 @@ Midnight Club 3: DUB Edition Remix is a dual-layer DVD: its movies (`\VIDEO\ROCK
 - **VU1 elsewhere** (D57): the engine's VIF1 gets the words the EE side's took, in one go, and does not stall itself.
 - **Not in save states**, like INT (their format is positional): handlers lift a stall at once, a state saved during one is unlikely.
 - **Nightfire** now shows its language choice, the MGM movie, its title and the first mission's loading screen.
+
+## D92. Macro-mode divisions land at once
+
+Jak II and Jak 3 drew a streak from each text line's first glyph to the screen's top left. Their text is built on the EE with VU0 macro instructions and sent through path 2: a VDIV, then a VMULQ by Q a few COP2 instructions later. Macro mode counted nothing down: a division's Q landed at the next division, VWAITQ or microprogram, so each VMULQ took the previous division's result. Within a glyph its vertices share their depth and Q, which hid it; a line's first vertex took a Q from elsewhere.
+
+- **Interlocked**: the EE's COP2 instructions wait for a result they read, so in macro mode VDIV, VSQRT and VRSQRT give Q at once (to VU0's microprograms too). Microprograms keep the latencies and stalls of D86.
+- **Found with** the runner's `PROBE=x,y` (the triangles drawn over a pixel: the streak's, with its vertices' depth), then `VALUEWATCH` on its x for the EE instruction storing it.

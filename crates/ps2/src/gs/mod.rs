@@ -126,7 +126,14 @@ pub struct Gs {
     /// Diagnostics: the EE address of the GIF DMA's current quadword.
     #[serde(skip)]
     pub dma_source: u32,
+    /// Diagnostics: a pixel (window coordinates, after XYOFFSET), and the
+    /// triangles drawn over it: their vertices (x, y, z before XYOFFSET).
+    #[serde(skip)]
+    pub probe: Option<Probe>,
 }
+
+/// See `Gs::probe`: the pixel, and the triangles drawn over it.
+pub type Probe = ((i32, i32), Vec<[[u32; 3]; 3]>);
 
 fn no_clut() -> [u32; 256] {
     [0; 256]
@@ -150,6 +157,7 @@ impl Default for Gs {
             commands: Vec::new(),
             transfer_log: None,
             dma_source: 0,
+            probe: None,
         }
     }
 }

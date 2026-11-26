@@ -914,6 +914,14 @@ impl Vu {
                     value: q,
                     left: latency,
                 };
+                // Macro mode (no GIF given): the EE's COP2 instructions
+                // interlock, one reading Q waits for the division: Q is the
+                // result for them at once (Jak II and 3 divide, then
+                // multiply by Q a few COP2 instructions later; their text's
+                // first vertex took the previous Q).
+                if out.is_none() {
+                    self.wait_q();
+                }
             }
             0x3B => self.wait_q(),
             0x3C => self.set_vi(it, vfs[fsf] as u16),
@@ -1147,6 +1155,22 @@ mod tests {
             );
             assert_eq!(vu.vf[6], f([want; 4]), "stall: {reads_vf3}");
         }
+    }
+
+    /// In macro mode (the EE's COP2), a VMULQ right after a VDIV reads the
+    /// division's result: the EE interlocks.
+    #[test]
+    fn macro_divisions_land_at_once() {
+        let mut vu = Vu::new(0);
+        vu.vf[1] = f([1.0; 4]);
+        vu.vf[2] = f([4.0; 4]);
+        vu.vf[7] = f([2.0; 4]);
+        vu.q = 1f32.to_bits();
+        // VDIV Q, vf1x, vf2x; VMULQ.xyzw vf6, vf7.
+        let div = (2 << 16) | (1 << 11) | ((0x38 >> 2) << 6) | 0x3C;
+        vu.special2(0x38, div, None);
+        vu.macro_upper((0xF << 21) | (7 << 11) | (6 << 6) | 0x1C);
+        assert_eq!(vu.vf[6], f([0.5; 4]));
     }
 
     #[test]

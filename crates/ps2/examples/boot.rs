@@ -112,6 +112,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if std::env::var("SYSCALLS").is_ok() {
         ps2.ee.syscalls = Some(Default::default());
     }
+    // PROBE=x,y (window pixels): the triangles drawn over that pixel
+    // (reported with DRAWS, the last ones).
+    if let Some((x, y)) = std::env::var("PROBE").ok().and_then(|v| {
+        let (a, b) = v.split_once(',')?;
+        Some((a.parse().ok()?, b.parse().ok()?))
+    }) {
+        ps2.bus.gs.probe = Some(((x, y), Vec::new()));
+    }
     // TRANSFERS=1: the GS's transfers, from the start (reported with
     // DRAWS).
     if std::env::var("TRANSFERS").is_ok() {
@@ -422,6 +430,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         for ((lib, n, ra), (count, a0, at)) in &calls {
             let ago = (p.now - at) as f64 * 512.0 / 294_912_000.0;
             println!("  IOP call {lib}#{n} from {ra:08X}: {count} times, last a0 {a0:08X}, {ago:.2} s ago");
+        }
+    }
+    if let Some((at, hits)) = &ps2.bus.gs.probe {
+        println!("Triangles over {at:?}: {}", hits.len());
+        for v in hits.iter().rev().take(40).rev() {
+            println!("  {:x?}", v);
         }
     }
     if let Some(log) = &ps2.ee.syscalls {
@@ -978,11 +992,17 @@ fn dump_draws(ps2: &mut Ps2, frames: u64) {
     let kickz = std::env::var("KICKZ")
         .ok()
         .and_then(|v| u32::from_str_radix(&v, 16).ok());
+    // KICKJUMP=hex: those where a vertex is further than that (12.4 fixed
+    // point) from the one before it, in x or y.
+    let kickjump = std::env::var("KICKJUMP")
+        .ok()
+        .and_then(|v| u32::from_str_radix(&v, 16).ok());
     for k in &kicks {
         let e = by_program.entry(k.start).or_default();
         e.0 += 1;
         let mut i = 0;
         let mut bad_here = 0;
+        let mut last: Option<(u32, u32)> = None;
         while i < k.packet.len() {
             let tag = k.packet[i];
             let lo = u64::from(tag[0]) | (u64::from(tag[1]) << 32);
@@ -1014,6 +1034,12 @@ fn dump_draws(ps2: &mut Ps2, frames: u64) {
                         if kickz == Some(z) {
                             bad_here += 1;
                         }
+                        if let (Some(jump), Some((lx, ly))) = (kickjump, last)
+                            && (x.abs_diff(lx) > jump || y.abs_diff(ly) > jump)
+                        {
+                            bad_here += 1;
+                        }
+                        last = Some((x, y));
                     }
                 }
             }

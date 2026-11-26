@@ -304,6 +304,15 @@ impl Gs {
             return;
         }
         let sign = area.signum();
+        if let Some(((x, y), hits)) = &mut self.probe {
+            let at = (i64::from(*x) * 16, i64::from(*y) * 16);
+            let inside = [(1, 2), (2, 0), (0, 1)]
+                .iter()
+                .all(|&(i, j)| edge(p[i], p[j], at) * sign >= 0);
+            if inside && hits.len() < 4096 {
+                hits.push(std::array::from_fn(|i| [v[i].x, v[i].y, v[i].z]));
+            }
+        }
         let minx = p.iter().map(|q| q.0).min().unwrap_or(0);
         let maxx = p.iter().map(|q| q.0).max().unwrap_or(0);
         let miny = p.iter().map(|q| q.1).min().unwrap_or(0);
