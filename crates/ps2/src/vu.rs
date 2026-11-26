@@ -268,6 +268,11 @@ pub struct Vu {
     pub trace_from: Option<u32>,
     #[serde(skip)]
     trace: Vec<(u32, [u16; 16])>,
+    /// Traced runs: data memory's quadwords in this range as they start.
+    #[serde(skip)]
+    pub trace_mem: Option<(u32, u32)>,
+    #[serde(skip)]
+    trace_snapshot: Vec<[u32; 4]>,
     /// Microprograms compiled to WebAssembly (in browsers; see `vu_jit`),
     /// and the instructions a compiled one ran when it stopped.
     #[serde(skip)]
@@ -292,6 +297,8 @@ pub struct Kick {
     pub trace: Vec<(u32, [u16; 16])>,
     /// The micro memory then, when traced.
     pub micro: Vec<u8>,
+    /// Data memory as the run started, when traced (`Vu::trace_mem`).
+    pub mem: Vec<[u32; 4]>,
 }
 
 /// Instructions a microprogram may run (one that never ends is stopped).
@@ -332,6 +339,8 @@ impl Vu {
             kicks: None,
             trace_from: None,
             trace: Vec::new(),
+            trace_mem: None,
+            trace_snapshot: Vec::new(),
             jit: None,
             run_n: 0,
             micro_gen: 0,
@@ -407,6 +416,12 @@ impl Vu {
         self.pc = pc & self.wrap();
         self.start = self.pc;
         self.trace.clear();
+        self.trace_snapshot.clear();
+        if self.trace_from == Some(self.start)
+            && let Some((from, to)) = self.trace_mem
+        {
+            self.trace_snapshot = (from..to).map(|q| self.read_q(q)).collect();
+        }
         self.branch = None;
         // The flags as they stand when the program starts.
         self.flag_history = [self.flags(); 4];
@@ -968,6 +983,7 @@ impl Vu {
                             } else {
                                 self.micro.to_vec()
                             },
+                            mem: self.trace_snapshot.clone(),
                         };
                         if let Some(kicks) = self.kicks.as_mut() {
                             kicks.push(kick);
