@@ -254,7 +254,7 @@ async function start(msg: StartMessage) {
     // Its own module, with the PlayStation's interface where they overlap.
     const ps2 = await import("./wasm/texel_web_ps2.js");
     await ps2.default();
-    const onGpu: Ps2Emulator | null = (await webgpu()) ? await ps2.Ps2Emulator.withGpu(bios, msg.canvas).catch(gpuFailed) : null;
+    const onGpu: Ps2Emulator | null = msg.webgpu && (await webgpu()) ? await ps2.Ps2Emulator.withGpu(bios, msg.canvas).catch(gpuFailed) : null;
     gpu = onGpu;
     const ps2emu = onGpu ?? new ps2.Ps2Emulator(bios);
     // The EE's code compiled to WebAssembly as it runs; interpreted if this
@@ -284,7 +284,7 @@ async function start(msg: StartMessage) {
   } else {
     ps1Memory = (await init()).memory;
     // Scaled drawing on the GPU, where the browser has WebGPU.
-    const onGpu = (await webgpu()) ? await Emulator.withGpu(bios, msg.canvas).catch(gpuFailed) : null;
+    const onGpu = msg.webgpu && (await webgpu()) ? await Emulator.withGpu(bios, msg.canvas).catch(gpuFailed) : null;
     gpu = onGpu;
     emu = onGpu ?? new Emulator(bios);
     // The CPU's code compiled to WebAssembly as it runs (it runs exactly as

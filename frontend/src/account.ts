@@ -6,6 +6,7 @@ import { avatar } from "./account-menu";
 import { ApiError, api } from "./api";
 import { h } from "./dom";
 import type { Shell } from "./main";
+import { setWebgpuAllowed, webgpuAllowed } from "./player";
 
 const MIN_PASSWORD = 10;
 
@@ -219,6 +220,7 @@ export function renderAccount(shell: Shell) {
       h("dd", {}, me.oidc ? "the sign-in provider" : (me.email ?? "an e-mail address")),
     ),
   ];
+  parts.push(browserSettings());
   if (me.oidc) {
     parts.push(h("p.muted", {}, "Your name and password are your sign-in provider's: change them there."));
   } else {
@@ -276,5 +278,30 @@ export function renderAccount(shell: Shell) {
   shell.app.replaceChildren(
     shell.header("account"),
     h("main.auth", {}, h("div.account-title", {}, avatar(me, "large"), h("h1", {}, "Your account")), error.el, done, ...parts),
+  );
+}
+
+/** Settings of this browser (kept in it: they depend on the device). */
+function browserSettings(): Node {
+  const has = "gpu" in navigator;
+  const box = h("input.switch", {
+    type: "checkbox",
+    checked: has && webgpuAllowed(),
+    disabled: !has,
+    "aria-label": "Draw with WebGPU",
+  }) as HTMLInputElement;
+  box.onchange = () => setWebgpuAllowed(box.checked);
+  const about = has
+    ? "Games draw on the graphics card: faster at higher resolutions. Off: drawn by the processor, for when the picture is wrong or the tab crashes. From the next game started."
+    : "This browser has no WebGPU: games are drawn by the processor.";
+  return h(
+    "section",
+    {},
+    h("h2", {}, "This browser"),
+    h(
+      "div.admin-features",
+      {},
+      h("label.admin-feature", {}, h("span.admin-feature-text", {}, h("strong", {}, "Draw with WebGPU"), h("span.muted.small", {}, about)), box),
+    ),
   );
 }

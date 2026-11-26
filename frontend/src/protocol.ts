@@ -18,6 +18,9 @@ export interface StartMessage {
   audio: SharedArrayBuffer | null;
   smooth: boolean;
   scale: number;
+  /** Drawing on the GPU allowed, where the browser has WebGPU (the user's
+   * choice for this browser, see `webgpuAllowed`). */
+  webgpu: boolean;
   /** Netplay: the room whose game this is, to run in step with it. */
   room: RoomSnapshot | null;
   /** Cheat and patch codes, from the start. */

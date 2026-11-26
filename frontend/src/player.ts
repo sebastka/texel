@@ -29,6 +29,7 @@ interface Callbacks {
 const SMOOTH_KEY = "texel.smooth";
 const PRECISE_KEY = "texel.precise";
 const WIDESCREEN_KEY = "texel.widescreen";
+const WEBGPU_KEY = "texel.webgpu";
 
 /** A remembered on/off setting (`fallback` when none, or no storage). */
 function loadFlag(key: string, fallback: boolean): boolean {
@@ -47,6 +48,17 @@ function saveFlag(key: string, on: boolean) {
     // Private mode: not remembered.
   }
 }
+/** Whether games may draw on the GPU, where this browser has WebGPU (on
+ * by default): in this browser, a property of the device (its driver may
+ * draw wrongly). From the next game started. */
+export function webgpuAllowed(): boolean {
+  return loadFlag(WEBGPU_KEY, true);
+}
+
+export function setWebgpuAllowed(on: boolean) {
+  saveFlag(WEBGPU_KEY, on);
+}
+
 /** How long a stopped worker may take to save memory cards. */
 const STOP_TIMEOUT_MS = 10_000;
 /** Largest canvas side, in device pixels (a 4K screen is 3840 wide). */
@@ -224,6 +236,7 @@ export class Player {
         audio: ring,
         smooth: this.smooth,
         scale: this.scale,
+        webgpu: webgpuAllowed(),
       },
       [offscreen],
     );
