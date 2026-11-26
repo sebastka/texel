@@ -69,7 +69,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ps2.bus.ipu.trace = Some(Box::default());
         ps2.bus.ipu_sources = Some((Vec::new(), 0, 0));
         // IPUWATCH=address: writes to those 64 bytes, in the same log.
-        ps2.bus.ipu_watch = std::env::var("IPUWATCH").ok().and_then(|a| u32::from_str_radix(&a, 16).ok());
+        ps2.bus.ipu_watch = std::env::var("IPUWATCH")
+            .ok()
+            .and_then(|a| u32::from_str_radix(&a, 16).ok());
     }
     // TRANSFERS=1: the GS's transfers, from the start (reported with
     // DRAWS).
@@ -613,7 +615,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 continue;
             }
             if cmd == 0xFD {
-                println!("  SPU2DMA ch{left} {lsn:08X} BCR {count:08X} (auto {}, read {})", waiting & 1, waiting >> 1);
+                println!(
+                    "  SPU2DMA ch{left} {lsn:08X} BCR {count:08X} (auto {}, read {})",
+                    waiting & 1,
+                    waiting >> 1
+                );
                 continue;
             }
             if cmd == 0xFE {

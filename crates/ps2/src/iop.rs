@@ -501,7 +501,11 @@ impl IopBus {
             return;
         }
         let shift = (pa & 3) * 8;
-        let mask = if N >= 4 { u32::MAX } else { ((1u32 << (8 * N)) - 1) << shift };
+        let mask = if N >= 4 {
+            u32::MAX
+        } else {
+            ((1u32 << (8 * N)) - 1) << shift
+        };
         self.io_write(pa & !3, v << shift, mask);
     }
 

@@ -349,7 +349,11 @@ impl Bus {
             let mut low = [0u8; 4];
             let n = N.min(4);
             low[..n].copy_from_slice(&data[..n]);
-            log.push((*taken, pa, u64::from(u32::from_le_bytes(low)) | (N as u64) << 32 | 1 << 61));
+            log.push((
+                *taken,
+                pa,
+                u64::from(u32::from_le_bytes(low)) | (N as u64) << 32 | 1 << 61,
+            ));
         }
         if (pa as usize) < RAM_SIZE {
             let line = pa / CODE_LINE as u32;
