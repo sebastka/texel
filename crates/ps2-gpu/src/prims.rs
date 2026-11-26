@@ -354,8 +354,10 @@ fn triangle(e: &Env, v: &[Vertex], words: &mut [u32; PRIM_WORDS]) -> Option<[i32
     let mut sy = [0i64; 3];
     for (k, &(i, j)) in edges.iter().enumerate() {
         let (dx, dy) = ((p[j].0 - p[i].0) * sign, (p[j].1 - p[i].1) * sign);
-        // The top-left rule, folded into the value.
-        let bias = if (dy == 0 && dx < 0) || dy > 0 { 0 } else { -1 };
+        // The top-left rule, folded into the value: with the edges oriented
+        // so the inside is positive (y down), a left edge goes up (dy < 0)
+        // and a top edge right (dy = 0, dx > 0).
+        let bias = if (dy == 0 && dx > 0) || dy < 0 { 0 } else { -1 };
         unbiased[k] = edge(p[i], p[j], start) * sign;
         w[k] = unbiased[k] + bias;
         sx[k] = -dy * 16;

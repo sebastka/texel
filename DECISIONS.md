@@ -742,3 +742,12 @@ Jak II and Jak 3 drew a streak from each text line's first glyph to the screen's
 
 - **Interlocked**: the EE's COP2 instructions wait for a result they read, so in macro mode VDIV, VSQRT and VRSQRT give Q at once (to VU0's microprograms too). Microprograms keep the latencies and stalls of D86.
 - **Found with** the runner's `PROBE=x,y` (the triangles drawn over a pixel: the streak's, with its vertices' depth), then `VALUEWATCH` on its x for the EE instruction storing it.
+
+## D93. The top-left rule, the right way round
+
+Jak and Daxter's sea showed a black grid: the game renders its water texture as 4×4-pixel quads, and each lost its left column and top row. Both GSes (the software one and the GPU one's triangle setup) applied the GS's top-left rule backwards: with the edges oriented so the inside is positive (y down), a left edge goes up and a top edge goes right, and those are the ones whose pixels belong to the triangle; they had kept the bottom and right ones instead.
+
+- **Unseen** where meshes share edges (each pixel still went to one of the two triangles); seen where quads abut without sharing (render-to-texture grids, sprites made of triangles), and as a one-pixel shift of every triangle.
+- **Checked** by a test drawing two abutting quads of two triangles each, both windings: they tile exactly.
+- **Found with** `PROBE` (the sea's triangles sample a 128×128 texture), `TEXDUMP` of that texture (each quad's first column and row black), then the rule turned round: the texture tiles.
+- **Not a bug**: the black sky in Jak and Daxter's demo at 40 s is one frame between scenes; its frame buffers have the sky the frame after.

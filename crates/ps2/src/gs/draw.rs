@@ -251,6 +251,25 @@ impl Gs {
         if px0 >= px1 || py0 >= py1 {
             return;
         }
+        if let Some(((x, y), hits)) = &mut self.probe
+            && (px0..px1).contains(x)
+            && (py0..py1).contains(y)
+            && hits.len() < 4096
+        {
+            let r = |k: u8| self.regs[usize::from(k)];
+            let regs = [
+                r(reg::PRIM),
+                r(reg::TEX0_1),
+                r(reg::TEX0_2),
+                r(reg::FRAME_1),
+                r(reg::FRAME_1 + 1),
+                r(reg::ALPHA_1),
+                r(reg::TEST_1),
+            ];
+            let vertex = |p: &Vertex| [p.x, p.y, p.z, u32::from_le_bytes(p.rgba)];
+            // A sprite: its two corners, the second again.
+            hits.push(([vertex(a), vertex(b), vertex(b)], regs));
+        }
         let color = b.rgba.map(u32::from);
         // Texel coordinates along each axis, from a to b: linear in x and y.
         let (mut u0, mut du, mut v0, mut dv) = (0.0, 0.0, 0.0, 0.0);
@@ -310,7 +329,18 @@ impl Gs {
                 .iter()
                 .all(|&(i, j)| edge(p[i], p[j], at) * sign >= 0);
             if inside && hits.len() < 4096 {
-                hits.push(std::array::from_fn(|i| [v[i].x, v[i].y, v[i].z]));
+                let r = |k: u8| self.regs[usize::from(k)];
+                let regs = [
+                    r(reg::PRIM),
+                    r(reg::TEX0_1),
+                    r(reg::TEX0_2),
+                    r(reg::FRAME_1),
+                    r(reg::FRAME_1 + 1),
+                    r(reg::ALPHA_1),
+                    r(reg::TEST_1),
+                ];
+                let vertex = |p: &Vertex| [p.x, p.y, p.z, u32::from_le_bytes(p.rgba)];
+                hits.push((std::array::from_fn(|i| vertex(&v[i])), regs));
             }
         }
         let minx = p.iter().map(|q| q.0).min().unwrap_or(0);
@@ -338,8 +368,10 @@ impl Gs {
             step_x[k] = -dy * 16;
             step_y[k] = dx * 16;
             // The top-left rule: pixels exactly on an edge belong to it only
-            // if it is a top or a left edge.
-            bias[k] = if (dy == 0 && dx < 0) || dy > 0 { 0 } else { -1 };
+            // if it is a top or a left edge. With the edges oriented so the
+            // inside is positive (y down), a left edge goes up (dy < 0) and
+            // a top edge right (dy = 0, dx > 0).
+            bias[k] = if (dy == 0 && dx > 0) || dy < 0 { 0 } else { -1 };
         }
         // Attributes are planes: their value at the first pixel, and their
         // steps per pixel and per row, from the barycentric weights'.
@@ -715,6 +747,36 @@ mod tests {
         gs.write_reg(reg::XYZ2, xyz(20, 20));
         assert_eq!(gs.mem.read(0, 0, 1, 11, 18), 0x80FF_0000);
         assert_eq!(gs.mem.read(0, 0, 1, 18, 11), 0);
+    }
+
+    /// The top-left rule: abutting quads (two triangles each, both
+    /// windings) tile exactly: a pixel on an edge goes to the triangle it
+    /// is the left or top edge of.
+    #[test]
+    fn triangles_follow_the_top_left_rule() {
+        let mut gs = gs();
+        gs.write_reg(reg::PRIM, 3);
+        let quad = |gs: &mut Gs, x: u32, color: u64| {
+            gs.write_reg(reg::RGBAQ, color);
+            for (a, b) in [((x, 0), (x + 4, 0)), ((x + 4, 4), (x + 4, 0))] {
+                gs.write_reg(reg::XYZ2, xyz(a.0, a.1));
+                gs.write_reg(reg::XYZ2, xyz(b.0, b.1));
+                gs.write_reg(reg::XYZ2, xyz(x, 4));
+            }
+        };
+        // The right one first: the left one must not draw over its column.
+        quad(&mut gs, 4, 0x8000_00BB);
+        quad(&mut gs, 0, 0x8000_00AA);
+        for y in 0..4 {
+            for x in 0..8 {
+                let want = if x < 4 { 0x8000_00AA } else { 0x8000_00BB };
+                assert_eq!(gs.mem.read(0, 0, 1, x, y), want, "({x}, {y})");
+            }
+            assert_eq!(gs.mem.read(0, 0, 1, 8, y), 0, "(8, {y})");
+        }
+        for x in 0..9 {
+            assert_eq!(gs.mem.read(0, 0, 1, x, 4), 0, "({x}, 4)");
+        }
     }
 
     #[test]

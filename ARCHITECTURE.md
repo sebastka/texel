@@ -175,8 +175,11 @@ It prints what the BIOS kernel writes to its debug port (its start-up log) and w
 | `SYSCALLS=1` | Every EE system call of the run, by number and address: how many, the last `a0`, how long ago the last was |
 | `IOPCALLS=1` | Every call the IOP's modules make through their linked imports, by library, function number and caller: how many, the last `a0`, how long ago |
 | `IOPRAM=path` | The IOP's memory at the end, saved there |
-| `PROBE=x,y` | The triangles the software GS drew over that pixel (window coordinates), with their vertices |
+| `PROBE=x,y` | The triangles and sprites the software GS drew over that pixel (window coordinates): vertices (x, y, z, RGBA), PRIM, TEX0, FRAME, ALPHA, TEST |
 | `KICKJUMP=hex` | With `DRAWS`: shows (as bad packets) VU1 packets where a vertex is further than that (12.4 fixed point) from the one before it |
+| `ADDRWATCH=from,to` (hex) | The EE instructions (or DMA channels, `DA00000n`) storing into that range |
+| `VU1MEM=from,to` (hex, quadwords) | VU1's data memory there, at the end |
+| `TRACEMEM=from,to` (hex, quadwords) | With `PROG`: VU1's data memory there as each traced run starts |
 | `PACKETS=1`, `TAGS=1` | The SIF's commands and DMA tags |
 | `CODE=start,end`, `IOPFIND=imm` | EE memory (hex); IOP loads and stores with that offset |
 | `CDVDCMDS=1`, `CARDLOG=1`, `SIO2TRACE=1`, `USBLOG=1` | The drive's commands; the cards'; SIO2's registers; the USB controller's first accesses |

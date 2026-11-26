@@ -146,6 +146,9 @@ pub struct Vif {
     pub watch: Option<(u32, u32)>,
     #[serde(skip)]
     pub watched: Vec<String>,
+    /// Diagnostics: the EE address of the DMA's current quadword.
+    #[serde(skip)]
+    pub dma_source: u32,
 }
 
 impl Vif {
@@ -180,6 +183,7 @@ impl Vif {
             mask_path3: false,
             watch: None,
             watched: Vec::new(),
+            dma_source: 0,
         }
     }
 
@@ -372,8 +376,16 @@ impl Vif {
                     && self.addr + n * self.wl.max(self.cl).max(1) >= from
                 {
                     let line = format!(
-                        "UNPACK {w:08x} at {:#05x} n {n} cl {} wl {} mode {} mask {:08x} row {:x?} col {:x?} tops {:#x}",
-                        self.addr, self.cl, self.wl, self.mode, self.mask, self.row, self.col, self.tops
+                        "UNPACK {w:08x} at {:#05x} n {n} cl {} wl {} mode {} mask {:08x} row {:x?} col {:x?} tops {:#x} from {:08x}",
+                        self.addr,
+                        self.cl,
+                        self.wl,
+                        self.mode,
+                        self.mask,
+                        self.row,
+                        self.col,
+                        self.tops,
+                        self.dma_source
                     );
                     self.watched.push(line);
                 }

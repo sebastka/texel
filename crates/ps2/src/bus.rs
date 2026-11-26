@@ -110,6 +110,10 @@ impl Mch {
 /// (last address, count).
 pub type ValueWatch = (u32, BTreeMap<u32, (u32, u64)>);
 
+/// `Bus::addr_watch`: the range, and its stores by EE instruction: PC →
+/// (last address, count).
+pub type AddrWatch = (u32, u32, BTreeMap<u32, (u32, u64)>);
+
 /// `Bus::tag_watch`: the channel, the range, and the tags read: (TADR, tag).
 pub type TagWatch = (u32, u32, u32, Vec<(u32, u64)>);
 
@@ -206,6 +210,10 @@ pub struct Bus {
     /// are counted by EE instruction: PC → (last address, count).
     #[serde(skip)]
     pub value_watch: Option<ValueWatch>,
+    /// Diagnostics: an address range whose stores are counted by EE
+    /// instruction (0xDA00000n: DMA channel n), as `value_watch`.
+    #[serde(skip)]
+    pub addr_watch: Option<AddrWatch>,
     /// Diagnostics: a channel and an address range; the chain tags it reads
     /// there, or pointing there: (TADR, tag), the first 4096.
     #[serde(skip)]
@@ -271,6 +279,7 @@ impl Bus {
             ipu_watch: Vec::new(),
             store_pc: 0,
             value_watch: None,
+            addr_watch: None,
             tag_watch: None,
         }
     }
@@ -396,6 +405,12 @@ impl Bus {
         if let Some((value, hits)) = &mut self.value_watch
             && N >= 4
             && data.as_chunks::<4>().0.iter().any(|w| u32::from_le_bytes(*w) == *value)
+        {
+            let hit = hits.entry(self.store_pc).or_insert((0, 0));
+            *hit = (pa, hit.1 + 1);
+        }
+        if let Some((from, to, hits)) = &mut self.addr_watch
+            && (*from..*to).contains(&(pa & 0x1FFF_FFFF))
         {
             let hit = hits.entry(self.store_pc).or_insert((0, 0));
             *hit = (pa, hit.1 + 1);
@@ -1199,7 +1214,9 @@ impl Bus {
                 self.regs.insert(base + 0x80, sadr.wrapping_add(16) & 0x3FF0);
                 let v = self.read128(SCRATCHPAD + (sadr & 0x3FF0));
                 let to = if mfifo_fill { self.ring(madr) } else { madr };
+                let pc = std::mem::replace(&mut self.store_pc, 0xDA00_0008);
                 self.write128(Self::dma_address(to), v);
+                self.store_pc = pc;
                 None
             } else {
                 Some(self.read128(Self::dma_address(madr)))
@@ -1220,6 +1237,9 @@ impl Bus {
             if let Some(q) = q {
                 if ch == 2 {
                     self.gs.dma_source = madr;
+                }
+                if ch == 1 {
+                    self.vif1.dma_source = madr;
                 }
                 let words: [u32; 4] = std::array::from_fn(|k| (q >> (32 * k)) as u32);
                 self.dma_sink(ch, &words, q);

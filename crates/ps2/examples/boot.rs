@@ -112,6 +112,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if std::env::var("SYSCALLS").is_ok() {
         ps2.ee.syscalls = Some(Default::default());
     }
+    // ADDRWATCH=from,to (hex): the EE instructions (or DMA channels,
+    // 0xDA00000n) storing there.
+    if let Some((a, b)) = std::env::var("ADDRWATCH").ok().and_then(|v| {
+        let (a, b) = v.split_once(',')?;
+        Some((u32::from_str_radix(a, 16).ok()?, u32::from_str_radix(b, 16).ok()?))
+    }) {
+        ps2.bus.addr_watch = Some((a, b, BTreeMap::new()));
+    }
     // PROBE=x,y (window pixels): the triangles drawn over that pixel
     // (reported with DRAWS, the last ones).
     if let Some((x, y)) = std::env::var("PROBE").ok().and_then(|v| {
@@ -432,10 +440,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("  IOP call {lib}#{n} from {ra:08X}: {count} times, last a0 {a0:08X}, {ago:.2} s ago");
         }
     }
+    // VU1MEM=from,to (hex, quadwords): VU1's data memory there, at the end.
+    if let Some((a, b)) = std::env::var("VU1MEM").ok().and_then(|v| {
+        let (a, b) = v.split_once(',')?;
+        Some((u32::from_str_radix(a, 16).ok()?, u32::from_str_radix(b, 16).ok()?))
+    }) {
+        ps2.bus.sync_vu1(texel_ps2::vu1q::Why::VuMemory);
+        for q in a..b {
+            println!("  VU1 {q:03x}: {:08x?}", ps2.bus.vu1.read_q(q));
+        }
+    }
+    if let Some((a, b, hits)) = &ps2.bus.addr_watch {
+        println!("Stores to {a:08x}..{b:08x}, by EE instruction:");
+        for (pc, (at, n)) in hits {
+            println!("  {pc:08X}: {n} times, last at {at:08X}");
+        }
+    }
     if let Some((at, hits)) = &ps2.bus.gs.probe {
         println!("Triangles over {at:?}: {}", hits.len());
-        for v in hits.iter().rev().take(40).rev() {
-            println!("  {:x?}", v);
+        for (v, r) in hits.iter().rev().take(40).rev() {
+            println!(
+                "  {v:x?} PRIM {:x} TEX0 {:x} {:x} FRAME {:x} {:x} ALPHA {:x} TEST {:x}",
+                r[0], r[1], r[2], r[3], r[4], r[5], r[6]
+            );
         }
     }
     if let Some(log) = &ps2.ee.syscalls {
@@ -931,6 +958,12 @@ fn dump_draws(ps2: &mut Ps2, frames: u64) {
     ps2.bus.vu1.trace_from = std::env::var("PROG")
         .ok()
         .and_then(|v| u32::from_str_radix(&v, 16).ok());
+    // TRACEMEM=from,to (hex, quadwords): with PROG, VU1's data memory there
+    // as each traced run starts.
+    ps2.bus.vu1.trace_mem = std::env::var("TRACEMEM").ok().and_then(|v| {
+        let (a, b) = v.split_once(',')?;
+        Some((u32::from_str_radix(a, 16).ok()?, u32::from_str_radix(b, 16).ok()?))
+    });
     ps2.bus.gif.context_log = Some(Vec::new());
     ps2.bus.gif.find = std::env::var("FINDXY").ok().and_then(|v| {
         let (a, b) = v.split_once(',')?;
@@ -1066,6 +1099,9 @@ fn dump_draws(ps2: &mut Ps2, frames: u64) {
                     let lo = u32::from_le_bytes(k.micro[at..at + 4].try_into().unwrap_or_default());
                     let hi = u32::from_le_bytes(k.micro[at + 4..at + 8].try_into().unwrap_or_default());
                     println!("KCODE {pc:04x} {hi:08x} {lo:08x}");
+                }
+                for (q, v) in k.mem.iter().enumerate() {
+                    println!("MEM {q:03x}: {v:08x?}");
                 }
                 for (pc, vi) in &k.trace {
                     println!(

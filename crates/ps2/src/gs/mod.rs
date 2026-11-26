@@ -132,8 +132,10 @@ pub struct Gs {
     pub probe: Option<Probe>,
 }
 
-/// See `Gs::probe`: the pixel, and the triangles drawn over it.
-pub type Probe = ((i32, i32), Vec<[[u32; 3]; 3]>);
+/// See `Gs::probe`: the pixel, and the triangles drawn over it: their
+/// vertices (x, y, z, RGBA), then PRIM, TEX0_1, TEX0_2, FRAME_1, FRAME_2,
+/// ALPHA_1 and TEST_1.
+pub type Probe = ((i32, i32), Vec<([[u32; 4]; 3], [u64; 7])>);
 
 fn no_clut() -> [u32; 256] {
     [0; 256]
