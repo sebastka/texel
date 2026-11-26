@@ -191,6 +191,10 @@ pub struct Bus {
     /// (taken, address, low 32 bits | 1 << 61).
     #[serde(skip)]
     pub ipu_watch: Vec<u32>,
+    /// The EE instruction of the last word stored (by the interpreter), for
+    /// diagnostics.
+    #[serde(skip)]
+    pub store_pc: u32,
 }
 
 impl Bus {
@@ -250,6 +254,7 @@ impl Bus {
             ba6: 0,
             ipu_sources: None,
             ipu_watch: Vec::new(),
+            store_pc: 0,
         }
     }
 
@@ -625,6 +630,10 @@ impl Bus {
         match pa {
             0x1000_0000..0x1000_2000 => self.timers.write(pa - 0x1000_0000, value),
             IPU_CMD => {
+                if let Some((log, taken, _)) = &mut self.ipu_sources {
+                    let busy = u64::from(self.ipu.busy());
+                    log.push((*taken, value, u64::from(self.store_pc) | busy << 32 | 1 << 59));
+                }
                 self.ipu.write_cmd(value);
                 self.run_ipu();
             }
@@ -656,7 +665,26 @@ impl Bus {
                 if !is_known_register(pa) {
                     self.note_unknown(pa);
                 }
+                // A channel's CHCR, while it runs, takes STR alone: the other
+                // fields are written while it is stopped. Movie players stop
+                // the IPU's input with CHCR = 1, read CHCR back and later
+                // restart with it: the chain goes on (Midnight Club II).
+                let value = if dma_channel(pa).is_some() && self.reg(pa) & CHCR_STR != 0 {
+                    (self.reg(pa) & !CHCR_STR) | (value & CHCR_STR)
+                } else {
+                    value
+                };
                 let started = dma_channel(pa).filter(|_| value & CHCR_STR != 0 && self.reg(pa) & CHCR_STR == 0);
+                if pa == IPU_TO
+                    && started.is_none()
+                    && let Some((log, taken, _)) = &mut self.ipu_sources
+                {
+                    let qwc = self.regs.get(&(IPU_TO + QWC)).copied().unwrap_or(0) & 0xFFFF;
+                    log.push((*taken, value, u64::from(self.store_pc) | u64::from(qwc) << 32 | 1 << 58));
+                    let (ifc, fp) = self.ipu.counts();
+                    let bp = self.ipu.read_bp();
+                    log.push((*taken, bp, u64::from(ifc) << 8 | u64::from(fp) | 1 << 62));
+                }
                 self.regs.insert(pa, value);
                 if let Some(ch @ (SIF0 | SIF1)) = started {
                     self.iop.sif.log_tag(
@@ -695,7 +723,13 @@ impl Bus {
                                     log.push((*taken, madr, u64::from(value) | u64::from(*next) << 32 | 1 << 63));
                                     let (ifc, fp) = self.ipu.counts();
                                     let bp = self.ipu.read_bp();
-                                    log.push((*taken, bp, u64::from(ifc) << 8 | u64::from(fp) | 1 << 62));
+                                    let qwc = self.regs.get(&(IPU_TO + QWC)).copied().unwrap_or(0) & 0xFFFF;
+                                    log.push((
+                                        *taken,
+                                        bp,
+                                        u64::from(ifc) << 8 | u64::from(fp) | u64::from(qwc) << 16 | 1 << 62,
+                                    ));
+                                    log.push((*taken, self.store_pc, 1 << 60));
                                 }
                                 self.run_ipu()
                             }
@@ -1261,6 +1295,26 @@ mod tests {
         // NTSC's values: 525 half-lines.
         bus.write64(0x1200_0060, 0x00C7_8006_01A0_1801);
         assert!(!bus.pal());
+    }
+
+    /// Stopping a running channel by writing CHCR leaves its other fields:
+    /// the chain mode and the last tag, which a restart goes on from.
+    #[test]
+    fn stopping_a_channel_keeps_its_mode_and_tag() {
+        let mut bus = Bus::new(&[]);
+        bus.write32(D_CTRL, 1);
+        // The IPU's input: a REF of 64 quadwords; the IPU takes 10 at most.
+        bus.write64(0x2000, 0x3000 << 32 | 3 << 28 | 64);
+        bus.write32(IPU_TO + QWC, 0);
+        bus.write32(IPU_TO + TADR, 0x2000);
+        bus.write32(IPU_TO, 0x105);
+        let running = bus.read32(IPU_TO);
+        assert_eq!(running & 0x7000_010C, 0x3000_0104 | CHCR_STR);
+        bus.write32(IPU_TO, 1);
+        assert_eq!(bus.read32(IPU_TO), running & !CHCR_STR);
+        // Stopped, the whole value is taken.
+        bus.write32(IPU_TO, 1);
+        assert_eq!(bus.read32(IPU_TO), 1);
     }
 
     /// A source chain restarted with data left stops after it when CHCR's

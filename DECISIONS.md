@@ -648,3 +648,11 @@ A DMA channel in chain mode keeps its last tag's upper half in CHCR. Started aga
 - **A chain started with QWC left** ends after it when CHCR's tag says so; with QWC 0 it reads a tag first, as before.
 - **Checked**: a test restarting a source chain with each kind of tag; GTA III's intro movies play to the end (30 seconds of console time) without an IPU error, where there were 49.
 - Found with traces of the drive's commands, the IOP's transfers, the IPU's input stream and channel 4's tags (`CDVDREADS`, `IPUTRACE`, `IPUWATCH` in the boot example), and a comparison with the movie files' video.
+
+## D82. A running channel's CHCR takes STR alone
+
+While an EE DMA channel runs (STR set), a write to its CHCR changes STR alone: the mode, the direction and the last tag's half stay, as the console's manual has it (the other fields are written while the channel is stopped). Sony's movie library has the game stop the IPU's input with CHCR = 1, read CHCR back, use the IPU for a colour conversion, and restart with what it read: the chain goes on from its last tag. Texel took the whole value, so the restart was a normal transfer, ending with the block under way: Midnight Club II's movies lost the next tag's video (the start of their ring, after the wrap), the IPU decoded the wrong data, and the movie froze.
+
+- **A write to a running channel's CHCR** takes its STR bit alone (stopping it, or nothing); a stopped channel's takes the whole value, as before.
+- **Checked**: a test stopping a running chain; Midnight Club II's intro movies play to the end (25 seconds of console time, 30 pictures a second) without an IPU error, where they froze after four seconds; GTA III's as before.
+- Found by logging, with the IPU's trace, what started and stopped channel 4 and the IPU's commands, each with the EE instruction that wrote it, and reading the movie library's code there.

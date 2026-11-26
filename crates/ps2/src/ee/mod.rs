@@ -690,6 +690,7 @@ impl Ee {
     }
     fn store32(&mut self, bus: &mut Bus, va: u32, v: u32) -> Option<()> {
         let pa = self.data_addr(va, true)?;
+        bus.store_pc = self.current_pc;
         bus.write32(pa, v);
         Some(())
     }

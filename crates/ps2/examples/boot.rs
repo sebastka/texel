@@ -501,7 +501,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .map(|&(at, a, tag)| match tag {
                     0 => format!("{at} {a:08X}\n"),
                     t if t >> 61 == 1 => format!("{at} write {a:08X} {:08X} ({} bytes)\n", t as u32, (t >> 32) & 0xFF),
-                    t if t >> 62 == 1 => format!("{at} BP {a:08X} IFC {} FP {}\n", (t >> 8) & 0xFF, t & 0xFF),
+                    t if t >> 60 == 1 => format!("{at} PC {a:08X}\n"),
+                    t if t >> 59 == 1 => format!(
+                        "{at} IPU_CMD {a:08X} at {:08X}{}\n",
+                        t as u32,
+                        if (t >> 32) & 1 != 0 { " (IPU busy)" } else { "" }
+                    ),
+                    t if t >> 58 == 1 => format!(
+                        "{at} CHCR write {a:08X} at {:08X}, QWC {}\n",
+                        t as u32,
+                        (t >> 32) & 0xFFFF
+                    ),
+                    t if t >> 62 == 1 => format!(
+                        "{at} BP {a:08X} IFC {} FP {} QWC {}\n",
+                        (t >> 8) & 0xFF,
+                        t & 0xFF,
+                        (t >> 16) & 0xFFFF
+                    ),
                     t if t >> 63 != 0 => format!(
                         "{at} {a:08X} start CHCR {:08X} after {:08X}\n",
                         t as u32,
