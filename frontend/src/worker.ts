@@ -82,6 +82,9 @@ let audioRunning = false;
 let timer: ReturnType<typeof setTimeout> | undefined;
 let nextFrameAt = 0;
 let frames = 0;
+/** The second's emulation time, for the stats: total and slowest frame. */
+let frameMsTotal = 0;
+let frameMsMax = 0;
 let cardsCheckedAt = 0;
 let statsAt = 0;
 /** Netplay session (the room's game), if any. */
@@ -415,8 +418,12 @@ function tick() {
         width: emu.frameWidth,
         height: emu.frameHeight,
         pal: emu.isPal,
+        frameMs: frames > 0 ? frameMsTotal / frames : 0,
+        frameMsMax,
       });
       frames = 0;
+      frameMsTotal = 0;
+      frameMsMax = 0;
       statsAt = now;
       adaptScale();
     }
@@ -461,7 +468,10 @@ function runFrame() {
   if (!emu) return;
   const started = performance.now();
   emu.runFrame();
-  emuMs = emuMs * 0.9 + (performance.now() - started) * 0.1;
+  const took = performance.now() - started;
+  emuMs = emuMs * 0.9 + took * 0.1;
+  frameMsTotal += took;
+  frameMsMax = Math.max(frameMsMax, took);
   reportPads();
   frames++;
   const samples = emu.takeAudio();

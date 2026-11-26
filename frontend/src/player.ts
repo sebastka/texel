@@ -248,7 +248,11 @@ export class Player {
         this.pal = msg.pal;
         if (!this.paused) {
           const gpu = this.renderer ? ` · ${this.renderer}` : "";
-          this.cb.onStatus(`${msg.fps.toFixed(0)} fps · ${msg.width}×${msg.height}${this.autoNote}${this.pal ? " · PAL" : ""}${gpu}`);
+          // Emulation's time per frame against what a frame allows: past
+          // it, the game slows down.
+          const budget = 1000 / (this.pal ? 50 : 60);
+          const load = ` · ${msg.frameMs.toFixed(1)} ms/frame, slowest ${msg.frameMsMax.toFixed(1)} (of ${budget.toFixed(budget % 1 ? 1 : 0)})`;
+          this.cb.onStatus(`${msg.fps.toFixed(0)} fps · ${msg.width}×${msg.height}${this.autoNote}${this.pal ? " · PAL" : ""}${load}${gpu}`);
         }
         break;
       case "auto-scale":

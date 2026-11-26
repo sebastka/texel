@@ -113,7 +113,7 @@ pub struct Cpu {
     lo: u32,
     pub(crate) branch: bool,
     #[serde(serialize_with = "scratch")]
-    delay_slot: bool,
+    pub(crate) delay_slot: bool,
     // Coprocessor 0.
     pub(crate) sr: u32,
     cause: u32,

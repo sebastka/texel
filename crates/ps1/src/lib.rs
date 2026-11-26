@@ -241,14 +241,32 @@ impl System {
         }
         // A frame is ~570k cycles; bail out after two in case video is off.
         let mut budget = 2 * CPU_CLOCK / 50 * self.bus.overclock() / 100;
+        // Whether the next instruction may start a block: the compiler is
+        // asked where blocks start, not before every instruction it
+        // interprets (code not compiled yet runs block by block in the
+        // interpreter, without a lookup for each instruction).
+        let mut block_start = true;
         while !self.bus.gpu.frame_ready && budget > 0 {
             // A compiled block counts its cycles into `pending` itself.
-            let compiled = self.exe.is_none()
+            let compiled = block_start
+                && self.exe.is_none()
                 && self
                     .jit
                     .as_mut()
                     .is_some_and(|jit| jit.run(&mut self.cpu, &mut self.bus));
-            let cycles = if compiled { 0 } else { self.cpu.step(&mut self.bus) };
+            let cycles = if compiled {
+                0
+            } else {
+                let pc = self.cpu.pc;
+                let cycles = self.cpu.step(&mut self.bus);
+                // A block ends after a branch's delay slot; an exception or
+                // an interrupt goes elsewhere.
+                block_start = self.cpu.delay_slot || self.cpu.pc != pc.wrapping_add(4);
+                cycles
+            };
+            if compiled {
+                block_start = true;
+            }
             self.bus.pending += cycles;
             // Peripherals also catch up on every I/O access (see Bus::sync).
             if self.bus.pending >= self.bus.deadline {

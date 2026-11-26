@@ -169,7 +169,9 @@ export type FromWorker =
   | { type: "started"; pal: boolean; bios: string; renderer: string | null; precise: boolean }
   /** Codes the core refused, and why. */
   | { type: "codes-refused"; refused: [string, string][] }
-  | { type: "stats"; fps: number; width: number; height: number; pal: boolean }
+  /** `frameMs`, `frameMsMax`: the second's emulation time per frame, on
+   * average and at most (in the worker, drawing elsewhere excluded). */
+  | { type: "stats"; fps: number; width: number; height: number; pal: boolean; frameMs: number; frameMsMax: number }
   /** The resolution drawn changed: lowered while emulation lags (`chosen`:
    * the one chosen, which it returns to). */
   | { type: "auto-scale"; scale: number; chosen: number }
