@@ -34,8 +34,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if std::env::var("CDVDREADS").is_ok() {
         ps2.bus.iop.cdvd.read_log = Some(Vec::new());
     }
-    // What the IOP's modules print.
+    // What the IOP's modules print; IOPCALLS=1: their calls to the linked
+    // imports too.
     ps2.iop_printf = Some(Default::default());
+    if std::env::var("IOPCALLS").is_ok()
+        && let Some(p) = &mut ps2.iop_printf
+    {
+        p.calls = Some(Default::default());
+    }
     // NOGFX=1: draw nothing (faster, when frames do not matter).
     if std::env::var("NOGFX").is_ok() {
         ps2.bus.gs.rendering = texel_ps2::gs::Rendering::Off;
@@ -294,6 +300,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("  {:08X}: {:08X}", 0x8000_0000 | x, ps2.bus.read32(x));
         }
     }
+    // IOPRAM=path: the IOP's memory, saved there (to disassemble).
+    if let Ok(path) = std::env::var("IOPRAM") {
+        std::fs::write(&path, &ps2.bus.iop.ram)?;
+    }
     // IOPFIND=imm: IOP loads and stores with that offset.
     if let Some(imm) = std::env::var("IOPFIND")
         .ok()
@@ -401,6 +411,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "  IOP {pc:08X} x{n}: {:08X}",
                 texel_ps1::cpu::CpuBus::load32(&mut ps2.bus.iop, **pc)
             );
+        }
+    }
+    if let Some(p) = &ps2.iop_printf
+        && let Some(calls) = &p.calls
+    {
+        // The most recent last (a slice is 512 EE cycles).
+        let mut calls: Vec<_> = calls.iter().collect();
+        calls.sort_by_key(|(_, (_, _, at))| *at);
+        for ((lib, n, ra), (count, a0, at)) in &calls {
+            let ago = (p.now - at) as f64 * 512.0 / 294_912_000.0;
+            println!("  IOP call {lib}#{n} from {ra:08X}: {count} times, last a0 {a0:08X}, {ago:.2} s ago");
         }
     }
     if let Some(log) = &ps2.ee.syscalls {

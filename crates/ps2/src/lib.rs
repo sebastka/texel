@@ -350,6 +350,9 @@ impl Ps2 {
                     p.scan(&self.bus.iop.ram);
                 }
             }
+            if let Some(p) = &mut self.iop_printf {
+                p.now = self.slices;
+            }
             while self.iop_budget > 0 {
                 self.bus.iop.pc = self.iop.pc;
                 if let Some(p) = &mut self.iop_printf {

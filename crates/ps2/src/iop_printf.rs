@@ -3,6 +3,9 @@
 //! which loadcore links to `printf` itself. Linked stubs keep their function
 //! number, so `printf` is found by looking for stdio's import tables in IOP
 //! memory; calls to it are formatted from the IOP's registers and stack.
+//!
+//! Diagnostics, when on (`calls`): every linked import is counted the same
+//! way, by library, function number and caller.
 
 use texel_ps1::cpu::Cpu;
 
@@ -16,7 +19,17 @@ pub struct IopPrintf {
     targets: Vec<u32>,
     /// What was printed.
     pub out: Vec<u8>,
+    /// Calls to the linked imports, when on: by (library, function
+    /// number, caller's ra), how many, the last a0, and when (`now`).
+    pub calls: Option<CallLog>,
+    /// The time, in the caller's units, for `calls`.
+    pub now: u64,
+    /// Where each linked import goes: its library and function number.
+    imports: std::collections::HashMap<u32, (String, u32)>,
 }
+
+/// See `IopPrintf::calls`.
+pub type CallLog = std::collections::BTreeMap<(String, u32, u32), (u64, u32, u64)>;
 
 fn word(ram: &[u8], at: u32) -> u32 {
     let at = (at as usize) & (ram.len() - 1) & !3;
@@ -27,8 +40,25 @@ impl IopPrintf {
     /// Looks for stdio's linked import tables, to find `printf`.
     pub fn scan(&mut self, ram: &[u8]) {
         self.targets.clear();
+        self.imports.clear();
         for at in (0..ram.len() as u32 - 32).step_by(4) {
-            if word(ram, at) != IMPORT_MAGIC || &ram[at as usize + 12..at as usize + 20] != b"stdio\0\0\0" {
+            if word(ram, at) != IMPORT_MAGIC {
+                continue;
+            }
+            if self.calls.is_some() {
+                let name = &ram[at as usize + 12..at as usize + 20];
+                let name = String::from_utf8_lossy(name.split(|&b| b == 0).next().unwrap_or_default()).into_owned();
+                let mut stub = at + 20;
+                while word(ram, stub) != 0 && stub < at + 20 + 8 * 128 {
+                    let (jump, number) = (word(ram, stub), word(ram, stub + 4));
+                    if jump >> 26 == 0x02 && number >> 16 == 0x2400 {
+                        self.imports
+                            .insert((jump & 0x03FF_FFFF) << 2, (name.clone(), number & 0xFFFF));
+                    }
+                    stub += 8;
+                }
+            }
+            if &ram[at as usize + 12..at as usize + 20] != b"stdio\0\0\0" {
                 continue;
             }
             let mut stub = at + 20;
@@ -52,6 +82,12 @@ impl IopPrintf {
     pub fn check(&mut self, cpu: &Cpu, ram: &[u8]) {
         if self.targets.contains(&(cpu.pc & 0x1FFF_FFFF)) {
             self.format(cpu, ram);
+        }
+        if let Some(calls) = &mut self.calls
+            && let Some((lib, n)) = self.imports.get(&(cpu.pc & 0x1FFF_FFFF))
+        {
+            let entry = calls.entry((lib.clone(), *n, cpu.reg(31))).or_default();
+            *entry = (entry.0 + 1, cpu.reg(4), self.now);
         }
     }
 
