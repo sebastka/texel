@@ -13,9 +13,9 @@ dependencies = [
 
 [[package]]
 name = "allocator-api2"
-version = "0.2.21"
+version = "0.2.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
+checksum = "57b212daf2e827b1ccdd778b7eb48ba433e58cb0e4f27b43cd6b7a608425a014"
 
 [[package]]
 name = "android_system_properties"
@@ -4082,9 +4082,9 @@ checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
 
 [[package]]
 name = "zrip"
-version = "0.8.28"
+version = "0.8.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b757650f21e3100d9faba66460749874cc577e5615e38c9e8c458181189af82f"
+checksum = "d886ee8c071aed87a037634815bf1b77d66ec90e02122bc031166f4b218bb291"
 dependencies = [
  "zrip-core",
  "zrip-decode",
@@ -4093,15 +4093,15 @@ dependencies = [
 
 [[package]]
 name = "zrip-core"
-version = "0.14.3"
+version = "0.14.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "21d21db14998a6bd1657bb8d312812b5ae6a5f43ec349f64d131a1c6532adc2a"
+checksum = "5f6ea7ccd7799d815353fb360e6d2d21207001d58f0a7c02ec9e45d95fe60ae4"
 
 [[package]]
 name = "zrip-decode"
-version = "0.8.21"
+version = "0.8.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "553a16722a477c7a2c6c19bf44aac0ddbfe906d16f240a841962133a2e4380e8"
+checksum = "89ced3ea49c7e49b32b675294304987c3481f2f7b19f3c60ff6b1e4b73eb2ffd"
 dependencies = [
  "fearless_simd",
  "zrip-core",
@@ -4109,9 +4109,9 @@ dependencies = [
 
 [[package]]
 name = "zrip-encode"
-version = "0.10.5"
+version = "0.10.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "124ff777cd290cf896e685f44e469ff052c917ed35e3e9eb6b29fbae5f424e3d"
+checksum = "26cf89a0e00fb1e421a0e1b911cdf593178affc2cbcffae62b6dea25089e6fca"
 dependencies = [
  "fearless_simd",
  "zrip-core",
