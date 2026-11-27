@@ -751,3 +751,11 @@ Jak and Daxter's sea showed a black grid: the game renders its water texture as 
 - **Checked** by a test drawing two abutting quads of two triangles each, both windings: they tile exactly.
 - **Found with** `PROBE` (the sea's triangles sample a 128×128 texture), `TEXDUMP` of that texture (each quad's first column and row black), then the rule turned round: the texture tiles.
 - **Not a bug**: the black sky in Jak and Daxter's demo at 40 s is one frame between scenes; its frame buffers have the sky the frame after.
+
+## D94. Path 3 shows under way for the rest of its slice
+
+Spyro: A Hero's Tail stopped after its intro movies: its VIF1 interrupt handler starts a path 3 transfer (GIF DMA), then waits for GIF_STAT to show it under way (OPH, bit 9, then APATH, bits 10-11) before letting VIF1 go on. The GIF's DMA moves its data at once here, so GIF_STAT never showed it, and the handler spun forever.
+
+- **For the rest of the slice**: once path 3 has moved data, GIF_STAT shows OPH and APATH 3 until the slice ends (512 EE cycles at most); the channel still completes at once. A handler reading GIF_STAT right after its start sees the transfer; code waiting for everything to be idle (the same game polls VIF0, the GIF, VIF1, VU1 and APATH) waits a slice at most.
+- **Not for the transfer's time**: GIF_STAT busy for two EE cycles a quadword, with or without the channel's completion deferred as long, made the game stop earlier, after its first movie, every thread asleep; not understood yet, so the shorter window.
+- **Spyro: A Hero's Tail** now plays its intro and reaches its main menu (`READWATCH=10003020` shows its handlers seeing 0xE00).

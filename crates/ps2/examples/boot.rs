@@ -107,6 +107,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         ps2.bus.value_watch = Some((v, std::collections::BTreeMap::new()));
     }
+    // READWATCH=hex: the EE's 32-bit loads of that address (reported with
+    // EXC).
+    if let Some(a) = std::env::var("READWATCH")
+        .ok()
+        .and_then(|v| u32::from_str_radix(&v, 16).ok())
+    {
+        ps2.ee.read_watch = Some((a, BTreeMap::new()));
+    }
     // SYSCALLS=1: every EE syscall, by number and address (reported with
     // EXC).
     if std::env::var("SYSCALLS").is_ok() {
@@ -463,6 +471,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "  {v:x?} PRIM {:x} TEX0 {:x} {:x} FRAME {:x} {:x} ALPHA {:x} TEST {:x}",
                 r[0], r[1], r[2], r[3], r[4], r[5], r[6]
             );
+        }
+    }
+    if let Some((a, reads)) = &ps2.ee.read_watch {
+        println!("Loads of {a:08x}, by EE instruction:");
+        for (pc, (n, last, any)) in reads {
+            println!("  {pc:08X}: {n} times, last {last:08X}, bits seen {any:08X}");
         }
     }
     if let Some(log) = &ps2.ee.syscalls {

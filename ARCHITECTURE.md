@@ -178,6 +178,7 @@ It prints what the BIOS kernel writes to its debug port (its start-up log) and w
 | `PROBE=x,y` | The triangles and sprites the software GS drew over that pixel (window coordinates): vertices (x, y, z, RGBA), PRIM, TEX0, FRAME, ALPHA, TEST |
 | `KICKJUMP=hex` | With `DRAWS`: shows (as bad packets) VU1 packets where a vertex is further than that (12.4 fixed point) from the one before it |
 | `ADDRWATCH=from,to` (hex) | The EE instructions (or DMA channels, `DA00000n`) storing into that range |
+| `READWATCH=hex` | The EE's 32-bit loads of that address, by instruction: how many, the last value, the bits ever set |
 | `VU1MEM=from,to` (hex, quadwords) | VU1's data memory there, at the end |
 | `TRACEMEM=from,to` (hex, quadwords) | With `PROG`: VU1's data memory there as each traced run starts |
 | `PACKETS=1`, `TAGS=1` | The SIF's commands and DMA tags |

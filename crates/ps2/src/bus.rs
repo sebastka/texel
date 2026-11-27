@@ -210,6 +210,12 @@ pub struct Bus {
     /// are counted by EE instruction: PC → (last address, count).
     #[serde(skip)]
     pub value_watch: Option<ValueWatch>,
+    /// Path 3 moved data in this slice: GIF_STAT shows it under way (OPH,
+    /// APATH 3) until the slice ends. Its DMA moves at once here, but
+    /// takes time on a console, and games wait to see it under way. Not in
+    /// save states: it lasts a slice.
+    #[serde(skip)]
+    path3_seen: bool,
     /// Diagnostics: an address range whose stores are counted by EE
     /// instruction (0xDA00000n: DMA channel n), as `value_watch`.
     #[serde(skip)]
@@ -279,6 +285,7 @@ impl Bus {
             ipu_watch: Vec::new(),
             store_pc: 0,
             value_watch: None,
+            path3_seen: false,
             addr_watch: None,
             tag_watch: None,
         }
@@ -306,6 +313,7 @@ impl Bus {
         // vertical blanks raised below wait a few cycles (`Intc::fresh`).
         self.sync_irqs();
         let raised = self.intc.stat;
+        self.path3_seen = false;
         self.vu1q.now += cycles;
         self.bus_remainder += cycles;
         let bus_cycles = self.bus_remainder / 2;
@@ -627,6 +635,12 @@ impl Bus {
                     let qwc = self.reg(GIF_BASE + QWC) & 0xFFFF;
                     let fifo = if qwc == 0 { 16 } else { qwc.min(16) };
                     stat |= 1 << 5 | 1 << 6 | fifo << 24;
+                }
+                // Path 3's transfer, until the slice ends: OPH and APATH 3
+                // (Spyro: A Hero's Tail waits to see them after starting
+                // it, in its VIF1 interrupt).
+                if self.path3_seen {
+                    stat |= 1 << 9 | 3 << 10;
                 }
                 stat
             }
@@ -1237,6 +1251,7 @@ impl Bus {
             if let Some(q) = q {
                 if ch == 2 {
                     self.gs.dma_source = madr;
+                    self.path3_seen = true;
                 }
                 if ch == 1 {
                     self.vif1.dma_source = madr;
@@ -1562,6 +1577,23 @@ mod tests {
         bus.write128(0x1000_5000, 0x0600_0000);
         assert_eq!(bus.read32(GIF_BASE) & CHCR_STR, 0);
         assert_eq!(bus.read32(GIF_STAT) >> 24 & 0x1F, 0);
+    }
+
+    /// Path 3's DMA moves at once, but GIF_STAT shows it under way (OPH,
+    /// APATH 3) until the slice ends, for a game that waits to see it.
+    #[test]
+    fn path3_shows_under_way_until_the_slice_ends() {
+        let mut bus = Bus::new(&[]);
+        // A normal transfer of one quadword: an empty GIF tag (EOP).
+        bus.write128(0x1000, 1 << 15);
+        bus.write32(GIF_BASE + MADR, 0x1000);
+        bus.write32(GIF_BASE + QWC, 1);
+        assert_eq!(bus.read32(GIF_STAT) & 0xE00, 0);
+        bus.write32(GIF_BASE, CHCR_STR);
+        assert_eq!(bus.read32(GIF_BASE) & CHCR_STR, 0);
+        assert_eq!(bus.read32(GIF_STAT) & 0xE00, 0xE00);
+        bus.advance(1);
+        assert_eq!(bus.read32(GIF_STAT) & 0xE00, 0);
     }
 
     #[test]

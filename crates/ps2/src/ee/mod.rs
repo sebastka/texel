@@ -101,7 +101,14 @@ pub struct Ee {
     /// how many, the last a0, the cycle of the last.
     #[serde(skip)]
     pub syscalls: Option<SyscallLog>,
+    /// Diagnostics, when on: an address, and its 32-bit loads by EE
+    /// instruction: how many, the last value, the values' OR.
+    #[serde(skip)]
+    pub read_watch: Option<ReadWatch>,
 }
+
+/// See `Ee::read_watch`.
+pub type ReadWatch = (u32, BTreeMap<u32, (u64, u32, u32)>);
 
 /// See `Ee::syscalls`.
 pub type SyscallLog = BTreeMap<(u32, u32), (u64, u32, u64)>;
@@ -153,6 +160,7 @@ impl Ee {
             unimplemented: BTreeMap::new(),
             trace: std::collections::VecDeque::new(),
             syscalls: None,
+            read_watch: None,
         }
     }
 
@@ -682,6 +690,12 @@ impl Ee {
     fn load32(&mut self, bus: &mut Bus, va: u32) -> Option<u32> {
         let pa = self.data_addr(va, false)?;
         let v = bus.read32(pa);
+        if let Some((at, reads)) = &mut self.read_watch
+            && *at == pa
+        {
+            let r = reads.entry(self.current_pc).or_default();
+            *r = (r.0 + 1, v, r.2 | v);
+        }
         if pa == crate::bus::INTC_STAT {
             self.note_poll(v);
             if std::mem::take(&mut self.intc_watch) {
