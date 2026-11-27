@@ -19,7 +19,7 @@ serde-big-array = "0.5.1"
 # Validates the WebAssembly the EE's compiler makes.
 wasmparser = "=0.263.0"
 # The boot example's zipped images (Redump's), unpacked in memory.
-zip = { version = "9.8.1", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+zip = { version = "9.8.2", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
 [lints]
 workspace = true
