@@ -15,7 +15,7 @@ path = "src/main.rs"
 texel-ps1.workspace = true
 texel-ps2.workspace = true
 texel-disc.workspace = true
-anyhow = "1.0.104"
+anyhow = "1.0.105"
 argon2 = { version = "0.6.0", default-features = false, features = ["alloc", "password-hash"] }
 base64 = "0.23.1"
 axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "tokio", "query", "ws"] }
@@ -46,7 +46,7 @@ tracing-subscriber = { version = "0.3.23", default-features = false, features = 
 wtransport = { version = "0.7.2", default-features = false, features = ["ring"] }
 # DuckStation's hash of a disc's build, which picks its cheat files (codes.rs).
 xxhash-rust = { version = "0.8.21", default-features = false, features = ["xxh64"] }
-zip = { version = "9.8.1", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+zip = { version = "9.8.2", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
 # posix_fadvise (pagecache.rs).
 [target.'cfg(target_os = "linux")'.dependencies]
