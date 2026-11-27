@@ -778,7 +778,11 @@ impl Gpu {
         }
         let mut pixels = Vec::with_capacity((x1 - x0 + 1) * (y1 - y0 + 1));
         for y in y0..=y1 {
-            pixels.extend(self.vram[y * VRAM_WIDTH + x0..=y * VRAM_WIDTH + x1].iter().map(|&v| u32::from(v)));
+            pixels.extend(
+                self.vram[y * VRAM_WIDTH + x0..=y * VRAM_WIDTH + x1]
+                    .iter()
+                    .map(|&v| u32::from(v)),
+            );
         }
         self.commands.push(Command::Write {
             x: x0 as u32,
@@ -802,7 +806,10 @@ impl Gpu {
         let mut changed = None;
         for (y, (now, was)) in self.vram.chunks(VRAM_WIDTH).zip(kept.chunks(VRAM_WIDTH)).enumerate() {
             let differs = |(a, b): (&u16, &u16)| a != b;
-            if let (Some(x0), Some(x1)) = (now.iter().zip(was).position(differs), now.iter().zip(was).rposition(differs)) {
+            if let (Some(x0), Some(x1)) = (
+                now.iter().zip(was).position(differs),
+                now.iter().zip(was).rposition(differs),
+            ) {
                 changed = Some(union(changed, [x0 as i32, y as i32, x1 as i32, y as i32]));
             }
         }
