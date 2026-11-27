@@ -865,3 +865,12 @@ The VU's elementary function unit (ESADD to EEXP) put its result in P at once. I
 - **The VU compiler** leaves MFP to the interpreter now, as it did the EFU and WAITP.
 - **Found** looking into Kya's menu (not its cause).
 
+
+## D107. Rollback spares the scaled renderers the frames nobody sees
+
+With WebGPU, a PlayStation game in a rollback room could slow to a crawl while it ran fine alone. Each correction runs up to 8 frames again, and each was drawn scaled like a shown one: on the emulation thread with WebGPU (its commands set up and submitted there, the GPU drawing them at the resolution chosen, which WebGPU does not lower by itself), in the drawing worker without. Alone, nothing runs again. And the time those frames took was counted nowhere: the stats did not show it.
+
+- **Held scaled drawing** (`Gpu::set_held`, `holdScaled`): the frames run again, but the last two, record nothing for the scaled VRAM. The native VRAM is drawn as ever (games read it, and it is the machine's state), and the area drawn meanwhile goes to the scaled VRAM when the hold ends, each native pixel a block (a `Write`, so both renderers take it as they are). The last two frames are drawn scaled: the picture shown next was drawn in the frame before it. What a correction costs the renderers is then two frames at most, not eight; detail drawn only in the held frames (a picture kept from one frame to the next) is at native resolution until drawn again.
+- **Going back sends the native VRAM again** where it changed (`Gpu::restore_vram`): the renderers drew the frames dropped there, and kept what only those drew (a texture uploaded on a misprediction) in their scaled VRAM and in their copy of the native one, which textures are read from.
+- **The input delay** goes up to 4 frames rather than 2 (it is the players' one-way delay, so only distant players reach it): fewer corrections, for at most 2 frames more delay.
+- **The time spent running frames again** counts in the next frame's (the stats, and the resolution lowered while emulation lags, without WebGPU).
