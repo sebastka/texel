@@ -45,6 +45,8 @@ async function run(compiled) {
   for (let f = 1; f <= frames; f++) {
     if (f === Math.floor(frames / 2) + 1) half = performance.now();
     emu.runFrame();
+    // As the browser does, each frame (or the sound piles up).
+    emu.takeAudio();
     if (f % 60 === 0) hashes.push(emu.stateHash());
     // Compiled modules come in the background: let them in.
     if (compiled) await new Promise((resolve) => setImmediate(resolve));

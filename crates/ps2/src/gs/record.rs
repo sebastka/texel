@@ -48,6 +48,38 @@ pub struct DrawRegs {
     pub colclamp: u64,
 }
 
+/// A primitive's vertices (one to three), kept inline: a draw allocates
+/// nothing. Reads as a slice.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Vertices {
+    v: [Vertex; 3],
+    n: u8,
+}
+
+impl Vertices {
+    pub fn new(from: &[Vertex]) -> Self {
+        let mut v = [Vertex::default(); 3];
+        let n = from.len().min(3);
+        v[..n].copy_from_slice(&from[..n]);
+        Self { v, n: n as u8 }
+    }
+}
+
+impl std::ops::Deref for Vertices {
+    type Target = [Vertex];
+    fn deref(&self) -> &[Vertex] {
+        &self.v[..usize::from(self.n)]
+    }
+}
+
+impl<'a> IntoIterator for &'a Vertices {
+    type Item = &'a Vertex;
+    type IntoIter = std::slice::Iter<'a, Vertex>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Command {
     /// A primitive: its kind (0 point, 1 line, 2 line strip, 3 triangle,
@@ -55,7 +87,7 @@ pub enum Command {
     Draw {
         kind: u32,
         regs: DrawRegs,
-        vertices: Vec<Vertex>,
+        vertices: Vertices,
     },
     /// Pixels written by a host to local transfer, in raster order over a
     /// rectangle, from pixel `first` of it.

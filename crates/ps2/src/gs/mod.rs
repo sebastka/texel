@@ -10,7 +10,7 @@ mod privileged;
 mod record;
 
 pub use privileged::{CSR_VSINT, Privileged, REG_NAMES};
-pub use record::{Command, DrawRegs, Rendering};
+pub use record::{Command, DrawRegs, Rendering, Vertices};
 
 use mem::{Memory, bits, psm};
 use privileged::{CSR_FINISH, CSR_SIGNAL};
@@ -365,7 +365,7 @@ impl Gs {
             return;
         }
         if kick {
-            let verts: Vec<Vertex> = self.vertices[self.vertices.len() - needed..].to_vec();
+            let verts = Vertices::new(&self.vertices[self.vertices.len() - needed..]);
             if self.rendering.software() {
                 self.draw(kind, &verts);
             }

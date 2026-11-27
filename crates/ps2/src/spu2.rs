@@ -208,7 +208,7 @@ pub struct Spu2 {
     frac: u64,
     /// Output, interleaved stereo at 48 kHz.
     #[serde(skip)]
-    output: Vec<i16>,
+    output: std::collections::VecDeque<i16>,
     /// Where the cores write their outputs in sound memory (see
     /// `write_outputs`). Not in save states (their format is positional):
     /// it only shifts when the next lap comes.
@@ -235,7 +235,7 @@ impl Default for Spu2 {
             out_pos: 0,
             noise: 1,
             frac: 0,
-            output: Vec::new(),
+            output: std::collections::VecDeque::new(),
         }
     }
 }
@@ -644,7 +644,7 @@ impl Spu2 {
 
     /// The output since the last call, interleaved stereo at 48 kHz.
     pub fn drain_output(&mut self, out: &mut Vec<i16>) {
-        out.append(&mut self.output);
+        out.extend(self.output.drain(..));
     }
 
     fn sample(&mut self) {
@@ -655,11 +655,12 @@ impl Spu2 {
         }
         self.write_outputs();
         let (l, r) = self.cores[1].out;
+        // Not collected: the oldest goes (a ring, nothing moves).
         if self.output.len() + 2 > MAX_OUTPUT {
             self.output.drain(..2);
         }
-        self.output.push(l.clamp(-0x8000, 0x7FFF) as i16);
-        self.output.push(r.clamp(-0x8000, 0x7FFF) as i16);
+        self.output.push_back(l.clamp(-0x8000, 0x7FFF) as i16);
+        self.output.push_back(r.clamp(-0x8000, 0x7FFF) as i16);
     }
 
     /// Each core writes its outputs to sound memory, a halfword a sample in

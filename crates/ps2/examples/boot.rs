@@ -1291,6 +1291,15 @@ fn dump_draws(ps2: &mut Ps2, frames: u64) {
         let want = std::env::var("PROG")
             .ok()
             .and_then(|v| u32::from_str_radix(&v, 16).ok());
+        // KICKADDR=hex: (as a bad packet) only the first ones kicked from
+        // there (holding FINDXY's vertex, if given).
+        if let Some(a) = std::env::var("KICKADDR")
+            .ok()
+            .and_then(|v| u32::from_str_radix(&v, 16).ok())
+        {
+            let holds = find.is_none_or(|(fx, fy)| k.packet.iter().any(|q| q[0] & 0xFFFF == fx && q[1] & 0xFFFF == fy));
+            bad_here = usize::from(a == k.addr && holds);
+        }
         if bad_here > 0 && shown < 2 && want.is_none_or(|w| w == k.start) {
             shown += 1;
             println!(
