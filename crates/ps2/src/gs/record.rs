@@ -80,6 +80,9 @@ impl<'a> IntoIterator for &'a Vertices {
     }
 }
 
+// Draws are most commands, and keep their vertices inline (no allocation
+// each): the other variants are the smaller ones.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq)]
 pub enum Command {
     /// A primitive: its kind (0 point, 1 line, 2 line strip, 3 triangle,
