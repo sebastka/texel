@@ -124,6 +124,50 @@ const LOADED: [u32; 2] = [12, 13];
 /// round was done (see `idle_loop`).
 const START: u32 = 14;
 const ROUNDS: u32 = 15;
+/// The general-purpose registers 1 to 31, held in locals while the block
+/// runs: loaded on entry (those it uses), written back on leaving (those
+/// it writes), and around the instructions the interpreter runs (those
+/// they read, then write).
+const REGS: u32 = 16;
+/// The bus's deadline (flat: checked after each instruction, see
+/// `Emitter::commit`): loaded on entry, and after the interpreter ran.
+const DEADLINE: u32 = 47;
+
+fn reg_local(r: usize) -> u32 {
+    REGS + r as u32 - 1
+}
+
+/// The general-purpose registers an instruction may read or write (more,
+/// for some), as a mask.
+fn gprs(i: u32) -> u32 {
+    let (rs, rt, rd) = ((i >> 21) & 0x1f, (i >> 16) & 0x1f, (i >> 11) & 0x1f);
+    let m = match i >> 26 {
+        0x00 => 1 << rs | 1 << rt | 1 << rd,
+        0x01 => 1 << rs | u32::from((i >> 17) & 0xf == 0x8) << 31,
+        0x02 => 0,
+        0x03 => 1 << 31,
+        _ => 1 << rs | 1 << rt,
+    };
+    m & !1
+}
+
+/// The registers an instruction compiled to WebAssembly writes (more, for
+/// some), as a mask.
+fn native_writes(i: u32) -> u32 {
+    let (rt, rd) = ((i >> 16) & 0x1f, (i >> 11) & 0x1f);
+    let m = match i >> 26 {
+        0x00 => 1 << rd,
+        0x01 => u32::from((i >> 17) & 0xf == 0x8) << 31,
+        0x03 => 1 << 31,
+        0x09..=0x0f | 0x20..=0x25 => 1 << rt,
+        _ => 0,
+    };
+    m & !1
+}
+
+fn mask_regs(mask: u32) -> impl Iterator<Item = usize> {
+    (1..32).filter(move |r| mask >> r & 1 != 0)
+}
 
 /// Where the CPU stands after an instruction, for leaving the block there.
 #[derive(Clone, Copy)]
@@ -141,6 +185,10 @@ struct Emitter<'a> {
     l: &'a Layout,
     /// Blocks and ifs open inside the block the function's exit is.
     depth: u32,
+    /// The registers the block uses (in locals), and those it writes
+    /// (written back), as masks.
+    used: u32,
+    written: u32,
 }
 
 impl Emitter<'_> {
@@ -148,31 +196,69 @@ impl Emitter<'_> {
         if r == 0 {
             self.c.i32_const(0);
         } else {
-            self.c.local_get(CPU).mem(op::I32_LOAD, 2, self.l.regs + 4 * r as u32);
+            debug_assert!(self.used >> r & 1 != 0);
+            self.c.local_get(reg_local(r));
         }
     }
 
-    /// Stores the value in local `from` into register `r` (both copies).
+    /// Sets register `r` to the value in local `from`.
     fn set_reg_from(&mut self, r: usize, from: u32) {
         if r == 0 {
             return;
         }
-        for base in [self.l.regs, self.l.out_regs] {
-            self.c
-                .local_get(CPU)
-                .local_get(from)
-                .mem(op::I32_STORE, 2, base + 4 * r as u32);
-        }
+        debug_assert!(self.written >> r & 1 != 0);
+        self.c.local_get(from).local_set(reg_local(r));
     }
 
-    /// Computes a value (pushed by `value`) into register `r`, through RET.
+    /// Computes a value (pushed by `value`) into register `r`.
     fn set_reg(&mut self, r: usize, value: impl FnOnce(&mut Self)) {
         if r == 0 {
             return;
         }
+        debug_assert!(self.written >> r & 1 != 0);
         value(self);
-        self.c.local_set(RET);
-        self.set_reg_from(r, RET);
+        self.c.local_set(reg_local(r));
+    }
+
+    /// The registers in `mask`, from their locals into the CPU (both
+    /// copies).
+    fn store_regs(&mut self, mask: u32) {
+        for r in mask_regs(mask) {
+            for base in [self.l.regs, self.l.out_regs] {
+                self.c
+                    .local_get(CPU)
+                    .local_get(reg_local(r))
+                    .mem(op::I32_STORE, 2, base + 4 * r as u32);
+            }
+        }
+    }
+
+    /// The registers in `mask`, from the CPU into their locals.
+    fn load_regs(&mut self, mask: u32) {
+        for r in mask_regs(mask) {
+            self.c
+                .local_get(CPU)
+                .mem(op::I32_LOAD, 2, self.l.regs + 4 * r as u32)
+                .local_set(reg_local(r));
+        }
+    }
+
+    /// Leaves the block before an instruction (the CPU as `step` would
+    /// leave it) when the bus's deadline may come within the next `bound`
+    /// cycles (the most the instructions up to the next check may take):
+    /// the interpreter runs them, to the deadline exactly.
+    fn check_deadline(&mut self, bound: u32, after: After) {
+        self.c
+            .local_get(PEND)
+            .i32_const(bound as i32)
+            .op(op::I32_ADD)
+            .local_get(DEADLINE)
+            .op(op::I32_GE_U)
+            .if_();
+        self.depth += 1;
+        self.leave(after, None);
+        self.depth -= 1;
+        self.c.op(op::END);
     }
 
     fn store_cpu(&mut self, offset: u32, value: impl FnOnce(&mut Code)) {
@@ -225,7 +311,13 @@ impl Emitter<'_> {
 
     /// The fetch's extra cycles, into EXTRA (as `Cpu::fetch_cycles`, less
     /// the instruction's own cycle).
-    fn fetch(&mut self, pc: u32, icache: bool) {
+    /// `hit`: the line is known to be in the cache (the instruction before,
+    /// just run, filled it).
+    fn fetch(&mut self, pc: u32, icache: bool, hit: bool) {
+        if hit {
+            self.c.i32_const(0).local_set(EXTRA);
+            return;
+        }
         let p = pc & 0x1fff_ffff;
         let uncached = match p {
             0x0000_0000..=0x007f_ffff => RAM_ACCESS,
@@ -275,27 +367,49 @@ impl Emitter<'_> {
             .op(op::I64_ADD)
             .local_set(CYC);
         self.c.local_get(N).i32_const(1).op(op::I32_ADD).local_set(N);
-        self.c
-            .local_get(PEND)
-            .local_get(BUS)
-            .mem(op::I32_LOAD, 2, self.l.deadline)
-            .op(op::I32_GE_U);
-        if smc {
-            self.c.local_get(SMC).op(op::I32_OR);
+        // Flat: the deadline comes every few dozen instructions (the IOP's
+        // time slices), checked after each (as `step`'s caller does), not
+        // ahead (see `check_deadline`): blocks would often leave early.
+        if self.l.flat || smc {
+            if self.l.flat {
+                self.c.local_get(PEND).local_get(DEADLINE).op(op::I32_GE_U);
+            }
+            if smc {
+                self.c.local_get(SMC);
+            }
+            if self.l.flat && smc {
+                self.c.op(op::I32_OR);
+            }
+            self.c.if_();
+            self.depth += 1;
+            self.leave(after, load);
+            self.depth -= 1;
+            self.c.op(op::END);
         }
-        self.c.if_();
-        self.depth += 1;
-        self.leave(after, load);
-        self.depth -= 1;
-        self.c.op(op::END);
     }
 
     /// Runs the instruction through the interpreter (`in_delay`: in a delay
     /// slot, taken when TAKEN is set), with the load landing after it;
     /// leaves the block when it says to, or at the bus's deadline.
-    /// `stop`: it always says to.
-    fn interpret(&mut self, instr: u32, pc: u32, in_delay: bool, landing: Option<(usize, u32)>, exec: u32, stop: bool) {
+    /// `stop`: it always says to. `bound`: the most cycles the
+    /// instructions after it, to the next check, may take (see
+    /// `check_deadline`).
+    #[allow(clippy::too_many_arguments)]
+    fn interpret(
+        &mut self,
+        instr: u32,
+        pc: u32,
+        in_delay: bool,
+        landing: Option<(usize, u32)>,
+        exec: u32,
+        stop: bool,
+        bound: u32,
+    ) {
         let l = self.l;
+        // The registers it reads, as the block left them; then those it
+        // writes (the landing load's too), as it left them.
+        self.store_regs(gprs(instr) & self.written);
+        let changed = (gprs(instr) | landing.map_or(0, |(r, _)| 1 << r)) & self.used & !1;
         self.store_cpu(l.next_pc, |c| {
             if in_delay {
                 c.local_get(NEXT);
@@ -328,6 +442,11 @@ impl Emitter<'_> {
         }
         self.c.local_get(EXTRA).i32_const(1).op(op::I32_SHL).op(op::I32_OR);
         self.c.i32_const(exec as i32).call_indirect(EXEC_TYPE).local_set(RET);
+        self.load_regs(changed);
+        self.c
+            .local_get(BUS)
+            .mem(op::I32_LOAD, 2, l.deadline)
+            .local_set(DEADLINE);
         self.c.local_get(CPU).mem(op::I64_LOAD, 3, l.cycles).local_set(CYC);
         self.c.local_get(BUS).mem(op::I32_LOAD, 2, l.pending);
         self.c
@@ -345,8 +464,9 @@ impl Emitter<'_> {
         self.c.local_get(RET).i32_const(31).op(op::I32_SHR_U);
         self.c
             .local_get(PEND)
-            .local_get(BUS)
-            .mem(op::I32_LOAD, 2, l.deadline)
+            .i32_const(bound as i32)
+            .op(op::I32_ADD)
+            .local_get(DEADLINE)
             .op(op::I32_GE_U)
             .op(op::I32_OR)
             .br_if(self.depth);
@@ -430,6 +550,25 @@ fn branch_target(i: u32, at: u32) -> Option<u32> {
 /// Whether a branch is conditional (not a jump: J, JAL, JR, JALR).
 fn conditional(i: u32) -> bool {
     matches!(i >> 26, 0x01 | 0x04..=0x07)
+}
+
+/// The most extra cycles fetching the instruction at `pc` may take (see
+/// `Emitter::fetch`): a miss filling its cache line.
+fn fetch_max(pc: u32, icache: bool) -> u32 {
+    let uncached = match pc & 0x1fff_ffff {
+        0x0000_0000..=0x007f_ffff => RAM_ACCESS,
+        0x1fc0_0000..=0x1fc7_ffff => BIOS_ACCESS,
+        _ => IO_ACCESS,
+    };
+    if pc >> 29 == 5 || !icache {
+        return uncached.saturating_sub(1);
+    }
+    let fill = if uncached == RAM_ACCESS {
+        ICACHE_FILL
+    } else {
+        uncached * 4
+    };
+    fill.saturating_sub(1)
 }
 
 /// What an instruction is, for compiling.
@@ -526,26 +665,65 @@ pub fn compile(
         branch_target(words[len - 2], at) == Some(pc)
     };
     let idle = back && !layout.flat && idle_loop(&words[..len]);
+    let words = &words[..len];
+    let at = |k: usize| pc.wrapping_add(4 * k as u32);
+    let compiled = |k: usize| matches!(class(words[k]), Class::Native | Class::Branch);
+    // Fetches known to hit the instruction cache: in the line of the
+    // instruction just before, compiled (not the interpreter's, which may
+    // do anything to the cache).
+    let hit = |k: usize| icache && pc >> 29 != 5 && k > 0 && at(k) >> 4 == at(k - 1) >> 4 && compiled(k - 1);
+    // The most cycles each instruction may count, and from each, to the
+    // next check of the deadline (the interpreter's next instruction; the
+    // last one leaves anyway).
+    let cost = |k: usize| {
+        if layout.flat {
+            return 1;
+        }
+        let load = matches!(words[k] >> 26, 0x20..=0x25);
+        1 + if hit(k) { 0 } else { fetch_max(at(k), icache) } + if load { RAM_ACCESS } else { 0 }
+    };
+    // (Flat: checked after each instead, see `Emitter::commit`.)
+    let mut bound = vec![0u32; len + 1];
+    for k in (0..len).rev() {
+        if compiled(k) && !layout.flat {
+            bound[k] = bound[k + 1] + if k + 1 == len { 0 } else { cost(k) };
+        }
+    }
+    let used = words.iter().fold(0, |m, &i| m | gprs(i));
+    let written = words
+        .iter()
+        .filter(|&&i| matches!(class(i), Class::Native | Class::Branch))
+        .fold(0, |m, &i| m | native_writes(i));
     let mut e = Emitter {
         c: Code::default(),
         l: layout,
         // Inside the function's block and the loop.
         depth: 1,
+        used,
+        written,
     };
     let mut native = 0;
-    // The function: a block its exits branch out of, then the pending
-    // cycles and the CPU's cycles written back, and the count returned.
+    // The function: a block its exits branch out of, then the registers,
+    // the pending cycles and the CPU's cycles written back, and the count
+    // returned.
     e.c.local_get(BUS).mem(op::I32_LOAD, 2, layout.pending).local_set(PEND);
     e.c.local_get(CPU).mem(op::I64_LOAD, 3, layout.cycles).local_set(CYC);
     e.c.local_get(PEND).local_set(START);
+    e.c.local_get(BUS)
+        .mem(op::I32_LOAD, 2, layout.deadline)
+        .local_set(DEADLINE);
+    e.load_regs(used);
     e.c.block();
     e.c.loop_();
+    // Each round: none run when the deadline may come before the end (or
+    // the interpreter's first instruction); the caller interprets them.
+    e.check_deadline(bound[0], After::Plain { pc });
     // The load landing after the current instruction: register, local.
     let mut landing: Option<(usize, u32)> = None;
     let mut in_delay = false;
     for k in 0..len {
         let i = words[k];
-        let at = pc.wrapping_add(4 * k as u32);
+        let at = at(k);
         let next = at.wrapping_add(4);
         let after = if in_delay {
             After::Delay
@@ -563,10 +741,10 @@ pub fn compile(
         let imm = i & 0xffff;
         let imm_se = imm as i16 as i32;
         let class = class(i);
-        e.fetch(at, icache);
+        e.fetch(at, icache, hit(k));
         match class {
             Class::Pure | Class::Stop => {
-                e.interpret(i, at, in_delay, landing, exec, class == Class::Stop);
+                e.interpret(i, at, in_delay, landing, exec, class == Class::Stop, bound[k + 1]);
                 landing = None;
             }
             Class::Native => {
@@ -672,7 +850,7 @@ pub fn compile(
                         e.c.local_set(KIND);
                         e.c.local_get(KIND).op(op::I32_EQZ).if_();
                         e.depth += 1;
-                        e.interpret(i, at, in_delay, landing, exec, true);
+                        e.interpret(i, at, in_delay, landing, exec, true, 0);
                         e.depth -= 1;
                         e.c.op(op::END);
                         // The offset in RAM or the scratchpad, and its base.
@@ -898,6 +1076,7 @@ pub fn compile(
     // The loop's end, then the block's.
     e.c.op(op::END);
     e.c.op(op::END);
+    e.store_regs(written);
     e.c.local_get(BUS).local_get(PEND).mem(op::I32_STORE, 2, layout.pending);
     e.c.local_get(CPU).local_get(CYC).mem(op::I64_STORE, 3, layout.cycles);
     e.c.local_get(N).op(op::END);
@@ -922,7 +1101,7 @@ pub fn batch(blocks: &[&Code]) -> Vec<u8> {
             results: &[I32],
         },
     ];
-    let locals: &[(u32, u8)] = &[(2, I32), (1, I64), (11, I32)];
+    let locals: &[(u32, u8)] = &[(2, I32), (1, I64), (11, I32), (31, I32), (1, I32)];
     let funcs: Vec<_> = blocks.iter().map(|&c| (locals, c)).collect();
     wasm::module_of(&types, &funcs)
 }

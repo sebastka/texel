@@ -19,12 +19,16 @@ use texel_ps2::ee::Ee;
 use texel_ps2::ee::jit::{Backend, helpers};
 use texel_ps2::gif::Gif;
 use texel_ps2::gs::Gs;
+use texel_ps2::iop::IopBus;
+use texel_ps2::ps1::cpu::Cpu;
 use texel_ps2::vu::Vu;
 use texel_ps2::vu_jit::{VuBackend, helpers as vu_helpers};
 use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
 
 type Block = extern "C" fn(*mut Ee, *mut Bus, u32) -> u32;
+type IopBlock = extern "C" fn(*mut Cpu, *mut IopBus) -> u32;
+type IopExec = extern "C" fn(*mut Cpu, *mut IopBus, u32, u32, u32) -> u32;
 type Exec = extern "C" fn(*mut Ee, *mut Bus, u32, u32, u32) -> u32;
 type Program = extern "C" fn(*mut Vu, *mut u8, *mut Gif, *mut Gs) -> u32;
 type Lower = extern "C" fn(*mut Vu, *mut Gif, *mut Gs, u32, u32);
@@ -173,4 +177,41 @@ extern "C" fn lower(vu: *mut Vu, gif: *mut Gif, gs: *mut Gs, instr: u32, pc: u32
     // GIF and GS, borrowed for the call; they pass them back here unchanged.
     let (vu, gif, gs) = unsafe { (&mut *vu, &mut *gif, &mut *gs) };
     vu_helpers::lower(vu, gif, gs, instr, pc);
+}
+
+/// The IOP's compiled blocks (the PlayStation's compiler, see
+/// `Ps2::iop_jit`): modules made and put in the table as the EE's are.
+impl texel_ps2::ps1::jit::Backend<IopBus> for WebBackend {
+    fn submit(&mut self, module: &[u8], count: usize) -> u32 {
+        Backend::submit(self, module, count)
+    }
+
+    fn ready(&mut self) -> Vec<(u32, Option<Vec<u32>>)> {
+        Backend::ready(self)
+    }
+
+    fn call(&mut self, func: u32, cpu: &mut Cpu, bus: &mut IopBus) -> u32 {
+        // SAFETY: `func` is the table index `ready` gave a block's
+        // function, whose type is `IopBlock`; in WebAssembly a function
+        // pointer is its table index.
+        let block = unsafe { std::mem::transmute::<usize, IopBlock>(func as usize) };
+        block(cpu, bus)
+    }
+
+    fn release(&mut self, func: u32) {
+        Backend::release(self, func);
+    }
+
+    fn exec_index(&self) -> u32 {
+        iop_exec as IopExec as usize as u32
+    }
+}
+
+/// What compiled IOP blocks call for the instructions they leave to the
+/// interpreter (see `Ps2::iop_exec`).
+extern "C" fn iop_exec(cpu: *mut Cpu, bus: *mut IopBus, instr: u32, pc: u32, flags: u32) -> u32 {
+    // SAFETY: blocks are only run by `call`, which gives them the live CPU
+    // and bus, borrowed for the call; they pass them back here unchanged.
+    let (cpu, bus) = unsafe { (&mut *cpu, &mut *bus) };
+    texel_ps2::Ps2::iop_exec(cpu, bus, instr, pc, flags)
 }

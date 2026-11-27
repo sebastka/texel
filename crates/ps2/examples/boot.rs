@@ -1399,7 +1399,7 @@ fn dump_draws(ps2: &mut Ps2, frames: u64) {
             let w = xs.clone().max().unwrap_or(0) - xs.min().unwrap_or(0);
             let h = ys.clone().max().unwrap_or(0) - ys.min().unwrap_or(0);
             if *kind != 6 && w.max(h) > 400 {
-                big.push((w.max(h), *kind, regs.prim, vertices.clone(), regs.xyoffset));
+                big.push((w.max(h), *kind, regs.prim, *vertices, regs.xyoffset));
             }
         }
     }

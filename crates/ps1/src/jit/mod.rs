@@ -338,6 +338,11 @@ impl<B: JitBus> Jit<B> {
         let func = *func;
         cpu.set_cause(cause);
         let n = self.backend.call(func, cpu, bus);
+        // None run: the deadline may come within it (see `compile`), the
+        // interpreter runs them.
+        if n == 0 {
+            return Some(false);
+        }
         self.stats.runs += 1;
         self.stats.in_blocks += u64::from(n);
         Some(true)

@@ -75,10 +75,14 @@ impl Ps2Emulator {
     pub fn set_compiler(&mut self, on: bool) -> Result<(), JsError> {
         self.compiler = on;
         self.ps2.ee.jit = None;
+        self.ps2.iop_jit = None;
         #[cfg(target_arch = "wasm32")]
         if on {
             let backend = jit::WebBackend::new().map_err(|e| JsError::new(&format!("{e:?}")))?;
             self.ps2.ee.jit = Some(Box::new(texel_ps2::ee::jit::Jit::new(Box::new(backend))));
+            // The IOP's code too (the PlayStation's compiler).
+            let backend = jit::WebBackend::new().map_err(|e| JsError::new(&format!("{e:?}")))?;
+            self.ps2.iop_jit = Some(Box::new(texel_ps2::ps1::jit::Jit::new(Box::new(backend))));
         }
         Ok(())
     }
@@ -128,9 +132,10 @@ impl Ps2Emulator {
     /// What the compiler did, for diagnostics.
     #[wasm_bindgen(js_name = compilerStats)]
     pub fn compiler_stats(&self) -> String {
-        match &self.ps2.ee.jit {
-            Some(j) => format!("{:?}", j.stats),
-            None => "off".into(),
+        match (&self.ps2.ee.jit, &self.ps2.iop_jit) {
+            (Some(j), Some(i)) => format!("{:?}; IOP {:?}", j.stats, i.stats),
+            (Some(j), None) => format!("{:?}", j.stats),
+            _ => "off".into(),
         }
     }
 
@@ -293,6 +298,9 @@ impl Ps2Emulator {
         self.ps2.run(self.ps2.bus.frame_cycles());
         // The blocks compiled in the frame go to the browser.
         if let Some(jit) = &mut self.ps2.ee.jit {
+            jit.end_frame();
+        }
+        if let Some(jit) = &mut self.ps2.iop_jit {
             jit.end_frame();
         }
         #[cfg(target_arch = "wasm32")]

@@ -341,9 +341,68 @@ pub struct IopBus {
     /// Accesses to addresses not emulated: address → count.
     #[serde(skip)]
     pub unknown: BTreeMap<u32, u64>,
+    /// For compiled code (`texel_ps1::jit`): the instructions run in this
+    /// slice, and how many it may run (see `Ps2::run`).
+    #[serde(skip)]
+    pub pending: u32,
+    #[serde(skip)]
+    pub deadline: u32,
+    /// RAM's pages' write counts, which compiled stores keep (the IOP's
+    /// blocks are checked against RAM before each run instead).
+    #[serde(skip, default = "ram_pages")]
+    ram_writes: Box<[u32]>,
+}
+
+fn ram_pages() -> Box<[u32]> {
+    vec![0; IOP_RAM_SIZE >> texel_ps1::bus::RAM_PAGE_BITS].into_boxed_slice()
+}
+
+impl texel_ps1::jit::JitBus for IopBus {
+    const FLAT: bool = true;
+    fn places(&self) -> texel_ps1::jit::BusPlaces {
+        texel_ps1::jit::BusPlaces {
+            pending: &self.pending as *const u32 as usize,
+            deadline: &self.deadline as *const u32 as usize,
+            scratchpad: self.scratchpad.as_ptr() as usize,
+            ram: self.ram.as_ptr() as usize,
+            ram_mask: IOP_RAM_SIZE as u32 - 1,
+            ram_writes: self.ram_writes.as_ptr() as usize,
+        }
+    }
+    fn pending(&self) -> u32 {
+        self.pending
+    }
+    fn deadline(&self) -> u32 {
+        self.deadline
+    }
+    fn ram(&self) -> &[u8] {
+        &self.ram
+    }
+    fn ram_writes(&self) -> &[u32] {
+        &self.ram_writes
+    }
 }
 
 impl IopBus {
+    /// Counts a write of `len` bytes at `at` in RAM (see `ram_writes`):
+    /// compiled blocks compare their code with RAM again only when the
+    /// counts of their pages changed. Every writer of RAM calls it (the
+    /// IOP, its DMA, the EE through its window); compiled stores count
+    /// their own.
+    pub fn wrote_ram(&mut self, at: usize, len: usize) {
+        use texel_ps1::bus::RAM_PAGE_BITS;
+        if len == 0 {
+            return;
+        }
+        let pages = self.ram_writes.len();
+        let first = (at & (IOP_RAM_SIZE - 1)) >> RAM_PAGE_BITS;
+        let n = (((at & ((1 << RAM_PAGE_BITS) - 1)) + len - 1) >> RAM_PAGE_BITS) + 1;
+        for k in 0..n.min(pages) {
+            let c = &mut self.ram_writes[(first + k) % pages];
+            *c = c.wrapping_add(1);
+        }
+    }
+
     /// See `Bus::transplant`.
     pub(crate) fn transplant(&mut self, old: &mut IopBus) {
         self.bios = std::mem::take(&mut old.bios);
@@ -373,6 +432,9 @@ impl IopBus {
             pc: 0,
             out: Vec::new(),
             unknown: BTreeMap::new(),
+            pending: 0,
+            deadline: 0,
+            ram_writes: ram_pages(),
         }
     }
 
@@ -510,6 +572,9 @@ impl IopBus {
         if let Some((mem, at)) = self.memory(pa) {
             if let Some(dst) = mem.get_mut(at..at + N) {
                 dst.copy_from_slice(&data);
+            }
+            if pa < 0x0080_0000 {
+                self.wrote_ram(at, N);
             }
             return;
         }
@@ -675,6 +740,7 @@ impl IopBus {
                 for (k, v) in block.into_iter().enumerate() {
                     self.ram[at(k as u32)] = v;
                 }
+                self.wrote_ram(at(0), size as usize);
             }
         }
         self.dma.ch[ch][0] = madr.wrapping_add(blocks * size);
@@ -701,6 +767,7 @@ impl IopBus {
             for (k, b) in data.into_iter().enumerate() {
                 self.ram[at(k)] = b;
             }
+            self.wrote_ram(madr, len);
         } else {
             let data: Vec<u8> = (0..len).map(|k| self.ram[at(k)]).collect();
             if self.spu2.auto_dma(core) {
@@ -734,6 +801,7 @@ impl IopBus {
             for (k, &b) in block[..n].iter().enumerate() {
                 self.ram[(madr as usize + k) & (IOP_RAM_SIZE - 1)] = b;
             }
+            self.wrote_ram(madr as usize, n);
             self.dma.ch[3][0] = madr.wrapping_add(n as u32);
             self.dma.cdvd_bytes -= n as u64;
             if self.dma.cdvd_log.len() == 64 {
@@ -759,6 +827,7 @@ impl IopBus {
     fn set_ram_word(&mut self, addr: u32, v: u32) {
         let at = (addr as usize) & (IOP_RAM_SIZE - 1) & !3;
         self.ram[at..at + 4].copy_from_slice(&v.to_le_bytes());
+        self.wrote_ram(at, 4);
     }
 
     /// SIF0 (channel 9): IOP memory into the FIFO, by chain of tags in IOP

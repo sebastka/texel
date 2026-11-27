@@ -15,6 +15,10 @@ pub mod gs;
 pub mod intc;
 pub mod iop;
 pub mod iop_printf;
+
+/// The PlayStation's core, whose CPU is the IOP (and whose compiler compiles
+/// it, see `Ps2::iop_jit`).
+pub use texel_ps1 as ps1;
 pub mod ipu;
 pub mod memcard;
 pub mod sif;
@@ -61,6 +65,11 @@ pub struct Ps2 {
     /// What the IOP's modules print, when set (diagnostics).
     #[serde(skip)]
     pub iop_printf: Option<iop_printf::IopPrintf>,
+    /// Compiles the IOP's code to WebAssembly (in browsers), when set: the
+    /// PlayStation's compiler, counting an instruction a cycle (see
+    /// `iop_exec`). Not with `iop_printf` (which looks at each instruction).
+    #[serde(skip)]
+    pub iop_jit: Option<Box<texel_ps1::jit::Jit<iop::IopBus>>>,
     slices: u64,
 }
 
@@ -131,6 +140,7 @@ impl Ps2 {
             boot_slot: None,
             boot_failed: false,
             iop_printf: None,
+            iop_jit: None,
             slices: 0,
         }
     }
@@ -305,6 +315,16 @@ impl Ps2 {
         }
     }
 
+    /// Runs one instruction of a compiled IOP block through the interpreter
+    /// (see `texel_ps1::jit::helpers::exec`), counting it a cycle, as the
+    /// stepping loop does (`run`); bit 31 set when the block must stop.
+    pub fn iop_exec(cpu: &mut texel_ps1::cpu::Cpu, bus: &mut iop::IopBus, instr: u32, pc: u32, flags: u32) -> u32 {
+        bus.pc = pc;
+        let (_, plain) = cpu.step_compiled(bus, instr, pc, flags & 1 != 0, flags >> 1);
+        let stop = !plain || !texel_ps1::jit::helpers::pure(instr);
+        1 | (u32::from(stop) << 31)
+    }
+
     /// Whether the IOP spins in an idle loop: a jump to itself, with a NOP
     /// in its delay slot (the IOP kernel's idle thread), which only an
     /// interrupt leaves.
@@ -359,6 +379,23 @@ impl Ps2 {
                 p.now = self.slices;
             }
             while self.iop_budget > 0 {
+                // Compiled blocks, after the slice's first step (which may
+                // take an interrupt and find the idle loop): the rest of the
+                // budget, at most, as the steps below would run it (one
+                // after the other: nothing else runs between steps).
+                if !first
+                    && self.iop_printf.is_none()
+                    && let Some(jit) = &mut self.iop_jit
+                {
+                    self.bus.iop.pending = 0;
+                    self.bus.iop.deadline = self.iop_budget.min(i64::from(u32::MAX)) as u32;
+                    if jit.run_chained(&mut self.iop, &mut self.bus.iop, |_| true) {
+                        let n = self.bus.iop.pending;
+                        self.iop_ran += u64::from(n);
+                        self.iop_budget -= i64::from(n);
+                        continue;
+                    }
+                }
                 self.bus.iop.pc = self.iop.pc;
                 if let Some(p) = &mut self.iop_printf {
                     p.check(&self.iop, &self.bus.iop.ram);

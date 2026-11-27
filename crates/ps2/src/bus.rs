@@ -462,6 +462,10 @@ impl Bus {
             if let Some(dst) = mem.get_mut(at..at + N) {
                 dst.copy_from_slice(&data);
             }
+            // The IOP's RAM: its compiled blocks check theirs again.
+            if (0x1C00_0000..0x1C20_0000).contains(&pa) {
+                self.iop.wrote_ram(at, N);
+            }
             return;
         }
         let mut bytes = [0u8; 16];

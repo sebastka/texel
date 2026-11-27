@@ -874,3 +874,15 @@ With WebGPU, a PlayStation game in a rollback room could slow to a crawl while i
 - **Going back sends the native VRAM again** where it changed (`Gpu::restore_vram`): the renderers drew the frames dropped there, and kept what only those drew (a texture uploaded on a misprediction) in their scaled VRAM and in their copy of the native one, which textures are read from.
 - **The input delay** goes up to 4 frames rather than 2 (it is the players' one-way delay, so only distant players reach it): fewer corrections, for at most 2 frames more delay.
 - **The time spent running frames again** counts in the next frame's (the stats, and the resolution lowered while emulation lags, without WebGPU).
+
+## D108. The IOP's code compiled, by the PlayStation's compiler
+
+The IOP is the PlayStation's CPU (D24), so its code can go through the PlayStation's compiler (D63). The compiler is generic over its bus (`JitBus`); the IOP's (`IopBus`) is flat: a cycle an instruction (D103), and no loops fast-forwarded. Compiled and interpreted, the PS2 stays the same in Jak and Daxter's title fly-over (`check-ps2-compiler.mjs`), but it is not faster: about 12 frames per second either way (30 s, three rounds each).
+
+- **RAM's writes counted.** A block's code is compared with RAM only after a write to its pages (as on the PlayStation): every writer of the IOP's RAM counts its writes (its stores, the CDVD's, SPU2's and SIO2's DMA, the SIF, the EE through its window at 0x1C000000), compiled stores their own.
+- **Blocks one after the other**, to the end of the IOP's time slice (`run_chained`): nothing runs between its instructions.
+- **Registers in locals.** A block loads the registers it uses on entry and writes back those it writes when it leaves; around an instruction the interpreter runs, those it reads, then those it writes.
+- **The deadline, PlayStation:** checked when a block starts (each round of a loop) and after each instruction the interpreter runs, for the most cycles the instructions up to the next check may take (a miss of the instruction cache for each fetch, RAM's access time for each load). When the deadline may come among them, the block leaves there, and the interpreter runs them to the deadline exactly; a block that leaves before its first instruction counts as not run. **IOP:** after each instruction, against the deadline in a local: its slices are 64 instructions, and leaving ahead of the deadline sent 15% of them to the interpreter.
+- **The instruction cache:** a fetch in the line of the instruction just before (compiled) hits, without its tag checked.
+- **Why no gain:** the interpreter took about 6% of the time; compiled blocks take about 4%, and their dispatch (the map, the call into another module) about 1%. Its blocks average 6.7 instructions, so what each call costs outweighs what it runs. V8's baseline compiler is not the cause: without it (`--no-liftoff`), the same.
+- **The PlayStation** stays the same compiled and interpreted in the BIOS's shell (60 s, through its menus: no game disc at hand), up to 2.5% faster than before (536 frames per second against 523).

@@ -126,7 +126,7 @@ Controllers come from the keyboard and the Gamepad API (`input.ts`, `gamepad.ts`
 | Graphics Synthesizer | Software rasteriser (sprites, triangles, lines, textures in every format, CLUTs, blending, depth and alpha tests, fog), transfers both ways, privileged registers; on the GPU through WebGPU: the software GS records what it is asked, `crates/ps2-gpu` draws it (D25, D28, D29) |
 | IPU | MPEG-1/2 decoding (BDEC, IDEC, VDEC, FDEC), colour conversion (CSC, PACK), its DMA channels: movies play (D60) |
 | DMA, INTC, timers | The EE's channels (normal, chain, interleave, the memory FIFO: D78), interrupt controller (a vertical blank's interrupt waits for the next read of INTC_STAT, D59), four timers |
-| I/O processor | `crates/ps1`'s CPU, with its own memory map, interrupts, six timers and DMA; the SIF between it and the EE (D24); a USB host controller (OHCI) with nothing plugged in, for games loading Sony's USB driver (D72); an expansion bay with nothing plugged in (D77) |
+| I/O processor | `crates/ps1`'s CPU (compiled to WebAssembly in browsers by its compiler, D108), with its own memory map, interrupts, six timers and DMA; the SIF between it and the EE (D24); a USB host controller (OHCI) with nothing plugged in, for games loading Sony's USB driver (D72); an expansion bay with nothing plugged in (D77) |
 | CDVD | N commands (reads of CD and DVD sectors, the end once DMA has the data, D61), S commands (clock, region, EEPROM), disc changes; after a fast boot, the system configuration the browser would have set (D73) |
 | SPU2 | Two cores of 24 voices (the PS1's SPU's), sound memory, DMA, reverb (D33) |
 | SIO2 | Controllers (DualShock 2, pressure-sensitive buttons included, D71) and memory cards (8 MiB, with ECC; formatted by the server) (D32) |
