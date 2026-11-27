@@ -20,8 +20,9 @@
 //! ADD, ADDI and SUB (they trap on overflow), coprocessors, LWL and
 //! friends, and accesses elsewhere.
 
+use super::JitBus;
 use super::wasm::{self, Code, FuncType, I32, I64, op};
-use crate::bus::{Bus, RAM_PAGE_BITS};
+use crate::bus::RAM_PAGE_BITS;
 use crate::cpu::{BIOS_ACCESS, Cpu, ICACHE_FILL, IO_ACCESS, RAM_ACCESS};
 
 /// Instructions per block, at most.
@@ -52,13 +53,28 @@ pub struct Layout {
     ram_mask: u32,
     ram_writes: u32,
     icache: u32,
+    /// The pending cycles count instructions (one each), not their cycles
+    /// (the PS2's IOP, see `JitBus::FLAT`); its loops never skip ahead.
+    flat: bool,
+}
+
+/// Where a bus keeps what compiled code reads and writes directly (see
+/// `JitBus::places`): addresses in the module's memory.
+pub struct BusPlaces {
+    pub pending: usize,
+    pub deadline: usize,
+    pub scratchpad: usize,
+    pub ram: usize,
+    pub ram_mask: u32,
+    pub ram_writes: usize,
 }
 
 impl Layout {
-    pub fn new(cpu: &Cpu, bus: &Bus) -> Self {
+    pub fn new<B: JitBus>(cpu: &Cpu, bus: &B) -> Self {
         let c = cpu as *const Cpu as usize;
-        let b = bus as *const Bus as usize;
+        let b = bus as *const B as usize;
         let at = |p: usize, base: usize| (p - base) as u32;
+        let places = bus.places();
         Self {
             regs: at(cpu.regs.as_ptr() as usize, c),
             out_regs: at(cpu.out_regs.as_ptr() as usize, c),
@@ -69,13 +85,14 @@ impl Layout {
             load_val: at(&cpu.load.1 as *const u32 as usize, c),
             cycles: at(&cpu.cycles as *const u64 as usize, c),
             sr: at(&cpu.sr as *const u32 as usize, c),
-            pending: at(&bus.pending as *const u32 as usize, b),
-            deadline: at(&bus.deadline as *const u32 as usize, b),
-            scratchpad: at(bus.scratchpad.as_ptr() as usize, b),
-            ram: bus.ram.as_ptr() as usize as u32,
-            ram_mask: bus.ram_mask(),
-            ram_writes: bus.ram_writes.as_ptr() as usize as u32,
+            pending: at(places.pending, b),
+            deadline: at(places.deadline, b),
+            scratchpad: at(places.scratchpad, b),
+            ram: places.ram as u32,
+            ram_mask: places.ram_mask,
+            ram_writes: places.ram_writes as u32,
             icache: cpu.icache.as_ptr() as usize as u32,
+            flat: B::FLAT,
         }
     }
 }
@@ -246,7 +263,11 @@ impl Emitter<'_> {
     /// deadline is reached (and, for a store, when it wrote the block's own code).
     fn commit(&mut self, after: After, load: Option<(usize, u32)>, smc: bool) {
         self.c.local_get(EXTRA).i32_const(1).op(op::I32_ADD).local_set(RET);
-        self.c.local_get(PEND).local_get(RET).op(op::I32_ADD).local_set(PEND);
+        if self.l.flat {
+            self.c.local_get(PEND).i32_const(1).op(op::I32_ADD).local_set(PEND);
+        } else {
+            self.c.local_get(PEND).local_get(RET).op(op::I32_ADD).local_set(PEND);
+        }
         self.c
             .local_get(CYC)
             .local_get(RET)
@@ -504,7 +525,7 @@ pub fn compile(
         let at = pc.wrapping_add(4 * (len as u32 - 2));
         branch_target(words[len - 2], at) == Some(pc)
     };
-    let idle = back && idle_loop(&words[..len]);
+    let idle = back && !layout.flat && idle_loop(&words[..len]);
     let mut e = Emitter {
         c: Code::default(),
         l: layout,

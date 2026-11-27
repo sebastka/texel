@@ -26,7 +26,49 @@ use std::hash::{BuildHasherDefault, Hasher};
 use crate::bus::{Bus, RAM_PAGE_BITS};
 use crate::cpu::{Cpu, CpuBus};
 
-pub use compile::{Compiled, Layout, MAX_LEN, batch, compile};
+pub use compile::{BusPlaces, Compiled, Layout, MAX_LEN, batch, compile};
+
+/// A bus compiled code runs on: the PlayStation's, or the PS2's IOP's.
+pub trait JitBus: CpuBus {
+    /// The pending cycles count instructions, one each (the IOP: its time
+    /// is counted so, see the PS2's `Ps2::run`), and loops are not
+    /// fast-forwarded.
+    const FLAT: bool = false;
+    /// Where compiled code finds the pending cycles, the deadline, the
+    /// scratchpad, RAM and its pages' write counts.
+    fn places(&self) -> BusPlaces;
+    fn pending(&self) -> u32;
+    fn deadline(&self) -> u32;
+    /// RAM (`ram_mask` + 1 bytes).
+    fn ram(&self) -> &[u8];
+    /// RAM's pages' write counts (see `RAM_PAGE_BITS`).
+    fn ram_writes(&self) -> &[u32];
+}
+
+impl JitBus for Bus {
+    fn places(&self) -> BusPlaces {
+        BusPlaces {
+            pending: &self.pending as *const u32 as usize,
+            deadline: &self.deadline as *const u32 as usize,
+            scratchpad: self.scratchpad.as_ptr() as usize,
+            ram: self.ram.as_ptr() as usize,
+            ram_mask: self.ram_mask(),
+            ram_writes: self.ram_writes.as_ptr() as usize,
+        }
+    }
+    fn pending(&self) -> u32 {
+        self.pending
+    }
+    fn deadline(&self) -> u32 {
+        self.deadline
+    }
+    fn ram(&self) -> &[u8] {
+        &self.ram
+    }
+    fn ram_writes(&self) -> &[u32] {
+        &self.ram_writes
+    }
+}
 
 /// Runs a block this many times before compiling it.
 const HOT: u32 = 2;
@@ -42,7 +84,7 @@ const PER_FRAME: u32 = 256;
 /// What compiles modules and runs their function: the browser, through the
 /// module running the emulator (where the little unsafe code calling into
 /// compiled blocks, and back, lives).
-pub trait Backend {
+pub trait Backend<B = Bus> {
     /// Starts compiling `module`, which exports `count` functions (`b0`,
     /// `b1`..., see `batch`), in the background: its number, which `ready`
     /// gives back with the functions.
@@ -54,7 +96,7 @@ pub trait Backend {
 
     /// Runs function `func` (from `install`) on `cpu` and `bus`: returns
     /// the number of instructions it ran.
-    fn call(&mut self, func: u32, cpu: &mut Cpu, bus: &mut Bus) -> u32;
+    fn call(&mut self, func: u32, cpu: &mut Cpu, bus: &mut B) -> u32;
 
     /// Function `func` will not be called again: its handle may be reused.
     fn release(&mut self, func: u32);
@@ -134,8 +176,8 @@ impl Hasher for PcHasher {
     }
 }
 
-pub struct Jit {
-    backend: Box<dyn Backend>,
+pub struct Jit<B: JitBus = Bus> {
+    backend: Box<dyn Backend<B>>,
     /// By the address of their first instruction.
     blocks: HashMap<u32, Entry, BuildHasherDefault<PcHasher>>,
     /// Blocks compiled, for the next module.
@@ -147,8 +189,8 @@ pub struct Jit {
     pub stats: Stats,
 }
 
-impl Jit {
-    pub fn new(backend: Box<dyn Backend>) -> Self {
+impl<B: JitBus> Jit<B> {
+    pub fn new(backend: Box<dyn Backend<B>>) -> Self {
         Self {
             backend,
             blocks: HashMap::default(),
@@ -175,7 +217,7 @@ impl Jit {
     /// Runs the block at the CPU's pc, if there is one it may start
     /// (compiling it when it is hot): whether it ran. Its cycles are in
     /// `bus.pending` then, as `step`'s would be.
-    pub fn run(&mut self, cpu: &mut Cpu, bus: &mut Bus) -> bool {
+    pub fn run(&mut self, cpu: &mut Cpu, bus: &mut B) -> bool {
         let Some(cause) = cpu.plain_start(bus.irq_active()) else {
             return false;
         };
@@ -209,8 +251,9 @@ impl Jit {
         let words: Vec<u32> = (0..count).map(|k| bus.fetch(pc.wrapping_add(4 * k))).collect();
         let layout = Layout::new(cpu, bus);
         let icache = bus.icache_enabled();
+        let ram_mask = bus.places().ram_mask;
         let ram_range = ram.then(|| {
-            let start = pa & bus.ram_mask();
+            let start = pa & ram_mask;
             (start, start + 4 * words.len() as u32)
         });
         let Some(compiled) = compile(pc, &words, icache, ram_range, self.backend.exec_index(), &layout) else {
@@ -220,7 +263,7 @@ impl Jit {
         self.stats.total += u64::from(compiled.len);
         // The code it was compiled from, as it must still be (RAM only:
         // the BIOS does not change).
-        let pa = if ram { pa & bus.ram_mask() } else { u32::MAX };
+        let pa = if ram { pa & ram_mask } else { u32::MAX };
         let code = if ram {
             code_at(bus, pa, 4 * compiled.len as usize)
                 .map(<[u8]>::to_vec)
@@ -245,15 +288,15 @@ impl Jit {
     }
 
     /// Runs blocks as `run`, then the compiled ones after them, while
-    /// nothing else would run between them in `run_frame`'s loop: the
-    /// peripherals have nothing due (`bus.deadline`), the frame is not
-    /// over, and each may start. The same as returning after each block,
-    /// without the way through the loop.
-    pub fn run_chained(&mut self, cpu: &mut Cpu, bus: &mut Bus) -> bool {
+    /// nothing else would run between them: the pending cycles are short
+    /// of the deadline, `more` says so (the PlayStation: the frame is not
+    /// over), and each may start. The same as returning after each block,
+    /// without the way through the caller's loop.
+    pub fn run_chained(&mut self, cpu: &mut Cpu, bus: &mut B, more: impl Fn(&B) -> bool) -> bool {
         if !self.run(cpu, bus) {
             return false;
         }
-        while bus.pending < bus.deadline && !bus.gpu.frame_ready {
+        while bus.pending() < bus.deadline() && more(bus) {
             let Some(cause) = cpu.plain_start(bus.irq_active()) else {
                 break;
             };
@@ -267,7 +310,7 @@ impl Jit {
     /// Runs the compiled block at `pc`, if its code is still there and it
     /// may run (`cause`: the CPU's, see `Cpu::plain_start`): whether it
     /// ran; `None`: no block compiled there.
-    fn call(&mut self, cpu: &mut Cpu, bus: &mut Bus, pc: u32, cause: u32) -> Option<bool> {
+    fn call(&mut self, cpu: &mut Cpu, bus: &mut B, pc: u32, cause: u32) -> Option<bool> {
         let entry = self.blocks.get_mut(&pc)?;
         let Entry::Compiled {
             func,
@@ -363,21 +406,21 @@ impl Jit {
 
 /// The write counts of the first and last RAM pages of `len` bytes at `pa`
 /// (`u32::MAX`: not RAM: none).
-fn page_writes(bus: &Bus, pa: u32, len: usize) -> [u32; 2] {
+fn page_writes<B: JitBus>(bus: &B, pa: u32, len: usize) -> [u32; 2] {
     if pa == u32::MAX || len == 0 {
         return [0; 2];
     }
     let first = pa as usize >> RAM_PAGE_BITS;
-    let last = ((pa as usize + len - 1) & bus.ram_mask() as usize) >> RAM_PAGE_BITS;
-    [bus.ram_writes[first], bus.ram_writes[last]]
+    let last = ((pa as usize + len - 1) & bus.places().ram_mask as usize) >> RAM_PAGE_BITS;
+    [bus.ram_writes()[first], bus.ram_writes()[last]]
 }
 
 /// RAM's bytes at `pa` (`u32::MAX`: not RAM: nothing to check).
-fn code_at(bus: &Bus, pa: u32, len: usize) -> Option<&[u8]> {
+fn code_at<B: JitBus>(bus: &B, pa: u32, len: usize) -> Option<&[u8]> {
     if pa == u32::MAX {
         return Some(&[]);
     }
-    bus.ram.get(pa as usize..pa as usize + len)
+    bus.ram().get(pa as usize..pa as usize + len)
 }
 
 pub mod helpers {
@@ -400,7 +443,7 @@ pub mod helpers {
 
     /// Instructions that only change the CPU's (and the GTE's) registers:
     /// a block may go on after them.
-    fn pure(i: u32) -> bool {
+    pub fn pure(i: u32) -> bool {
         let op = i >> 26;
         let rs = (i >> 21) & 0x1f;
         match op {

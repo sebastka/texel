@@ -197,6 +197,18 @@ pub struct Gpu {
     /// scaled; see `Command::Target`).
     #[serde(skip)]
     target: (bool, bool),
+    /// Recording, the scaled drawing held back (`Some`, see `set_held`),
+    /// and the native area drawn meanwhile (inclusive).
+    #[serde(skip)]
+    held: Option<Option<[i32; 4]>>,
+}
+
+/// The smallest rectangle (inclusive) holding both.
+fn union(a: Option<[i32; 4]>, r: [i32; 4]) -> [i32; 4] {
+    match a {
+        None => r,
+        Some(d) => [d[0].min(r[0]), d[1].min(r[1]), d[2].max(r[2]), d[3].max(r[3])],
+    }
 }
 
 /// Brings a native VRAM up to date from the renderer the drawing is
@@ -242,6 +254,7 @@ impl Gpu {
         self.stale = old.stale;
         self.fetch = old.fetch.take();
         self.target = old.target;
+        self.held = old.held;
     }
 
     pub fn new() -> Self {
@@ -292,6 +305,7 @@ impl Gpu {
             stale: false,
             fetch: None,
             target: (false, true),
+            held: None,
         };
         gpu.reset();
         gpu
@@ -619,6 +633,7 @@ impl Gpu {
         self.record = on;
         self.commands.clear();
         self.dirty = None;
+        self.held = None;
         let scale = self.scale;
         self.scale = 0;
         self.set_scale(scale);
@@ -643,6 +658,7 @@ impl Gpu {
         if on == self.defer {
             return;
         }
+        self.set_held(false);
         if on {
             // The renderer's native VRAM from this one, as it is.
             self.dirty = Some([0, 0, VRAM_WIDTH as i32 - 1, VRAM_HEIGHT as i32 - 1]);
@@ -710,6 +726,8 @@ impl Gpu {
         // recorded is still to draw there.
         if !self.defer {
             self.commands.clear();
+            // All of it is sent: nothing more to send when the hold ends.
+            self.held = self.held.map(|_| None);
             self.dirty = Some([0, 0, VRAM_WIDTH as i32 - 1, VRAM_HEIGHT as i32 - 1]);
             self.send_dirty();
         }
@@ -726,10 +744,75 @@ impl Gpu {
         if !self.record {
             return;
         }
-        self.dirty = Some(match self.dirty {
-            None => r,
-            Some(d) => [d[0].min(r[0]), d[1].min(r[1]), d[2].max(r[2]), d[3].max(r[3])],
+        self.dirty = Some(union(self.dirty, r));
+        if let Some(held) = &mut self.held {
+            *held = Some(union(*held, r));
+        }
+    }
+
+    /// Recording (not deferred), the scaled drawing held back while `on`:
+    /// for frames run again by rollback, which nobody sees. The native VRAM
+    /// is drawn here as ever; when the hold ends, the area drawn meanwhile
+    /// goes to the scaled VRAM as it is natively (each pixel a block), and
+    /// the frames drawn next draw over it at scale.
+    pub fn set_held(&mut self, on: bool) {
+        if on {
+            if self.record && !self.defer && self.held.is_none() {
+                self.held = Some(None);
+            }
+        } else if let Some(Some(area)) = self.held.take() {
+            self.write_native(area);
+        }
+    }
+
+    /// Recording: a native area (inclusive) written to the scaled VRAM as
+    /// it is here, each pixel a block.
+    fn write_native(&mut self, [x0, y0, x1, y1]: [i32; 4]) {
+        let (x0, y0) = (x0.max(0) as usize, y0.max(0) as usize);
+        let (x1, y1) = (x1.min(VRAM_WIDTH as i32 - 1), y1.min(VRAM_HEIGHT as i32 - 1));
+        let (Ok(x1), Ok(y1)) = (usize::try_from(x1), usize::try_from(y1)) else {
+            return;
+        };
+        if x0 > x1 || y0 > y1 {
+            return;
+        }
+        let mut pixels = Vec::with_capacity((x1 - x0 + 1) * (y1 - y0 + 1));
+        for y in y0..=y1 {
+            pixels.extend(self.vram[y * VRAM_WIDTH + x0..=y * VRAM_WIDTH + x1].iter().map(|&v| u32::from(v)));
+        }
+        self.commands.push(Command::Write {
+            x: x0 as u32,
+            y: y0 as u32,
+            w: (x1 - x0 + 1) as u32,
+            h: (y1 - y0 + 1) as u32,
+            first: 0,
+            check_mask: false,
+            pixels,
         });
+    }
+
+    /// Rollback: the native VRAM as it was kept. Recording (not deferred),
+    /// the area that changed goes to the renderer again (it drew the frames
+    /// dropped there): now, or when the scaled drawing is no longer held.
+    pub(crate) fn restore_vram(&mut self, kept: &[u16]) {
+        if !self.record || self.defer {
+            self.vram.copy_from_slice(kept);
+            return;
+        }
+        let mut changed = None;
+        for (y, (now, was)) in self.vram.chunks(VRAM_WIDTH).zip(kept.chunks(VRAM_WIDTH)).enumerate() {
+            let differs = |(a, b): (&u16, &u16)| a != b;
+            if let (Some(x0), Some(x1)) = (now.iter().zip(was).position(differs), now.iter().zip(was).rposition(differs)) {
+                changed = Some(union(changed, [x0 as i32, y as i32, x1 as i32, y as i32]));
+            }
+        }
+        self.vram.copy_from_slice(kept);
+        if let Some(area) = changed {
+            self.mark_dirty(area);
+            if self.held.is_none() {
+                self.write_native(area);
+            }
+        }
     }
 
     /// Marks a native rectangle, which may wrap around VRAM, as drawn.
@@ -826,6 +909,8 @@ impl Gpu {
         let v = v | (u16::from(self.set_mask) << 15);
         if self.record {
             self.mark_dirty([x as i32, y as i32, x as i32, y as i32]);
+        }
+        if self.record && self.held.is_none() {
             let word = u32::from(v) | (u32::from(skip) << 16);
             let (tx, ty, tw, th) = transfer;
             if let Some(Command::Write {
@@ -883,6 +968,8 @@ impl Gpu {
         }
         if self.record && width > 0 && height > 0 {
             self.mark_dirty_wrapping(x0, y0, width, height);
+        }
+        if self.record && width > 0 && height > 0 && self.held.is_none() {
             self.commands.push(Command::Fill {
                 x: x0,
                 y: y0,
@@ -941,8 +1028,11 @@ impl Gpu {
             }
         }
         if self.record {
-            let (sx, sy, dx, dy, w, h) = recorded;
+            let (_, _, dx, dy, w, h) = recorded;
             self.mark_dirty_wrapping(dx, dy, w, h);
+        }
+        if self.record && self.held.is_none() {
+            let (sx, sy, dx, dy, w, h) = recorded;
             self.commands.push(Command::Copy {
                 sx,
                 sy,
@@ -986,6 +1076,9 @@ impl Gpu {
         if self.record {
             if let Some(b) = native.bounds {
                 self.mark_dirty(b);
+            }
+            if self.held.is_some() {
+                return pixels;
             }
             // What the primitive reads, as the native VRAM is now (as the
             // scaled drawing below reads it).
@@ -2549,8 +2642,12 @@ mod tests {
     /// (some texels with the mask bit), shaded and textured triangles, a
     /// semi-transparent quad, a rectangle, a line, a fill, a copy and a
     /// transfer with the mask checked.
+    /// A GP0 word's coordinates.
+    fn xy(x: u32, y: u32) -> u32 {
+        x | (y << 16)
+    }
+
     fn scene() -> Vec<u32> {
-        let xy = |x: u32, y: u32| x | (y << 16);
         let tpage = 1 | (2 << 7);
         let mut w = vec![0xe300_0000, 0xe400_0000 | (511 << 10) | 1023];
         w.extend([0xa000_0000, xy(64, 0), xy(16, 16)]);
@@ -2661,6 +2758,92 @@ mod tests {
         replay_here.render_display(d, &mut a);
         replay_there.borrow().render_display(d, &mut b);
         assert!(a == b, "the scaled pictures differ at {scale}x");
+    }
+
+    /// Held scaled drawing (see `Gpu::set_held`): the native VRAM drawn as
+    /// ever, nothing recorded for the scaled one until the hold ends, then
+    /// the area drawn, as it is natively, each pixel a block.
+    #[test]
+    fn held_drawing_sends_the_native_area_drawn() {
+        let mut here = Gpu::new();
+        let mut held = Gpu::new();
+        for gpu in [&mut here, &mut held] {
+            gpu.set_scale(2);
+            gpu.set_recording(true);
+        }
+        let mut replay = replay::Replay::new();
+        replay.apply(&held.take_commands());
+        held.set_held(true);
+        for w in scene() {
+            here.gp0(w);
+            held.gp0(w);
+        }
+        assert!(held.take_commands().is_empty(), "drawing recorded while held");
+        assert!(here.vram == held.vram, "the native VRAMs differ");
+        held.set_held(false);
+        let commands = held.take_commands();
+        assert!(matches!(commands[..], [Command::Write { check_mask: false, .. }]));
+        replay.apply(&commands);
+        // The whole VRAM scaled up from the native one.
+        let mut expected = replay::Replay::new();
+        expected.apply(&[
+            Command::Upload {
+                x: 0,
+                y: 0,
+                w: VRAM_WIDTH as u32,
+                h: VRAM_HEIGHT as u32,
+                data: held.vram.to_vec(),
+            },
+            Command::Rescale { scale: 2 },
+        ]);
+        let d = Display {
+            x: 0,
+            y: 0,
+            w: VRAM_WIDTH as u32,
+            h: VRAM_HEIGHT as u32,
+            depth24: false,
+            off: false,
+        };
+        let (mut a, mut b) = (Vec::new(), Vec::new());
+        replay.render_display(d, &mut a);
+        expected.render_display(d, &mut b);
+        assert!(a == b, "the scaled VRAM is not the native one scaled up");
+        // Not held: recorded as usual.
+        here.take_commands();
+        here.gp0(0x0200_ff00);
+        here.gp0(xy(0, 0));
+        here.gp0(xy(16, 16));
+        assert!(matches!(here.take_commands()[..], [Command::Fill { .. }]));
+    }
+
+    /// Rollback going back (`Gpu::restore_vram`): the native area that
+    /// changed goes to the renderer again, now, or once the hold ends.
+    #[test]
+    fn restored_vram_is_sent_again() {
+        let mut gpu = Gpu::new();
+        gpu.set_recording(true);
+        let kept = gpu.vram.to_vec();
+        gpu.gp0(0x0200_ff00);
+        gpu.gp0(xy(32, 10));
+        gpu.gp0(xy(16, 4));
+        gpu.take_commands();
+        gpu.restore_vram(&kept);
+        assert!(gpu.vram[..] == kept[..]);
+        let written = |c: &[Command]| match c {
+            [Command::Write { x, y, w, h, pixels, .. }] => Some((*x, *y, *w, *h, pixels.iter().all(|&p| p == 0))),
+            _ => None,
+        };
+        assert_eq!(written(&gpu.take_commands()), Some((32, 10, 16, 4, true)));
+        // Held: sent when the hold ends.
+        gpu.gp0(0x0200_ff00);
+        gpu.gp0(xy(32, 10));
+        gpu.gp0(xy(16, 4));
+        gpu.take_commands();
+        gpu.set_held(true);
+        gpu.restore_vram(&kept);
+        assert!(gpu.take_commands().is_empty());
+        gpu.set_held(false);
+        assert_eq!(written(&gpu.take_commands()), Some((32, 10, 16, 4, true)));
     }
 
     #[test]

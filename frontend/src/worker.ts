@@ -59,6 +59,9 @@ let autoScale = 1;
 /** Milliseconds per frame, averaged: emulating it, drawing it elsewhere. */
 let emuMs = 0;
 let drawMs = 0;
+/** Netplay: time spent running frames again (rollback) since the last
+ * frame, which it adds to that frame's cost. */
+let spentMs = 0;
 /** Seconds running behind (or with room to spare), and until when not to
  * change the resolution again. */
 let behindFor = 0;
@@ -114,6 +117,7 @@ function joinRoom(room: RoomSnapshot) {
   net = new Session(room, {
     emu: () => emu,
     runFrame,
+    spent: (ms) => (spentMs += ms),
     status: (status) => post({ type: "net", status }),
     send: (data) => scope.postMessage({ type: "net-out", data } satisfies FromWorker, typeof data === "string" ? [] : [data.buffer]),
     sendDatagram: (data) => scope.postMessage({ type: "net-out", data, datagram: true } satisfies FromWorker, [data.buffer]),
@@ -478,7 +482,8 @@ function runFrame() {
   if (!emu) return;
   const started = performance.now();
   emu.runFrame();
-  const took = performance.now() - started;
+  const took = performance.now() - started + spentMs;
+  spentMs = 0;
   emuMs = emuMs * 0.9 + took * 0.1;
   frameMsTotal += took;
   frameMsMax = Math.max(frameMsMax, took);

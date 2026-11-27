@@ -358,7 +358,7 @@ impl Cpu {
     /// slot, no load in flight, no interrupt taken, pc aligned), and Cause
     /// as it would set it (`irq`: the interrupt controller's line): where a
     /// compiled block may start.
-    pub(crate) fn plain_start(&self, irq: bool) -> Option<u32> {
+    pub fn plain_start(&self, irq: bool) -> Option<u32> {
         let cause = if irq {
             self.cause | (1 << 10)
         } else {
@@ -368,7 +368,7 @@ impl Cpu {
         (!self.branch && self.load.0 == 0 && self.pc & 3 == 0 && !interrupt).then_some(cause)
     }
 
-    pub(crate) fn set_cause(&mut self, cause: u32) {
+    pub fn set_cause(&mut self, cause: u32) {
         self.cause = cause;
     }
 
@@ -376,7 +376,7 @@ impl Cpu {
     /// `step` does after fetching it (the fetch's extra cycles given), with
     /// the CPU's state as `step` would find it. Returns its cycles, and
     /// whether it ran plainly (no exception, no load issued).
-    pub(crate) fn step_compiled(
+    pub fn step_compiled(
         &mut self,
         bus: &mut impl CpuBus,
         instr: u32,

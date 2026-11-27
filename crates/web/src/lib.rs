@@ -230,7 +230,7 @@ impl Emulator {
 
     /// Rollback: goes back to the machine kept in a slot. The frames run
     /// since then were drawn: the scaled renderers draw those run again
-    /// over them.
+    /// over them (and get the native VRAM again where it went back).
     #[wasm_bindgen(js_name = rewindLoad)]
     pub fn rewind_load(&mut self, slot: usize) -> Result<(), JsError> {
         let r = self
@@ -239,6 +239,15 @@ impl Emulator {
             .ok_or_else(|| JsError::new("no state kept there"))?;
         self.system.load_rewind(r)?;
         Ok(())
+    }
+
+    /// Rollback: the frames run while `on` are not drawn scaled (nobody
+    /// sees them): only the native VRAM is, its area drawn then sent scaled
+    /// up when the hold ends. Spares the GPU (or the drawing worker) most
+    /// of a correction's frames.
+    #[wasm_bindgen(js_name = holdScaled)]
+    pub fn hold_scaled(&mut self, on: bool) {
+        self.system.set_gpu_held(on);
     }
 
     /// A checksum of the machine kept in a slot, as every member of a

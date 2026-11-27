@@ -256,7 +256,7 @@ impl System {
                 && self
                     .jit
                     .as_mut()
-                    .is_some_and(|jit| jit.run_chained(&mut self.cpu, &mut self.bus));
+                    .is_some_and(|jit| jit.run_chained(&mut self.cpu, &mut self.bus, |bus| !bus.gpu.frame_ready));
             let cycles = if compiled {
                 0
             } else {
@@ -442,6 +442,12 @@ impl System {
     /// change.
     pub fn set_gpu_deferred(&mut self, fetch: Option<gpu::VramFetch>) {
         self.bus.gpu.set_deferred(fetch);
+    }
+
+    /// Recording, the scaled drawing held back while `on` (frames run again
+    /// by rollback, never shown): see `Gpu::set_held`.
+    pub fn set_gpu_held(&mut self, on: bool) {
+        self.bus.gpu.set_held(on);
     }
 
     /// Deferred drawing: brings the native VRAM up to date from the

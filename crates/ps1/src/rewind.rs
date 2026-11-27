@@ -9,8 +9,8 @@
 //! is checked again where RAM changed; RAM and the instruction cache stay
 //! where they are, their contents copied, as compiled code holds their
 //! addresses), the renderers' scaled VRAM (the
-//! frames replayed draw again over those dropped), the samples not taken
-//! yet.
+//! frames replayed draw again over those dropped; where the native VRAM
+//! goes back, it is sent to them again), the samples not taken yet.
 
 use std::cell::Cell;
 
@@ -178,7 +178,7 @@ impl System {
                 bus.ram_writes[k] = bus.ram_writes[k].wrapping_add(1);
             }
         }
-        bus.gpu.vram.copy_from_slice(&r.vram);
+        bus.gpu.restore_vram(&r.vram);
         bus.spu.ram.copy_from_slice(&r.spu_ram);
         for (card, kept) in bus.sio.cards.iter_mut().zip(&r.cards) {
             if let (Some(c), Some(k)) = (card.as_mut(), kept) {

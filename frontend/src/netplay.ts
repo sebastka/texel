@@ -61,7 +61,11 @@ const TOO_FAR_BEHIND = 600;
  * at the cost of the delay it hides). */
 const MAX_ROLLBACK = 8;
 const RING = MAX_ROLLBACK + 2;
-const ROLLBACK_DELAY = 2;
+const ROLLBACK_DELAY = 4;
+/** Rollback: the frames run again last that are drawn scaled, the ones
+ * before them drawn at native resolution only (nobody sees them): the
+ * picture shown next was drawn in the frame before (double buffering). */
+const DRAWN_AGAIN = 2;
 /** Rollback: frames ahead of the others past which a frame is let go by,
  * and frames between two. */
 const LEAD = 1.5;
@@ -186,6 +190,9 @@ export interface SessionHooks {
   emu: () => Emulator | null;
   /** Runs a frame for real: audio, pads, stats. */
   runFrame: () => void;
+  /** Time spent running frames again (rollback), in ms: the next frame's
+   * cost, for the stats. */
+  spent?: (ms: number) => void;
   status: (s: NetStatus) => void;
   /** Sends a message to the room (through the page). */
   send: (data: string | Uint8Array) => void;
@@ -747,11 +754,18 @@ export class Session {
   /** Rollback: runs the frames from `from` to the current one again, the
    * machine being at `from`'s start (its state kept already). */
   private rerun(emu: Emulator, from: number, count = true) {
-    for (let f = from; f < this.frame; f++) {
-      if (f > from) emu.rewindSave(f % RING);
-      this.runAt(emu, f, false);
+    const started = performance.now();
+    try {
+      for (let f = from; f < this.frame; f++) {
+        if (f > from) emu.rewindSave(f % RING);
+        emu.holdScaled(f < this.frame - DRAWN_AGAIN);
+        this.runAt(emu, f, false);
+      }
+    } finally {
+      emu.holdScaled(false);
     }
     if (count) this.replayed += this.frame - from;
+    this.hooks.spent?.(performance.now() - started);
   }
 
   /** Rollback: moves the frontier past the frames whose inputs are all
