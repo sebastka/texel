@@ -759,3 +759,12 @@ Spyro: A Hero's Tail stopped after its intro movies: its VIF1 interrupt handler 
 - **For the rest of the slice**: once path 3 has moved data, GIF_STAT shows OPH and APATH 3 until the slice ends (512 EE cycles at most); the channel still completes at once. A handler reading GIF_STAT right after its start sees the transfer; code waiting for everything to be idle (the same game polls VIF0, the GIF, VIF1, VU1 and APATH) waits a slice at most.
 - **Not for the transfer's time**: GIF_STAT busy for two EE cycles a quadword, with or without the channel's completion deferred as long, made the game stop earlier, after its first movie, every thread asleep; not understood yet, so the shorter window.
 - **Spyro: A Hero's Tail** now plays its intro and reaches its main menu (`READWATCH=10003020` shows its handlers seeing 0xE00).
+
+## D95. The SPU2 writes its outputs to sound memory
+
+Yetisports and Burnout 3 stopped once RenderWare Audio (RWA.IRX) was loaded, black or loading. RWA sets core 0's IRQA to 0x400 with its interrupt on, and waits for that interrupt as its tick; nothing ever reached 0x400, so it never came, and the game waited for its audio.
+
+- **The outputs**: each sample, each core writes its dry output (left, right) and voices 1 and 3's to sound memory, a halfword in each of four areas of 512 halfwords that it goes round (core 0 from 0x400, 0x600, 0x800 and 0xA00; core 1 from 0xC00). These writes reach IRQA as any access does: at 0x400, an interrupt every 512 samples, 94 a second.
+- **Not in save states** (their format is positional): the position in the areas starts again at 0 when one is loaded, which only shifts the next lap.
+- **Yetisports** now shows its logos, title, memory card check and its EyeToy error (no camera: the game needs one).
+- **Found with** the runner's `IOPCALLS` (RWA set IRQA to 0x400 and installed an SPU2 interrupt handler; libsd's export numbers) and `SPU2=1` (the cores' ATTR, IRQA, ENDX, STATX and playing voices).

@@ -473,6 +473,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
     }
+    // SPU2=1: the sound chip's cores and playing voices, at the end.
+    if std::env::var("SPU2").is_ok() {
+        print!("{}", ps2.bus.iop.spu2.describe());
+    }
     if let Some((a, reads)) = &ps2.ee.read_watch {
         println!("Loads of {a:08x}, by EE instruction:");
         for (pc, (n, last, any)) in reads {

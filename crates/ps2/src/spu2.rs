@@ -209,6 +209,11 @@ pub struct Spu2 {
     /// Output, interleaved stereo at 48 kHz.
     #[serde(skip)]
     output: Vec<i16>,
+    /// Where the cores write their outputs in sound memory (see
+    /// `write_outputs`). Not in save states (their format is positional):
+    /// it only shifts when the next lap comes.
+    #[serde(skip)]
+    out_pos: u32,
 }
 
 impl std::fmt::Debug for Spu2 {
@@ -227,6 +232,7 @@ impl Default for Spu2 {
             cores: [Core::default(), Core::default()],
             irqinfo: 0,
             irq: false,
+            out_pos: 0,
             noise: 1,
             frac: 0,
             output: Vec::new(),
@@ -248,6 +254,30 @@ fn split(offset: u32) -> (usize, u32) {
 }
 
 impl Spu2 {
+    /// Diagnostics: each core's ATTR, IRQA and ENDX, and its voices that
+    /// play (envelope phase and level, address, loop address).
+    pub fn describe(&self) -> String {
+        let mut out = String::new();
+        for core in 0..2 {
+            out += &format!(
+                "SPU2 core {core}: ATTR {:04x} IRQA {:05x} ENDX {:06x} STATX {:04x}\n",
+                self.core_reg(core, reg::ATTR),
+                self.core_addr(core, reg::IRQA),
+                self.cores[core].endx,
+                self.cores[core].statx
+            );
+            for (i, v) in self.cores[core].voices.iter().enumerate() {
+                if v.phase != Phase::Off {
+                    out += &format!(
+                        "  voice {i}: {:?} env {:04x} at {:05x} loop {:05x}\n",
+                        v.phase, v.env, v.addr, v.loop_addr
+                    );
+                }
+            }
+        }
+        out
+    }
+
     fn core_reg(&self, core: usize, r: u32) -> u16 {
         self.regs[((r + 0x400 * core as u32) / 2) as usize]
     }
@@ -621,12 +651,34 @@ impl Spu2 {
         for core in 0..2 {
             self.mix_core(core);
         }
+        self.write_outputs();
         let (l, r) = self.cores[1].out;
         if self.output.len() + 2 > MAX_OUTPUT {
             self.output.drain(..2);
         }
         self.output.push(l.clamp(-0x8000, 0x7FFF) as i16);
         self.output.push(r.clamp(-0x8000, 0x7FFF) as i16);
+    }
+
+    /// Each core writes its outputs to sound memory, a halfword a sample in
+    /// areas of 512 that it goes round: its dry left and right, then voices
+    /// 1 and 3 (core 0 from 0x400, core 1 from 0xC00). The writes reach
+    /// IRQA as any access does: games aim it there for a regular interrupt
+    /// (RenderWare Audio's tick, at 0x400).
+    fn write_outputs(&mut self) {
+        let pos = self.out_pos;
+        for core in 0..2 {
+            let base = if core == 0 { 0x400 } else { 0xC00 };
+            let c = &self.cores[core];
+            let values = [c.out.0, c.out.1, c.voices[1].last, c.voices[3].last];
+            for (k, v) in values.into_iter().enumerate() {
+                let at = base + 0x200 * k as u32 + pos;
+                let v = v.clamp(-0x8000, 0x7FFF) as i16;
+                self.ram[2 * at as usize..2 * at as usize + 2].copy_from_slice(&v.to_le_bytes());
+                self.check_irq(at, 1);
+            }
+        }
+        self.out_pos = (pos + 1) & 0x1FF;
     }
 
     /// One sample of a core: its voices, inputs and master volume.
@@ -765,6 +817,23 @@ impl Spu2 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The cores write their outputs round areas of 512 halfwords: IRQA
+    /// there interrupts once a lap.
+    #[test]
+    fn outputs_written_to_memory_reach_irqa() {
+        let mut s = Spu2::default();
+        // Core 0: interrupts on, IRQA at 0x405 (its dry left, sample 5).
+        s.write16(reg::ATTR, ATTR_ENABLE | ATTR_IRQ);
+        s.write16(reg::IRQA, 0);
+        s.write16(reg::IRQA + 2, 0x405);
+        assert!(!s.tick(5 * CYCLES_PER_SAMPLE));
+        assert!(s.tick(CYCLES_PER_SAMPLE));
+        assert_eq!(s.read16(IRQINFO), 4);
+        // Not again before the next lap.
+        assert!(!s.tick(511 * CYCLES_PER_SAMPLE));
+        assert!(s.tick(CYCLES_PER_SAMPLE));
+    }
 
     #[test]
     fn statx_follows_dma() {
