@@ -30,6 +30,8 @@ pub mod reg {
     pub const XYZF3: u8 = 0x0C;
     pub const XYZ3: u8 = 0x0D;
     pub const TEX1_1: u8 = 0x14;
+    pub const MIPTBP1_1: u8 = 0x34;
+    pub const MIPTBP2_1: u8 = 0x36;
     pub const TEX2_1: u8 = 0x16;
     pub const TEX2_2: u8 = 0x17;
     pub const XYOFFSET_1: u8 = 0x18;
@@ -55,6 +57,31 @@ pub mod reg {
     pub const SIGNAL: u8 = 0x60;
     pub const FINISH: u8 = 0x61;
     pub const LABEL: u8 = 0x62;
+}
+
+/// MIPTBP1 for a texture's levels 1 to 3 laid out after level 0 (TEX1's
+/// MTBA): each level's base pointer follows the one before (its size in
+/// 256-byte blocks), with half its buffer width (1 at least).
+pub(crate) fn auto_mips(tex0: u64) -> u64 {
+    let psm = field(tex0, 20, 6);
+    // PSMT8H, PSMT4HL and PSMT4HH textures sit in 32-bit pixels.
+    let bits = match psm {
+        0x02 | 0x0A => 16,
+        0x13 => 8,
+        0x14 => 4,
+        _ => 32,
+    };
+    let (mut bp, mut bw) = (field(tex0, 0, 14), field(tex0, 14, 6));
+    let (mut w, mut h) = (1u32 << field(tex0, 26, 4).min(10), 1u32 << field(tex0, 30, 4).min(10));
+    let mut out = 0;
+    for level in 0..3 {
+        bp += w * h * bits / 8 / 256;
+        bw = (bw / 2).max(1);
+        w = (w / 2).max(1);
+        h = (h / 2).max(1);
+        out |= (u64::from(bp & 0x3FFF) | u64::from(bw & 0x3F) << 14) << (20 * level);
+    }
+    out
 }
 
 /// Bits `lo..lo+n` of `v`.
@@ -130,12 +157,23 @@ pub struct Gs {
     /// triangles drawn over it: their vertices (x, y, z before XYOFFSET).
     #[serde(skip)]
     pub probe: Option<Probe>,
+    /// Diagnostics: a register, and the values written to it (how many
+    /// times each, in the order first seen).
+    #[serde(skip)]
+    pub reg_log: Option<(u8, Vec<(u64, u64)>)>,
+    /// Diagnostics: a TEX0 value, and the texture as the first draw with it
+    /// samples it (level 0, CLUT applied: width, height, RGBA8 texels).
+    #[serde(skip)]
+    pub tex_snap: Option<(u64, Option<TexSnap>)>,
 }
 
+/// See `Gs::tex_snap`: a texture's width, height and RGBA8 texels.
+pub type TexSnap = (u32, u32, Vec<u32>);
+
 /// See `Gs::probe`: the pixel, and the triangles drawn over it: their
-/// vertices (x, y, z, RGBA), then PRIM, TEX0_1, TEX0_2, FRAME_1, FRAME_2,
-/// ALPHA_1 and TEST_1.
-pub type Probe = ((i32, i32), Vec<([[u32; 4]; 3], [u64; 7])>);
+/// vertices (x, y, z, RGBA, fog), then PRIM, TEX0_1, TEX0_2, FRAME_1,
+/// FRAME_2, ALPHA_1, TEST_1 and FOGCOL.
+pub type Probe = ((i32, i32), Vec<([[u32; 5]; 3], [u64; 8])>);
 
 fn no_clut() -> [u32; 256] {
     [0; 256]
@@ -160,6 +198,8 @@ impl Default for Gs {
             transfer_log: None,
             dma_source: 0,
             probe: None,
+            reg_log: None,
+            tex_snap: None,
         }
     }
 }
@@ -202,6 +242,15 @@ impl Gs {
     // --- General registers (through the GIF) --------------------------------
 
     pub fn write_reg(&mut self, addr: u8, data: u64) {
+        if let Some((r, seen)) = &mut self.reg_log
+            && *r == addr
+            && seen.len() < 4096
+        {
+            match seen.iter_mut().find(|(v, _)| *v == data) {
+                Some(e) => e.1 += 1,
+                None => seen.push((data, 1)),
+            }
+        }
         let a = addr as usize;
         match addr {
             reg::PRIM => {
@@ -221,6 +270,13 @@ impl Gs {
             reg::TEX0_1 | reg::TEX0_2 => {
                 self.regs[a] = data;
                 self.load_clut(data);
+                // TEX1's MTBA: levels 1 to 3 follow level 0 in memory, each
+                // a quarter of the one before, half its buffer width (the
+                // GS User's Manual's automatic base pointers).
+                let c = a - reg::TEX0_1 as usize;
+                if field(self.regs[reg::TEX1_1 as usize + c], 9, 1) != 0 {
+                    self.regs[reg::MIPTBP1_1 as usize + c] = auto_mips(data);
+                }
             }
             reg::TEX2_1 | reg::TEX2_2 => {
                 // TEX2 changes TEX0's format and CLUT fields only.
@@ -604,6 +660,58 @@ pub(crate) fn expand16(c: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// MTBA's base pointers: the GS User's Manual's example, a 512×512
+    /// PSMCT16 texture at 7200 (buffer width 8).
+    #[test]
+    fn mtba_lays_out_levels_after_level_0() {
+        let tex0 = 7200 | (8 << 14) | (u64::from(psm::CT16) << 20) | (9 << 26) | (9 << 30);
+        let levels = draw::mip_levels(auto_mips(tex0));
+        assert_eq!(levels, [(9248, 4), (9760, 2), (9888, 1)]);
+    }
+
+    /// A level of detail fixed at 1 (LCM, K = 1), MMIN nearest-mipmap
+    /// (point), MXL 1: a sprite takes level 1's texels, not level 0's.
+    #[test]
+    fn mipmaps_take_the_level_of_detail() {
+        let mut gs = Gs::default();
+        gs.write_reg(reg::FRAME_1, 1 << 16);
+        gs.write_reg(reg::SCISSOR_1, (63 << 16) | (63 << 48));
+        gs.write_reg(reg::TEST_1, 0);
+        gs.write_reg(reg::PRMODECONT, 1);
+        // Level 0: 4×4 CT32 of 0x11, at block 64; level 1: 2×2 of 0x22, at 96.
+        for (bp, w, v) in [(64u64, 4u64, 0x8011_1111u64), (96, 2, 0x8022_2222)] {
+            gs.write_reg(reg::BITBLTBUF, (bp << 32) | (1 << 48) | (u64::from(psm::CT32) << 56));
+            gs.write_reg(reg::TRXPOS, 0);
+            gs.write_reg(reg::TRXREG, w | (w << 32));
+            gs.write_reg(reg::TRXDIR, 0);
+            for _ in 0..w * w / 2 {
+                gs.write_reg(reg::HWREG, v | (v << 32));
+            }
+        }
+        gs.write_reg(reg::MIPTBP1_1, 96 | (1 << 14));
+        // TEX1: LCM, MXL 1, MMIN 2, K = 1 (4 fractional bits).
+        gs.write_reg(reg::TEX1_1, 1 | (1 << 2) | (2 << 6) | (16 << 32));
+        // TEX0: block 64, width 64, CT32, 4×4, RGBA, decal.
+        gs.write_reg(
+            reg::TEX0_1,
+            64 | (1 << 14) | (2 << 26) | (2 << 30) | (1 << 34) | (1 << 35),
+        );
+        gs.write_reg(reg::PRIM, 6 | (1 << 4) | (1 << 8));
+        gs.write_reg(reg::UV, 0);
+        gs.write_reg(reg::XYZ2, 0);
+        gs.write_reg(reg::UV, (4 * 16) | ((4 * 16) << 16));
+        gs.write_reg(reg::XYZ2, (8 * 16) | ((8 * 16) << 16));
+        assert_eq!(gs.mem.read(psm::CT32, 0, 1, 3, 3) & 0xFF_FFFF, 0x22_2222);
+        // MMIN 1 (no mipmaps): level 0.
+        gs.write_reg(reg::TEX1_1, 1 | (1 << 2) | (16 << 32));
+        gs.write_reg(reg::XYZ2, (8 * 16) | ((8 * 16) << 16));
+        gs.write_reg(reg::UV, 0);
+        gs.write_reg(reg::XYZ2, 0);
+        gs.write_reg(reg::UV, (4 * 16) | ((4 * 16) << 16));
+        gs.write_reg(reg::XYZ2, (8 * 16) | ((8 * 16) << 16));
+        assert_eq!(gs.mem.read(psm::CT32, 0, 1, 3, 3) & 0xFF_FFFF, 0x11_1111);
+    }
 
     #[test]
     fn host_to_local_transfer() {

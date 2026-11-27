@@ -24,8 +24,22 @@ pub struct IopPrintf {
     pub calls: Option<CallLog>,
     /// The time, in the caller's units, for `calls`.
     pub now: u64,
+    /// Diagnostics, when on: the last calls to linked imports from callers
+    /// in a range of addresses, in order (see `CallTrace`).
+    pub trace: Option<CallTrace>,
+    /// Diagnostics, when on: how many times the IOP ran each instruction.
+    pub pcs: Option<std::collections::HashMap<u32, u64>>,
     /// Where each linked import goes: its library and function number.
     imports: std::collections::HashMap<u32, (String, u32)>,
+}
+
+/// See `IopPrintf::trace`: the callers' range, and (time, library,
+/// function number, ra, a0, a1, sp) for each call, the last 20000.
+#[derive(Default)]
+pub struct CallTrace {
+    pub from: u32,
+    pub to: u32,
+    pub calls: std::collections::VecDeque<(u64, String, u32, u32, u32, u32, u32)>,
 }
 
 /// See `IopPrintf::calls`.
@@ -80,6 +94,9 @@ impl IopPrintf {
     /// `printf`.
     #[inline]
     pub fn check(&mut self, cpu: &Cpu, ram: &[u8]) {
+        if let Some(pcs) = &mut self.pcs {
+            *pcs.entry(cpu.pc).or_insert(0) += 1;
+        }
         if self.targets.contains(&(cpu.pc & 0x1FFF_FFFF)) {
             self.format(cpu, ram);
         }
@@ -88,6 +105,16 @@ impl IopPrintf {
         {
             let entry = calls.entry((lib.clone(), *n, cpu.reg(31))).or_default();
             *entry = (entry.0 + 1, cpu.reg(4), self.now);
+            let ra = cpu.reg(31);
+            if let Some(t) = &mut self.trace
+                && (t.from..t.to).contains(&ra)
+            {
+                if t.calls.len() >= 20_000 {
+                    t.calls.pop_front();
+                }
+                t.calls
+                    .push_back((self.now, lib.clone(), *n, ra, cpu.reg(4), cpu.reg(5), cpu.reg(29)));
+            }
         }
     }
 

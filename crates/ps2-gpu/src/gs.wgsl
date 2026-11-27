@@ -205,8 +205,10 @@ fn field(v: u32, lo: u32, n: u32) -> u32 {
 //          z, r, g, b, a, s, t, q, u, v, fog
 //   47     flat color
 //   48-63  registers (see REG_*)
+//   64-69  mipmap levels 1 to 6: base pointer, buffer width from bit 14
 
-const PRIM_WORDS: u32 = 64u;
+const PRIM_WORDS: u32 = 72u;
+const MIPS: u32 = 64u;
 const REG_PRIM: u32 = 48u;
 const REG_FRAME: u32 = 49u;
 const REG_FBMSK: u32 = 50u;
@@ -221,7 +223,7 @@ const REG_CLAMP_HI: u32 = 58u;
 const REG_TEXA: u32 = 59u;
 const REG_TA1: u32 = 60u;
 const REG_FOGCOL: u32 = 61u;
-const REG_FLAGS: u32 = 62u;  // bit 0: FBA, bit 1: COLCLAMP; TEX1: 8 LCM, 9-10 L, 11 MMAG, 12-14 MMIN, 16-27 K
+const REG_FLAGS: u32 = 62u;  // bit 0: FBA, bit 1: COLCLAMP; TEX1: 2-4 MXL, 8 LCM, 9-10 L, 11 MMAG, 12-14 MMIN, 16-27 K
 const REG_CLUT: u32 = 63u;   // the CLUT slot
 
 fn pw(p: u32, i: u32) -> u32 { return prims[p * PRIM_WORDS + i]; }
@@ -304,22 +306,35 @@ fn expand16_texa(p: u32, raw: u32) -> u32 {
     return rgb | (a << 24u);
 }
 
-fn texel(p: u32, uu: i32, vv: i32) -> vec4<u32> {
+// A level's texel (draw.rs's texel): levels above 0 halve the size and
+// the region clamp's bounds each.
+fn texel(p: u32, level: u32, uu: i32, vv: i32) -> vec4<u32> {
     let t0 = pw(p, REG_TEX0);
     let t1 = pw(p, REG_TEX0_HI);
     let cl = pw(p, REG_CLAMP);
     let ch = pw(p, REG_CLAMP_HI);
-    let tbp = field(t0, 0u, 14u);
-    let tbw = field(t0, 14u, 6u);
+    var tbp = field(t0, 0u, 14u);
+    var tbw = field(t0, 14u, 6u);
     let psm = field(t0, 20u, 6u);
-    let w = 1 << min(field(t0, 26u, 4u), 10u);
-    let h = 1 << min(field(t0, 30u, 2u) | (field(t1, 0u, 2u) << 2u), 10u);
-    let minu = i32(field(cl, 4u, 10u));
-    let maxu = i32(field(cl, 14u, 10u));
-    let minv = i32(field(cl, 24u, 8u) | (field(ch, 0u, 2u) << 8u));
-    let maxv = i32(field(ch, 2u, 10u));
-    let u = wrap(field(cl, 0u, 2u), uu, i32(w), minu, maxu);
-    let v = wrap(field(cl, 2u, 2u), vv, i32(h), minv, maxv);
+    let wms = field(cl, 0u, 2u);
+    let wmt = field(cl, 2u, 2u);
+    var w = 1 << min(field(t0, 26u, 4u), 10u);
+    var h = 1 << min(field(t0, 30u, 2u) | (field(t1, 0u, 2u) << 2u), 10u);
+    var minu = i32(field(cl, 4u, 10u));
+    var maxu = i32(field(cl, 14u, 10u));
+    var minv = i32(field(cl, 24u, 8u) | (field(ch, 0u, 2u) << 8u));
+    var maxv = i32(field(ch, 2u, 10u));
+    if (level > 0u) {
+        let m = pw(p, MIPS + level - 1u);
+        tbp = field(m, 0u, 14u);
+        tbw = field(m, 14u, 6u);
+        w = max(w >> level, 1);
+        h = max(h >> level, 1);
+        if (wms == 2u) { minu = minu >> level; maxu = maxu >> level; }
+        if (wmt == 2u) { minv = minv >> level; maxv = maxv >> level; }
+    }
+    let u = wrap(wms, uu, i32(w), minu, maxu);
+    let v = wrap(wmt, vv, i32(h), minv, maxv);
     let raw = mem_read(psm, tbp, tbw, u32(u), u32(v));
     let texa = pw(p, REG_TEXA);
     var c: u32;
@@ -343,37 +358,64 @@ fn texel(p: u32, uu: i32, vv: i32) -> vec4<u32> {
     return vec4<u32>(c & 0xFFu, (c >> 8u) & 0xFFu, (c >> 16u) & 0xFFu, c >> 24u);
 }
 
-// Whether a texel at that Q is filtered (bilinear), as TEX1 says: the
-// level of detail decides between the magnifying and the minifying filter.
-fn linear(p: u32, q: f32) -> bool {
+// The level of detail at that Q (TEX1's LCM, L and K; draw.rs's lod).
+fn lod_at(p: u32, q: f32) -> f32 {
     let f = pw(p, REG_FLAGS);
     let k = f32(i32(((f >> 16u) & 0xFFFu) << 20u) >> 20u) / 16.0;
-    var lod = k;
-    if (((f >> 8u) & 1u) == 0u) {
-        lod = log2(1.0 / abs(q)) * f32(1u << ((f >> 9u) & 3u)) + k;
-    }
-    if (lod <= 0.0) { return ((f >> 11u) & 1u) != 0u; }
-    let mmin = (f >> 12u) & 7u;
-    return mmin == 1u || mmin == 4u || mmin == 5u;
+    if (((f >> 8u) & 1u) != 0u) { return k; }
+    return log2(1.0 / abs(q)) * f32(1u << ((f >> 9u) & 3u)) + k;
 }
 
-// The texel at (u, v), filtered or not (draw.rs's sample).
+// The texel at (u, v), filtered or not, from a level or two (draw.rs's
+// sample): the magnifying filter at a level of detail of 0 or less, else
+// the minifying one, and with MMIN 2 to 5 a mipmap: the nearest level
+// (2, 4) or the two around it blended in sixteenths (3, 5), up to MXL.
 fn sample(p: u32, tc: vec3<f32>) -> vec4<u32> {
-    if (!linear(p, tc.z)) {
-        return texel(p, i32(floor(tc.x)), i32(floor(tc.y)));
+    let f = pw(p, REG_FLAGS);
+    let mmin = (f >> 12u) & 7u;
+    let mxl = (f >> 2u) & 7u;
+    let lod = lod_at(p, tc.z);
+    if (lod <= 0.0 || mmin < 2u || mmin > 5u || mxl == 0u) {
+        var linear = mmin == 1u || mmin == 4u || mmin == 5u;
+        if (lod <= 0.0) { linear = ((f >> 11u) & 1u) != 0u; }
+        return sample_level(p, 0u, tc.x, tc.y, linear);
+    }
+    let linear = mmin >= 4u;
+    if ((mmin & 1u) == 0u) {
+        let level = min(i32(floor(lod + 0.5)), i32(mxl));
+        return sample_level(p, u32(level), tc.x, tc.y, linear);
+    }
+    let m = i32(floor(lod));
+    if (m >= i32(mxl)) {
+        return sample_level(p, mxl, tc.x, tc.y, linear);
+    }
+    let w = u32(floor((lod - f32(m)) * 16.0));
+    let near = sample_level(p, u32(m), tc.x, tc.y, linear);
+    let far = sample_level(p, u32(m) + 1u, tc.x, tc.y, linear);
+    return (near * (16u - w) + far * w) >> vec4<u32>(4u);
+}
+
+// The texel at (u, v) (level 0's texels) in a level, point sampled or
+// bilinear (draw.rs's sample_level).
+fn sample_level(p: u32, level: u32, uu: f32, vv: f32, linear: bool) -> vec4<u32> {
+    let scale = f32(1u << level);
+    let u = uu / scale;
+    let v = vv / scale;
+    if (!linear) {
+        return texel(p, level, i32(floor(u)), i32(floor(v)));
     }
     // The four texels around (u - 0.5, v - 0.5), weighted in sixteenths;
     // a hair under a sixteenth counts as on it (draw.rs's SIXTEENTH_SLACK).
-    let fu = i32(floor((tc.x - 0.5) * 16.0 + 0.015625));
-    let fv = i32(floor((tc.y - 0.5) * 16.0 + 0.015625));
+    let fu = i32(floor((u - 0.5) * 16.0 + 0.015625));
+    let fv = i32(floor((v - 0.5) * 16.0 + 0.015625));
     let u0 = fu >> 4u;
     let v0 = fv >> 4u;
     let a = u32(fu & 15);
     let b = u32(fv & 15);
-    let t00 = texel(p, u0, v0);
-    let t10 = texel(p, u0 + 1, v0);
-    let t01 = texel(p, u0, v0 + 1);
-    let t11 = texel(p, u0 + 1, v0 + 1);
+    let t00 = texel(p, level, u0, v0);
+    let t10 = texel(p, level, u0 + 1, v0);
+    let t01 = texel(p, level, u0, v0 + 1);
+    let t11 = texel(p, level, u0 + 1, v0 + 1);
     let top = t00 * (16u - a) + t10 * a;
     let bottom = t01 * (16u - a) + t11 * a;
     return (top * (16u - b) + bottom * b) >> vec4<u32>(8u);

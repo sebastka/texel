@@ -133,6 +133,10 @@ impl Timer {
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct Timers {
     pub t: [Timer; 6],
+    /// Diagnostics, when on: the registers written (timer, register,
+    /// value, count then), the last ones.
+    #[serde(skip)]
+    pub log: Option<Vec<(u8, u8, u32, u64)>>,
 }
 
 impl Timers {
@@ -149,6 +153,11 @@ impl Timers {
             };
             if t.count_ticks(i, ticks) {
                 intc.raise(irq::TIMER[i]);
+                if let Some(log) = &mut self.log
+                    && i != 4
+                {
+                    log.push((i as u8, 0xFF, intc.mask, t.count));
+                }
             }
         }
     }
@@ -178,6 +187,12 @@ impl Timers {
     }
 
     fn write(&mut self, index: usize, reg: u32, v: u32) {
+        if let Some(log) = &mut self.log {
+            if log.len() >= 8000 {
+                log.drain(..4000);
+            }
+            log.push((index as u8, reg as u8, v, self.t[index].count));
+        }
         let t = &mut self.t[index];
         match reg {
             0 => t.count = u64::from(v) % Timer::width(index),
@@ -315,7 +330,7 @@ pub struct IopBus {
     pub usb: crate::usb::Ohci,
     /// IOP cycles into the current second, for the CDVD's clock.
     second_cycles: u64,
-    cache_ctrl: u32,
+    pub cache_ctrl: u32,
     /// Other registers: kept as written.
     regs: BTreeMap<u32, u32>,
     /// The IOP's PC when this instruction started, for diagnostics.
@@ -465,6 +480,12 @@ impl IopBus {
             let mut bytes = [0u8; 4];
             bytes[..N].copy_from_slice(&data);
             let v = u32::from_le_bytes(bytes);
+            if (off & 0x3FF) == 0x1B0
+                && let Some(log) = &mut self.cdvd.read_log
+            {
+                // Diagnostics: a core's ADMAS, among the reads and DMAs.
+                log.push((0xFB, off, v, 0, 0));
+            }
             match N {
                 1 => {}
                 2 => self.spu2.write16(off, v as u16),
@@ -563,6 +584,15 @@ impl IopBus {
             self.dma.ch[ch][reg] = v;
             // A channel starts on a write of its start bit.
             let start = reg == 2 && mask & CHCR_BUSY != 0 && v & CHCR_BUSY != 0;
+            // And stops on a write clearing it: an SPU2 transfer stopped so
+            // (the sound library's sceSdBlockTrans stop) never completes,
+            // and raises no interrupt (Sitting Ducks: its interrupt handler
+            // took one for the end of a half of its looping transfer, and
+            // started the next, keeping the channel busy for good).
+            if reg == 2 && mask & CHCR_BUSY != 0 && v & CHCR_BUSY == 0 && (ch == 4 || ch == 7) {
+                self.dma.pending.retain(|&(c, _)| c != ch);
+                self.dma.adma[usize::from(ch == 7)] = false;
+            }
             if start && (ch == 9 || ch == 10) {
                 self.sif.log_tag(
                     if ch == 9 { "IOP start ch9" } else { "IOP start ch10" },
@@ -602,7 +632,14 @@ impl IopBus {
             0x1F80_1600..0x1F80_1700 => self.usb.write(pa - 0x1F80_1600, v, &mut self.intc),
             // Written 0 to acknowledge.
             0x1F80_1070 => self.intc.stat &= v,
-            0x1F80_1074 => self.intc.mask = v,
+            0x1F80_1074 => {
+                if let Some(log) = &mut self.timers.log
+                    && (self.intc.mask ^ v) & (1 << irq::TIMER[5]) != 0
+                {
+                    log.push((5, 0xFE, v, self.timers.t[5].count));
+                }
+                self.intc.mask = v;
+            }
             0x1F80_1078 => self.intc.ctrl = v & 1,
             0x1F80_10F0 => self.dma.dpcr = v,
             0x1F80_10F4 => self.dma.write(false, v, &mut self.intc),
@@ -924,6 +961,24 @@ mod tests {
         bus.store32(0xBF80_10C0, 0x1000);
         bus.store16(0xBF80_10CA, (CHCR_BUSY >> 16) as u16);
         assert_eq!(bus.dma.ch[4][2], CHCR_BUSY | 0x0201);
+    }
+
+    /// An SPU2 transfer stopped by clearing its start bit never completes:
+    /// no interrupt flag, nothing left pending.
+    #[test]
+    fn a_stopped_spu2_transfer_raises_nothing() {
+        let mut bus = IopBus::new(&[]);
+        // Channel 4's interrupt, and the master enable.
+        bus.store32(0xBF80_10F4, 1 << 20 | 1 << 23);
+        bus.store32(0xBF80_10C0, 0x1000);
+        bus.store32(0xBF80_10C4, 0x00C0_0010);
+        bus.store32(0xBF80_10C8, CHCR_BUSY | 0x0201);
+        assert_eq!(bus.dma.pending.len(), 1);
+        bus.store32(0xBF80_10C8, 0x0201);
+        assert!(bus.dma.pending.is_empty());
+        bus.advance(1_000_000, 0);
+        assert_eq!(bus.dma.dicr & (1 << 28), 0);
+        assert_eq!(bus.dma.ch[4][2] & CHCR_BUSY, 0);
     }
 
     #[test]

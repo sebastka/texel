@@ -27,7 +27,8 @@ pub struct Sif {
     /// Words moved so far: SIF0 (IOP → EE) and SIF1, for diagnostics.
     pub sif0_words: u64,
     pub sif1_words: u64,
-    /// The IOP's register writes, for diagnostics: (offset, value).
+    /// The register writes, for diagnostics, the first 64: (offset, value),
+    /// the EE's with 0x1000 added to the offset.
     #[serde(skip)]
     pub iop_writes: Vec<(u32, u32)>,
     /// Transfer tags, for diagnostics: (who, tag word 0, word 1).
@@ -72,6 +73,10 @@ impl Sif {
     }
 
     pub fn ee_write(&mut self, offset: u32, v: u32) {
+        // In the same log as the IOP's, marked (0x1000 + offset).
+        if self.iop_writes.len() < 64 {
+            self.iop_writes.push((0x1000 | offset, v));
+        }
         match offset {
             0x00 => self.mscom = v,
             // The EE sets its own flags, and clears the IOP's.

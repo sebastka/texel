@@ -106,7 +106,8 @@ pub struct Vif {
     pub tops: u32,
     pub dbf: bool,
     pub mark: u32,
-    code: u32,
+    /// The last VIFcode (the CODE register).
+    pub code: u32,
     pending: Pending,
     /// The words of a quadword for DIRECT, and of a vector for UNPACK.
     buffer: Vec<u32>,

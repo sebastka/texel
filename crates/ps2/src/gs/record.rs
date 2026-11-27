@@ -38,6 +38,9 @@ pub struct DrawRegs {
     pub xyoffset: u64,
     pub tex0: u64,
     pub tex1: u64,
+    /// Mipmap levels 1 to 3, and 4 to 6.
+    pub miptbp1: u64,
+    pub miptbp2: u64,
     pub clamp: u64,
     pub fba: u64,
     pub texa: u64,
@@ -106,6 +109,8 @@ impl Gs {
             xyoffset: r[reg::XYOFFSET_1 as usize + c],
             tex0: r[reg::TEX0_1 as usize + c],
             tex1: r[reg::TEX1_1 as usize + c],
+            miptbp1: r[reg::MIPTBP1_1 as usize + c],
+            miptbp2: r[reg::MIPTBP2_1 as usize + c],
             clamp: r[reg::CLAMP_1 as usize + c],
             fba: r[reg::FBA_1 as usize + c],
             texa: r[reg::TEXA as usize],

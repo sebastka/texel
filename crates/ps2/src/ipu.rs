@@ -88,6 +88,24 @@ impl Bits<'_> {
         Ok((w >> (128 - n)) as u32)
     }
 
+    /// The next `n` bits as `peek`, but when fewer are there (the end of
+    /// what was sent), those there, followed by zeros: the bits and how
+    /// many are real.
+    fn peek_partial(&mut self, n: u32) -> Step<(u32, u32)> {
+        match self.peek(n) {
+            Err(Halt::Stall) => {
+                let have = (self.input.len() as u64 * 128)
+                    .saturating_sub(self.pos)
+                    .min(u64::from(n)) as u32;
+                if have == 0 {
+                    return Err(Halt::Stall);
+                }
+                Ok((self.peek(have)? << (n - have), have))
+            }
+            other => other.map(|v| (v, n)),
+        }
+    }
+
     fn skip(&mut self, n: u32) -> Step<()> {
         self.ensure(n)?;
         self.pos += u64::from(n);
@@ -134,9 +152,16 @@ impl Vlc {
         Self { bits, table }
     }
 
-    /// The next code's value (None: no code there).
+    /// The next code's value (None: no code there). A code needs only its
+    /// own bits: one at the very end of what was sent decodes without
+    /// waiting for more (Sitting Ducks' movies end a transfer on a short
+    /// code, and send the next only once the macroblock is out).
     fn read(&self, b: &mut Bits) -> Step<Option<(i32, u32)>> {
-        let (len, value) = self.table[b.peek(self.bits)? as usize];
+        let (bits, have) = b.peek_partial(self.bits)?;
+        let (len, value) = self.table[bits as usize];
+        if (len == 0 && have < self.bits) || u32::from(len) > have {
+            return Err(Halt::Stall);
+        }
         if len == 0 {
             return Ok(None);
         }
@@ -766,6 +791,11 @@ impl Ipu {
         self.job.is_some()
     }
 
+    /// The command under way (its code and options), for diagnostics.
+    pub fn command(&self) -> Option<(u32, u32)> {
+        self.job.as_ref().map(|j| (j.code, j.opt))
+    }
+
     /// Quadwords of input not read yet (a partly read one included).
     fn left(&self) -> usize {
         self.input
@@ -1307,16 +1337,24 @@ fn idec(dec: &mut Decoder, b: &mut Bits, job: &mut Job, out: &mut Vec<u8>) -> St
     }
     let t = tables();
     if job.count > 0 {
-        // A start code ends the slice.
+        // A start code ends the slice; it is byte aligned, after the zero
+        // bits filling the last byte, and decoding stops at its start (the
+        // next command skips it from there: Killzone's bonus disc decodes
+        // its menu's background a slice at a time, each slice's position
+        // taken from where the last one stopped).
         if b.peek(23)? == 0 {
+            let fill = ((8 - b.pos % 8) % 8) as u32;
+            b.skip(fill)?;
             dec.ctrl |= CTRL_SCD;
             return Ok(true);
         }
+        // Each macroblock after the first follows the one before (an
+        // increment of 1): anything else ends the slice as an error.
         loop {
             match t.mbai.read(b)? {
                 Some((MBAI_ESCAPE | MBAI_STUFFING, _)) => continue,
-                Some(_) => break,
-                None => return Err(Halt::Error),
+                Some((1, _)) => break,
+                _ => return Err(Halt::Error),
             }
         }
     }

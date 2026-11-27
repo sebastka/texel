@@ -131,7 +131,7 @@ Controllers come from the keyboard and the Gamepad API (`input.ts`, `gamepad.ts`
 | SPU2 | Two cores of 24 voices (the PS1's SPU's), sound memory, DMA, reverb (D33) |
 | SIO2 | Controllers (DualShock 2, pressure-sensitive buttons included, D71) and memory cards (8 MiB, with ECC; formatted by the server) (D32) |
 | Save states | The whole machine, GS memory included (read back from the GPU) (D34) |
-| Missing | Pressures in between (a button is pressed fully or not), the IOP's reboot into a game's DNAS image (Jak X), the DVD player, arcade boards, cycle-accurate timing, speed: Jak's jungle runs at about 16 frames per second (of 50) |
+| Missing | Pressures in between (a button is pressed fully or not), the DVD player, arcade boards, cycle-accurate timing, speed: Jak's jungle runs at about 16 frames per second (of 50) |
 
 Determinism matters throughout: save states, netplay and the compilers' checks (a compiled and an interpreted machine must reach the same state) need a run to go the same way each time. VU1's worker syncs at points that depend on the EE's side only, so a machine with the worker and one without go the same way (D57).
 
@@ -167,19 +167,33 @@ It prints what the BIOS kernel writes to its debug port (its start-up log) and w
 | `LOAD=state`, `SAVE=state` | Start from a save state; save one at the end |
 | `PRESS="16:cross,20.5:start"` | Hold buttons for 0.2 s from a time (seconds of console time) |
 | `SHOTS=dir` | The displayed frame every second (PPM) |
-| `NOGFX=1` | Draw nothing (faster) |
+| `NOGFX=1` | Draw nothing, nor write GS memory (faster: `TEXDUMP` and the like then show nothing) |
 | `VU1THREAD=1` | VU1 in a thread of its own |
 | `WAV=out.wav` | The sound |
 | `DUMP=1` | The busy loops' instructions and the EE's registers |
 | `EXC=1`, `EEREGS=1`, `IOPREGS=1`, `TLB=1` | The EE's last exceptions and system calls; registers; the TLB |
 | `SYSCALLS=1` | Every EE system call of the run, by number and address: how many, the last `a0`, how long ago the last was |
 | `IOPCALLS=1` | Every call the IOP's modules make through their linked imports, by library, function number and caller: how many, the last `a0`, how long ago |
+| `IOPTRACE=from,to` (hex) | With `IOPCALLS`: the last 20000 calls from callers in that range, in order, with `a0`, `a1` and `sp` (which tells the IOP's threads apart) |
+| `IOPPCS=1` | With `IOPCALLS`: the IOP's instructions run over the run, by 256-byte page (the runner always prints how busy the IOP was: its idle loop's time passes without running it) |
+| `TIMERLOG=1` | The IOP timers' register writes, the last ones, with the count then; for timers other than 4, the interrupts they raise (`FF`, with INTC's mask) and changes of timer 5's mask bit (`FE`) |
+| `ARGLOG=hex` | Each (`ra`, `a0`-`a3`) an EE instruction ran with, and how often (a function's callers and arguments) |
+| `TEXSNAP=TEX0` (hex) | That texture as the first draw with it samples it (level 0, CLUT applied): `texsnap.ppm`, and its alpha `texsnap_alpha.pgm` |
+| `NOSAMPLE=1` | Skips the samples of where the CPUs spend their time at the end (they run each CPU alone, without timers): memory dumps then show the state the run ended in |
 | `IOPRAM=path` | The IOP's memory at the end, saved there |
-| `PROBE=x,y` | The triangles and sprites the software GS drew over that pixel (window coordinates): vertices (x, y, z, RGBA), PRIM, TEX0, FRAME, ALPHA, TEST |
+| `EERAM=path` | The EE's memory at the end, saved there |
+| `PADLOG=1` | The controllers' commands other than polls (the first 500), with their replies |
+| `BREAKRAM=path` | With `BREAK`: the EE's memory when that instruction first runs, saved there |
+| `EIELOG=1` | Each change of Status.EIE (by MTC0, EI or DI), and the instruction making it |
+| (IPU) | When the IPU waits at the end: the command, its FIFO counts and the IPU's two DMA channels |
+| `PCCOUNT=path` | How many times each EE instruction ran (interpreter), saved there |
+| `PROBE=x,y` | The triangles, sprites and points the software GS drew over that pixel (window coordinates): vertices (x, y, z, RGBA, fog), PRIM, TEX0, FRAME, ALPHA, TEST, FOGCOL |
 | `KICKJUMP=hex` | With `DRAWS`: shows (as bad packets) VU1 packets where a vertex is further than that (12.4 fixed point) from the one before it |
 | `ADDRWATCH=from,to` (hex) | The EE instructions (or DMA channels, `DA00000n`) storing into that range |
 | `READWATCH=hex` | The EE's 32-bit loads of that address, by instruction: how many, the last value, the bits ever set |
 | `SPU2=1` | The SPU2's cores at the end (ATTR, IRQA, ENDX, STATX) and their playing voices |
+| `GSREG=hex` | The values written to that GS register, how many times each, in the order first seen |
+| `GIFTAGS=1` | The GIF tags seen, by path (without their loop count), how many times each |
 | `VU1MEM=from,to` (hex, quadwords) | VU1's data memory there, at the end |
 | `TRACEMEM=from,to` (hex, quadwords) | With `PROG`: VU1's data memory there as each traced run starts |
 | `PACKETS=1`, `TAGS=1` | The SIF's commands and DMA tags |
@@ -188,7 +202,7 @@ It prints what the BIOS kernel writes to its debug port (its start-up log) and w
 | `DRAWS=frames` | What the GS was asked to draw over that many more frames, and the writes of FRAME, XYOFFSET, TEX0 and TEX2 by GIF path |
 | `PROG=hex`, `FINDXY=x,y` | VU1's runs from there; which GIF path sent a vertex |
 | `VIFWATCH=from,to` | VIF1's UNPACKs writing VU1 memory there (quadwords, hex), their vectors, and the programs started |
-| `CDVDREADS=1` | Every drive command, in order with the drive's DMA, the SIF0 transfers and the SPU2's DMA |
+| `CDVDREADS=1` | Every drive command, in order with the drive's DMA, the SIF0 transfers, the SPU2's DMA and its cores' ADMAS writes (after a state loads too) |
 | `IPUTRACE=path`, `IPUWATCH=hex,…` | The IPU's input stream (`path.bin`), its commands with their bits and frames (`path.txt`), and channel 4's sources, tags, starts and stops, with the IPU's commands, each with the EE instruction that wrote it (`path.src`), and the writes to those lines of 64 bytes |
 | `TRANSFERS=1`, `DRAWSTATE=1` (with `DRAWS`) | The GS's transfers from the start, in order (destination, format, size, how much data was not zero, its EE address); the draws by state (kind, TEX0, TEX1, ALPHA, TEST, FRAME), with their first vertices |
 | `VALUEWATCH=hex` | The EE instructions storing that 32-bit value, and where |

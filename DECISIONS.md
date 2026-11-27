@@ -768,3 +768,100 @@ Yetisports and Burnout 3 stopped once RenderWare Audio (RWA.IRX) was loaded, bla
 - **Not in save states** (their format is positional): the position in the areas starts again at 0 when one is loaded, which only shifts the next lap.
 - **Yetisports** now shows its logos, title, memory card check and its EyeToy error (no camera: the game needs one).
 - **Found with** the runner's `IOPCALLS` (RWA set IRQA to 0x400 and installed an SPU2 interrupt handler; libsd's export numbers) and `SPU2=1` (the cores' ATTR, IRQA, ENDX, STATX and playing voices).
+
+## D96. The VIFs' CODE register
+
+Batman: Vengeance and Driver: Parallel Lines stayed black. Batman's interrupt handler lifts VIF1's stall (STC, D91), and counts a frame done, only when VIF1 is stalled, VIF1_CODE is its own marker (0x80800001: a NOP with its IRQ bit) and the GIF is idle; Parallel Lines reads VIF1_CODE all the time too. CODE read 0.
+
+- **CODE** (VIF0 at 0x10003880, VIF1 at 0x10003C80): the last VIFcode, as the VIF took it (the one it stalls after, with its IRQ bit).
+- **Batman: Vengeance** now shows its logos, language choice, title, name entry and main menu; **Driver: Parallel Lines** its intro movie, language choice and memory card dialog.
+- **Found with** `ADDRWATCH` on the counters Batman's main loop waits on, then the code incrementing one; `READWATCH=10003c80` shows Parallel Lines' reads.
+
+## D97. A GIF tag's PRIM field, in PACKED mode only
+
+TOCA Race Driver 2's dialog text was a dot per character. Its text goes through path 2 in REGLIST packets: one sets PRIM (a textured sprite) and RGBAQ, the next sends each glyph's ST and XYZ2, with its tag's PRE bit set and a PRIM field of 0. The tag's PRIM went to PRIM, so every glyph was drawn as a point.
+
+- **PRE applies to PACKED only**: in REGLIST and IMAGE mode the tag's PRIM field is ignored; PRIM keeps what the register list wrote.
+- **TOCA Race Driver 2** now shows its memory card dialog's text and buttons.
+- **Found with** the runner's `PROBE` (the dot was a point, PRIM 0: `PROBE` now records points too), `GSREG=0` (PRIM's values: 0x56 and 0, 14 times each) and `GIFTAGS=1` (the tags, by path).
+
+## D98. The EE's performance counters count
+
+Spyro: Enter the Dragonfly stayed black after its first loading screen: its main loop ran, drew its logos and legal text, and covered them with a fade sprite whose alpha never moved. Its fade advances by the frame's time step, and that step was 0: the game times its frames with the EE's performance counter PCR0 (MFPC), set up to count processor cycles (PCCR 0x80082036), and our counters only kept what was written to them.
+
+- **PCR0 and PCR1** count, while PCCR's CTE bit is set, their event in the modes PCCR enables for each (EXL, kernel, supervisor, user; the counter's mode bits against Status at the time the cycles are counted).
+- **Events**: processor cycles (1), and completed instructions (12, 13) as cycles, the EE here running one instruction a cycle; the others (issue details, cache and TLB misses, bus events) are not modelled and do not count. 16 is no event.
+- **No overflow exception**: the counters wrap at 32 bits; none of the games looked at relies on the exception.
+- **Spyro: Enter the Dragonfly** now shows its logos, legal screen, language choice and loading screens.
+- **Found with** the runner's new `PCCOUNT=path` (how many times each EE instruction ran, to find the per-frame code) and `EERAM=path` (the EE's memory), `ADDRWATCH` on the fade sprite's alpha in its packet, then the fade object's fields (time left 2.5 s, rate -0.2 a second) and the global step (0.0). A patch known among emulator users for this game forces one of its functions' results instead.
+
+## D99. The DualShock 2 says what it can send
+
+MTV Pimp My Ride: Street Racing said "The Analog Controller (DUALSHOCK 2) is not detected" and would not go on. It asks the controller which of the poll's bytes it can send (command 0x41) before choosing any; ours answered with the bytes chosen so far (the buttons and sticks, 0x3F), which is what a DualShock without pressures says.
+
+- **0x41, in analog mode**: all the bytes the controller can send (`FF FF 03`, then `00 00 5A`): the buttons, the sticks and the twelve pressures, whatever 0x4F chose. In digital mode, zeros as before.
+- **0x44 keeps pressure mode when it keeps analog mode** (this refines D71): setting analog mode again (the game does, unlocked, after choosing the pressures) leaves the mask as it was; going to digital mode, or the Analog button, still ends it.
+- **MTV Pimp My Ride** now checks the memory card and asks whether to go on without one; its polls are in pressure mode (0x79).
+- **Found with** the runner's new `PADLOG=1` (the controllers' commands other than polls, in order): the game configured the controller three times, the third time without asking for pressures.
+
+## D100. A stopped SPU2 transfer completes nothing
+
+Sitting Ducks stopped on its second logo movie (LSF): the IPU waited for data the disc no longer sent. Its sound driver (ZnaSnd) plays a movie's sound with libsd's looping block transfer (sceSdBlockTrans, auto-DMA on core 0): between two movies it stops it (clearing DMA channel 4's start bit, ATTR's transfer mode and ADMAS), then starts it again. The stopped transfer still completed here: its pending completion (or the auto-DMA's) raised channel 4's interrupt, libsd's handler took it for the end of a half of its loop and started the next (as an ordinary transfer now, ADMAS being 0), and so on: channel 4 was always busy, libsd refused the new loop (it checks the channel first), the movie's sound never drained, its demuxer stopped reading, and the video starved.
+
+- **Clearing a SPU2 channel's start bit** (4 or 7) stops it: its pending completion and auto-DMA are dropped, and no interrupt comes, as with a console's DMA controller stopped by software.
+- **Also**: the IPU's variable-length codes decode from the last bits sent (a code is complete once its own bits are there; a lookup no longer waits for a table's longest code length beyond the end of a transfer), which removed the first of the stalls seen while finding this.
+- **Sitting Ducks** now plays its logo movies, loads and shows its title and memory card question.
+- **Found with** the runner's IPU line (the command the IPU waits in, its FIFO and both IPU DMA channels), `CDVDREADS=1` (now also after a state is loaded, with ADMAS writes among the reads and SPU2 transfers), `IOPCALLS=1` (libsd's block transfer calls: stop, stop, start, then its status polled for good) and the libsd code itself: its start returns -1 while channel 4 is busy.
+
+## D101. IDEC stops at its start code's byte
+
+Killzone's bonus disc showed GS memory where its menu's background belongs: it decodes the background with IDEC a slice at a time (BCLR to where the last slice ended, FDEC, IDEC, FDEC over the next start code), and 440 of its 454 IDECs failed.
+
+- **The end of a slice**: IDEC found the start code as soon as 23 zero bits followed the last block, and stopped there, up to 7 bits before the start code's byte (the bits filling the last byte are zeros). The console's IPU stops at the start code itself, byte aligned (the EE User's Manual's IDEC notes); the game takes its next slice's position from there, so every slice after the first started a few bits early.
+- **Also from the manual**: after the first macroblock, an address increment other than 1 ends the slice as an error.
+- **Killzone's bonus disc** now shows its menu's background.
+- **Found with** `IPUTRACE` (each IDEC's first bits: a macroblock type where a slice should start, but not always) and the IPU's chapter of Sony's EE User's Manual.
+
+## D102. DI lands an instruction late
+
+Jak X hung at boot, EELOAD waiting forever for an IOP that never got its reset. Its loader resets the IOP to ROM (leaving the EE's record of the IOP's command buffer at 0, as it does) and starts the game's decompressed boot program with ExecPS2. That program aborted at once ("dkernel: HookOrDie() error ... aborting", Exit(0x7F)), the kernel went back to EELOAD to start the system menu, and EELOAD's IOP reset went to address 0. HookOrDie refuses to run with Status.EIE clear, and the program's start-up code only enables interrupts after it: it relies on starting with EIE set.
+
+- **The kernel's return to a new program** (after ExecPS2) runs `di`, then reads Status, sets its low bits and writes it back, then `eret`. With DI's write landing at once, the program started with EIE clear. On a console, DI's write lands after the next instruction: that instruction (the read of Status) still sees EIE set, and the write-back keeps it.
+- **DI** now clears EIE after the next instruction (when allowed: kernel mode, an exception level, or EDI). That instruction always runs in the interpreter (compiled blocks stop after a DI and are not entered while one is pending), so compiled and interpreted code agree.
+- **Jak X** now shows its publisher screen, language choice and Dolby screen; it then waits (its intro movie, next).
+- **Found with** PCSX2 as a reference, run headless (its console output: the boot program talked to the IOP before EELOAD reset it), the runner's `BREAKRAM` (the EE's memory when `BREAK` is reached), `EIELOG` (each change of Status.EIE and the instruction making it), `SYSCALLS` (now with a1), and a throwaway experiment (keeping EIE at that one `di` let the game boot). PCSX2's recompiler delays DI by one instruction too, for the same games.
+
+## D103. The IOP takes a cycle an instruction
+
+Jak X went black after its Dolby screen and stayed so: its game loop asked the IOP to queue the "thx-intro" stream every frame, and the stream's first reads never came. Its sound and file module (OVERLRD2) had stopped mid-load: the ISO thread (priority 55) sat ready after a 200 µs `DelayThread` whose alarm had fired, and never ran again. The IOP was busy all the time with higher priorities: the game polls the controllers through DBCMAN's RPC server (priority 20) about 1,650 times a second while it waits, and the SIF's interrupts and commands of that traffic took the IOP's every cycle.
+
+- **The IOP's time** was counted with the PlayStation's memory waits (5 cycles a load from RAM, 8 an instruction cache fill), about 4.3 cycles an instruction in the IOP kernel's interrupt paths. It is now one cycle an instruction, close to how PCSX2 counts it (Jak X plays there); the PlayStation keeps its own timing (`Cpu::step` still returns it). The PS2's IOP memory timings are not documented in what we have; the survey decides.
+- **Jak X** now plays the THX logo and its intro movie (the IOP is busy 59% of the time over its first 70 s).
+- **Found with** the runner's new `ARGLOG` (sceSifCallRpc's callers and arguments: the clients, their servers, the commands), `IOPTRACE` (the IOP's calls in order, by thread: the ISO thread's last `DelayThread`), `TIMERLOG` (the alarm's interrupt was raised and handled), `NOSAMPLE` (the IOP kernel's thread and alarm lists as the run ended: the ISO thread ready, the ready priorities' bitmap) and `IOPPCS` (no idle time left), and OpenGOAL's Jak 3 overlord (for how its stream requests become reads).
+
+## D104. A normal-mode DMA with no quadwords moves 0x10000
+
+Kya stopped on its publisher's logo movie: the movie faded out and the picture stayed. Its player feeds the IPU from a ring buffer, rounding what is left up to a quadword, and ends each movie with an FDEC of 32 bits past the stream's end code, which needs 32 more bits in the IPU. Of the five logo movies on the disc, the video streams of two (EDEN1 and EDEN3, the one played) are a whole number of quadwords long: nothing follows the end code. The player then starts channel 4 in normal mode with QWC 0, again and again; the channel did nothing, and the FDEC waited for ever.
+
+- **On a console** (PCSX2's notes, from hardware tests; Sony's manual only says the transfer is unsuccessful), a channel started in normal mode with QWC 0 moves a quadword, its count wraps round to 0xFFFF, and it moves those too: 0x10000 in all. The ring's old contents reach the IPU, the FDEC ends, and the player stops the movie.
+- **Channels** other than the SIF's (whose transfers here always read tags at QWC 0) now do so; QWC reads back as 16 bits.
+- **Kya** now goes on to its title, menu and intro movie.
+- **Found with** `IPUTRACE` (the stream's end), the movies demuxed from the disc (each video stream's length), PCSX2 headless (its console showed the movie ending) and its source (for the hardware's behaviour).
+
+## D105. The GS draws mipmaps
+
+The GS only ever sampled a texture's level 0: TEX1's MXL, MMIN's mipmap modes and the MIPTBP registers were ignored. Kya's menu (and many 3D scenes) draw with mipmaps: far textures sampled at level 0 alias badly.
+
+- **The level of detail** (TEX1: `(log2(1/Q) << L) + K`, or K alone with LCM) chooses, as Sony's GS User's Manual describes: 0 or less, level 0 with the magnifying filter (MMAG); above, with MMIN 0 or 1, level 0 with the minifying filter; with MMIN 2 or 4, the nearest level (rounded), point or bilinear; with MMIN 3 or 5, levels m and m+1 blended by the LOD's fraction (in sixteenths, as bilinear weights), up to MXL.
+- **Levels 1 to 6** take their base pointers and buffer widths from MIPTBP1 and MIPTBP2 (per context), half the size each, with the region clamp's bounds halved too. With TEX1's MTBA, writing TEX0 lays out levels 1 to 3 after level 0 (the manual's automatic base pointers, checked against its example).
+- **Both GSes**: the software one and the GPU one (gs.wgsl; a primitive takes 72 words now, the levels' pointers in words 64 to 69, MXL in the flags), equal on all four mipmap modes (`mipmapped_triangles`). The GPU GS's dependency tracking counts all the levels' memory as read.
+- **Kya's menu** is still wrong (stripes over its background): something else, open. Ruled out since: the depth test, the CLUT's timing, the VU's flag and division timing, the EFU (D106), the textures (right as drawn, `TEXSNAP`).
+
+## D106. The EFU's results land in P after their latency
+
+The VU's elementary function unit (ESADD to EEXP) put its result in P at once. In Sony's VU User's Manual, P has no interlock: each operation's result lands after its latency (ESADD 11 cycles; ERCPR, ESQRT and ESUM 12; ERSADD, ELENG and ERSQRT 18; ERLENG 24; ESIN 29; EEXP 44; the EATANs 54), an MFP before then reads the P before (the manual's WAITP example), WAITP waits for it, and a new EFU operation waits for the one under way.
+
+- **P's pending result** now lands when its cycle comes (the interpreter's cycle count, stalls included, as for Q), at WAITP, at the next EFU operation, or when the program ends (so none outlives a program, nor goes into a save state).
+- **The VU compiler** leaves MFP to the interpreter now, as it did the EFU and WAITP.
+- **Found** looking into Kya's menu (not its cause).
+

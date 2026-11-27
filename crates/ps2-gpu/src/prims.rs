@@ -6,7 +6,7 @@
 
 use texel_ps2::gs::{DrawRegs, Vertex};
 
-pub const PRIM_WORDS: usize = 64;
+pub const PRIM_WORDS: usize = 72;
 
 const KIND_RECT: u32 = 0;
 const KIND_TRIANGLE: u32 = 1;
@@ -107,15 +107,23 @@ fn registers(
     words[59] = r.texa as u32;
     words[60] = field(r.texa, 32, 8);
     words[61] = r.fogcol as u32;
-    // Flags: FBA, COLCLAMP; TEX1's LCM, L, MMAG, MMIN and K, for filtering.
+    // Flags: FBA, COLCLAMP; TEX1's MXL, LCM, L, MMAG, MMIN and K, for
+    // filtering and mipmaps.
     words[62] = field(r.fba, 0, 1)
         | (field(r.colclamp, 0, 1) << 1)
+        | (field(r.tex1, 2, 3).min(6) << 2)
         | (field(r.tex1, 0, 1) << 8)
         | (field(r.tex1, 19, 2) << 9)
         | (field(r.tex1, 5, 1) << 11)
         | (field(r.tex1, 6, 3) << 12)
         | (field(r.tex1, 32, 12) << 16);
     words[63] = clut;
+    // Mipmap levels 1 to 6: base pointer, and buffer width from bit 14.
+    for (i, miptbp) in [r.miptbp1, r.miptbp2].into_iter().enumerate() {
+        for j in 0..3 {
+            words[64 + 3 * i + j] = field(miptbp, 20 * j as u32, 20);
+        }
+    }
     // Frame and depth buffers: whole pages, down to the last row drawn.
     let rows = (y1.max(1) as u32).div_ceil(32);
     let fbp = field(r.frame, 0, 9) * 2048;
@@ -145,10 +153,22 @@ fn registers(
         let w = 1u32 << field(r.tex0, 26, 4).min(10);
         let h = 1u32 << field(r.tex0, 30, 4).min(10);
         // Whole pages too: the layouts spread a texture over its pages.
-        let words = (w * h * bits / 32).div_ceil(2048) * 2048;
+        let size = |w: u32, h: u32| (w * h * bits / 32).div_ceil(2048).max(1) * 2048;
+        let (mut start, mut end) = (tbp, tbp + size(w, h));
+        // With mipmaps, the levels drawn from too (all the memory from
+        // the lowest to the highest).
+        let mxl = field(r.tex1, 2, 3).min(6);
+        if (2..=5).contains(&field(r.tex1, 6, 3)) && mxl > 0 {
+            for level in 1..=mxl {
+                let miptbp = if level <= 3 { r.miptbp1 } else { r.miptbp2 };
+                let at = field(miptbp, 20 * ((level - 1) % 3), 14) * 64;
+                start = start.min(at);
+                end = end.max(at + size((w >> level).max(1), (h >> level).max(1)));
+            }
+        }
         Region {
-            start: tbp,
-            end: tbp + words.max(2048),
+            start,
+            end,
             layout: r.tex0 as u32,
         }
     });

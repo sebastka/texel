@@ -49,7 +49,7 @@ pub struct DualShock2 {
     #[serde(skip, default = "analog_mask")]
     pub mask: u32,
     /// The mode the mask was set in: leaving it (the Analog button, or
-    /// command 0x44) goes back to the DualShock's bytes.
+    /// command 0x44 to digital) goes back to the DualShock's bytes.
     #[serde(skip)]
     analog: bool,
     #[serde(skip)]
@@ -145,11 +145,14 @@ impl DualShock2 {
     fn config_data(&self, i: usize) -> u8 {
         let table = match self.command {
             0x40 => [0x00, 0x00, 0x02, 0x00, 0x00, 0x5A],
-            // The bytes polls send, in analog mode.
+            // The bytes polls can send, in analog mode: all of them,
+            // pressures included, whatever the mask (games tell a
+            // DualShock 2 from a DualShock by this: MTV Pimp My Ride asks
+            // before choosing any, and refuses a controller without).
             0x41 if self.pad.analog => [
-                self.mask as u8,
-                (self.mask >> 8) as u8,
-                (self.mask >> 16) as u8,
+                FULL_MASK as u8,
+                (FULL_MASK >> 8) as u8,
+                (FULL_MASK >> 16) as u8,
                 0x00,
                 0x00,
                 0x5A,
@@ -174,10 +177,10 @@ impl DualShock2 {
             self.command = v;
             self.params = [0; 3];
             self.own_config = self.pad.in_config();
-            // Setting the mode (analog or digital) ends pressure mode.
-            if self.own_config && v == 0x44 {
-                self.mask = ANALOG_MASK;
-            }
+            // Setting the mode (0x44) ends pressure mode only by leaving
+            // analog mode (seen at the next exchange, above): setting
+            // analog mode again keeps it (MTV Pimp My Ride sets it,
+            // unlocked, after asking for the pressures, and wants them).
             self.own = if self.own_config {
                 matches!(v, 0x40 | 0x41 | 0x4F)
             } else {
@@ -234,10 +237,10 @@ mod tests {
     fn pressures_once_asked_for() {
         let mut pad = DualShock2::new(true);
         analog_and_locked(&mut pad);
-        // What polls send: the buttons and sticks.
+        // What polls can send: the buttons, the sticks and the pressures.
         assert_eq!(
             command(&mut pad, &[0x01, 0x41, 0, 0, 0, 0, 0, 0, 0]),
-            [0xFF, 0xF3, 0x5A, 0x3F, 0x00, 0x00, 0x00, 0x00, 0x5A]
+            [0xFF, 0xF3, 0x5A, 0xFF, 0xFF, 0x03, 0x00, 0x00, 0x5A]
         );
         // Everything, then out of configuration.
         command(&mut pad, &[0x01, 0x4F, 0, 0xFF, 0xFF, 0x03, 0, 0, 0]);
@@ -279,6 +282,31 @@ mod tests {
         poll.resize(3 + 18, 0);
         command(&mut pad, &poll);
         assert_eq!(pad.rumble, (0xFF, 0x80));
+    }
+
+    #[test]
+    fn setting_analog_mode_again_keeps_pressures() {
+        let mut pad = DualShock2::new(true);
+        analog_and_locked(&mut pad);
+        command(&mut pad, &[0x01, 0x4F, 0, 0xFF, 0xFF, 0x03, 0, 0, 0]);
+        // Analog again, unlocked, in the same configuration session.
+        command(&mut pad, &[0x01, 0x44, 0, 1, 0, 0, 0, 0, 0]);
+        command(&mut pad, &[0x01, 0x43, 0, 0, 0, 0, 0, 0, 0]);
+        let mut poll = vec![0x01, 0x42, 0];
+        poll.resize(3 + 18, 0);
+        assert_eq!(command(&mut pad, &poll)[1], 0x79);
+        // To digital: the pressures end.
+        command(
+            &mut pad,
+            &[0x01, 0x43, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        );
+        command(&mut pad, &[0x01, 0x44, 0, 0, 0, 0, 0, 0, 0]);
+        command(&mut pad, &[0x01, 0x43, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(command(&mut pad, &[0x01, 0x42, 0, 0, 0])[1], 0x41);
+        command(&mut pad, &[0x01, 0x43, 0, 1, 0]);
+        command(&mut pad, &[0x01, 0x44, 0, 1, 0, 0, 0, 0, 0]);
+        command(&mut pad, &[0x01, 0x43, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(command(&mut pad, &[0x01, 0x42, 0, 0, 0, 0, 0, 0, 0])[1], 0x73);
     }
 
     #[test]

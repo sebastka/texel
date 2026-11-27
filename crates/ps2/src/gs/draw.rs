@@ -30,12 +30,21 @@ struct Texture {
     aem: bool,
     /// TEX1: the level of detail from K alone (LCM), or from Q, L and K;
     /// bilinear filtering when magnifying (MMAG) and when minifying (MMIN
-    /// 1, 4 or 5: the base level only, mipmaps not drawn).
+    /// 1, 4 or 5); MMIN 2 to 5 draw mipmaps, up to level MXL.
     lcm: bool,
     l: u32,
     k: f64,
     mag_linear: bool,
     min_linear: bool,
+    mmin: u32,
+    mxl: u32,
+    /// Levels 1 to 6: base pointer and buffer width (MIPTBP1, MIPTBP2).
+    mips: [(u32, u32); 6],
+}
+
+/// MIPTBP1 or MIPTBP2's three levels: base pointer and buffer width.
+pub(super) fn mip_levels(r: u64) -> [(u32, u32); 3] {
+    std::array::from_fn(|i| (field(r, 20 * i as u32, 14), field(r, 20 * i as u32 + 14, 6)))
 }
 
 /// Bilinear filtering's weights are sixteenths of a texel: coordinates
@@ -126,6 +135,13 @@ impl Gs {
                 k,
                 mag_linear: field(t1, 5, 1) != 0,
                 min_linear: matches!(field(t1, 6, 3), 1 | 4 | 5),
+                mmin: field(t1, 6, 3),
+                mxl: field(t1, 2, 3).min(6),
+                mips: {
+                    let a = mip_levels(r[reg::MIPTBP1_1 as usize + c]);
+                    let b = mip_levels(r[reg::MIPTBP2_1 as usize + c]);
+                    [a[0], a[1], a[2], b[0], b[1], b[2]]
+                },
             }
         });
         Env {
@@ -170,6 +186,20 @@ impl Gs {
 
     pub(super) fn draw(&mut self, kind: u32, v: &[Vertex]) {
         let env = self.env();
+        if let Some((want, None)) = &self.tex_snap
+            && let Some(tex) = &env.tex
+            && self.regs[reg::TEX0_1 as usize + field(self.regs[reg::PRIM as usize], 9, 1) as usize] == *want
+        {
+            let texels = (0..tex.h)
+                .flat_map(|y| (0..tex.w).map(move |x| (x, y)))
+                .map(|(x, y)| {
+                    let [r, g, b, a] = self.texel(tex, 0, x, y);
+                    r | g << 8 | b << 16 | a << 24
+                })
+                .collect();
+            let want = *want;
+            self.tex_snap = Some((want, Some((tex.w as u32, tex.h as u32, texels))));
+        }
         match kind {
             0 => self.draw_point(&env, &v[0]),
             1 | 2 => self.draw_line(&env, &v[0], &v[1]),
@@ -183,6 +213,25 @@ impl Gs {
     fn draw_point(&mut self, e: &Env, v: &Vertex) {
         let x = (v.x as i32 - e.ofx + 8) >> 4;
         let y = (v.y as i32 - e.ofy + 8) >> 4;
+        if let Some((at, hits)) = &mut self.probe
+            && *at == (x, y)
+            && hits.len() < 4096
+        {
+            let r = |k: u8| self.regs[usize::from(k)];
+            let regs = [
+                r(reg::PRIM),
+                r(reg::TEX0_1),
+                r(reg::TEX0_2),
+                r(reg::FRAME_1),
+                r(reg::FRAME_1 + 1),
+                r(reg::ALPHA_1),
+                r(reg::TEST_1),
+                r(reg::FOGCOL),
+            ];
+            let vertex = [v.x, v.y, v.z, u32::from_le_bytes(v.rgba), u32::from(v.fog)];
+            // A point: its vertex, three times.
+            hits.push(([vertex; 3], regs));
+        }
         let tc = self.texcoord(
             e,
             f64::from(v.s),
@@ -265,8 +314,9 @@ impl Gs {
                 r(reg::FRAME_1 + 1),
                 r(reg::ALPHA_1),
                 r(reg::TEST_1),
+                r(reg::FOGCOL),
             ];
-            let vertex = |p: &Vertex| [p.x, p.y, p.z, u32::from_le_bytes(p.rgba)];
+            let vertex = |p: &Vertex| [p.x, p.y, p.z, u32::from_le_bytes(p.rgba), u32::from(p.fog)];
             // A sprite: its two corners, the second again.
             hits.push(([vertex(a), vertex(b), vertex(b)], regs));
         }
@@ -338,8 +388,9 @@ impl Gs {
                     r(reg::FRAME_1 + 1),
                     r(reg::ALPHA_1),
                     r(reg::TEST_1),
+                    r(reg::FOGCOL),
                 ];
-                let vertex = |p: &Vertex| [p.x, p.y, p.z, u32::from_le_bytes(p.rgba)];
+                let vertex = |p: &Vertex| [p.x, p.y, p.z, u32::from_le_bytes(p.rgba), u32::from(p.fog)];
                 hits.push((std::array::from_fn(|i| vertex(&v[i])), regs));
             }
         }
@@ -453,21 +504,48 @@ impl Gs {
         }
     }
 
-    /// Whether a texel at that Q is filtered (bilinear): the level of
-    /// detail decides between the magnifying and the minifying filter.
-    fn linear(tex: &Texture, q: f64) -> bool {
-        let lod = if tex.lcm {
+    /// The level of detail at that Q (TEX1's LCM, L and K).
+    fn lod(tex: &Texture, q: f64) -> f64 {
+        if tex.lcm {
             tex.k
         } else {
             (1.0 / q.abs()).log2() * f64::from(1 << tex.l) + tex.k
-        };
-        if lod <= 0.0 { tex.mag_linear } else { tex.min_linear }
+        }
     }
 
-    /// The texel at (u, v), filtered or not, as RGBA8.
+    /// The texel at (u, v), filtered or not, as RGBA8. The level of detail
+    /// chooses the magnifying filter (0 or less) or the minifying one, and
+    /// with MMIN 2 to 5 a mipmap: the nearest level (2, 4), or the two
+    /// around it blended in sixteenths (3, 5), up to MXL.
     fn sample(&self, tex: &Texture, (u, v, q): (f64, f64, f64)) -> [u32; 4] {
-        if !Self::linear(tex, q) {
-            return self.texel(tex, u.floor() as i32, v.floor() as i32);
+        let lod = Self::lod(tex, q);
+        if lod <= 0.0 || tex.mmin < 2 || tex.mmin > 5 || tex.mxl == 0 {
+            let linear = if lod <= 0.0 { tex.mag_linear } else { tex.min_linear };
+            return self.sample_level(tex, 0, u, v, linear);
+        }
+        let linear = tex.mmin >= 4;
+        let mxl = tex.mxl as i32;
+        if tex.mmin & 1 == 0 {
+            let level = ((lod + 0.5).floor() as i32).min(mxl);
+            return self.sample_level(tex, level as u32, u, v, linear);
+        }
+        let m = lod.floor() as i32;
+        if m >= mxl {
+            return self.sample_level(tex, mxl as u32, u, v, linear);
+        }
+        let f = ((lod - f64::from(m)) * 16.0).floor() as u32;
+        let near = self.sample_level(tex, m as u32, u, v, linear);
+        let far = self.sample_level(tex, m as u32 + 1, u, v, linear);
+        std::array::from_fn(|c| (near[c] * (16 - f) + far[c] * f) >> 4)
+    }
+
+    /// The texel at (u, v) (level 0's texels) in a level, point sampled or
+    /// bilinear.
+    fn sample_level(&self, tex: &Texture, level: u32, u: f64, v: f64, linear: bool) -> [u32; 4] {
+        let scale = f64::from(1u32 << level);
+        let (u, v) = (u / scale, v / scale);
+        if !linear {
+            return self.texel(tex, level, u.floor() as i32, v.floor() as i32);
         }
         // Bilinear: the four texels around (u - 0.5, v - 0.5), weighted
         // with 4 fractional bits; a coordinate a hair under a sixteenth
@@ -476,10 +554,10 @@ impl Gs {
         let fu = ((u - 0.5) * 16.0 + SIXTEENTH_SLACK).floor() as i32;
         let fv = ((v - 0.5) * 16.0 + SIXTEENTH_SLACK).floor() as i32;
         let (u0, v0, a, b) = (fu >> 4, fv >> 4, (fu & 15) as u32, (fv & 15) as u32);
-        let t00 = self.texel(tex, u0, v0);
-        let t10 = self.texel(tex, u0 + 1, v0);
-        let t01 = self.texel(tex, u0, v0 + 1);
-        let t11 = self.texel(tex, u0 + 1, v0 + 1);
+        let t00 = self.texel(tex, level, u0, v0);
+        let t10 = self.texel(tex, level, u0 + 1, v0);
+        let t01 = self.texel(tex, level, u0, v0 + 1);
+        let t11 = self.texel(tex, level, u0 + 1, v0 + 1);
         std::array::from_fn(|c| {
             let top = t00[c] * (16 - a) + t10[c] * a;
             let bottom = t01[c] * (16 - a) + t11[c] * a;
@@ -497,11 +575,29 @@ impl Gs {
         }
     }
 
-    /// A texel as RGBA8 (alpha 0x80 is 1.0).
-    fn texel(&self, tex: &Texture, u: i32, v: i32) -> [u32; 4] {
-        let u = Self::wrap(tex.wms, u, tex.w, tex.minu, tex.maxu);
-        let v = Self::wrap(tex.wmt, v, tex.h, tex.minv, tex.maxv);
-        let raw = self.mem.read(tex.psm, tex.tbp, tex.tbw, u as u32, v as u32);
+    /// A level's texel as RGBA8 (alpha 0x80 is 1.0). Levels above 0 halve
+    /// the size and the region clamp's bounds each.
+    fn texel(&self, tex: &Texture, level: u32, u: i32, v: i32) -> [u32; 4] {
+        let (tbp, tbw, w, h, minu, maxu, minv, maxv) = if level == 0 {
+            (tex.tbp, tex.tbw, tex.w, tex.h, tex.minu, tex.maxu, tex.minv, tex.maxv)
+        } else {
+            let (tbp, tbw) = tex.mips[level as usize - 1];
+            let n = level as i32;
+            let clamped = |c: i32, wm: u32| if wm == 2 { c >> n } else { c };
+            (
+                tbp,
+                tbw,
+                (tex.w >> n).max(1),
+                (tex.h >> n).max(1),
+                clamped(tex.minu, tex.wms),
+                clamped(tex.maxu, tex.wms),
+                clamped(tex.minv, tex.wmt),
+                clamped(tex.maxv, tex.wmt),
+            )
+        };
+        let u = Self::wrap(tex.wms, u, w, minu, maxu);
+        let v = Self::wrap(tex.wmt, v, h, minv, maxv);
+        let raw = self.mem.read(tex.psm, tbp, tbw, u as u32, v as u32);
         let c = match tex.psm {
             psm::CT32 => raw,
             psm::CT24 => {

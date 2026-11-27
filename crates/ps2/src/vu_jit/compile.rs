@@ -1477,11 +1477,7 @@ impl Emitter {
                     e.simd(simd::I32X4_SPLAT);
                 });
             }
-            // MFP, XTOP, XITOP
-            0x64 if ft != 0 => self.store_masked(vf(ft), mask, |e| {
-                e.load_vu_i32(field(offset_of!(Vu, p)));
-                e.simd(simd::I32X4_SPLAT);
-            }),
+            // XTOP, XITOP (MFP is the interpreter's: P's pending result).
             0x68 => self.set_vi(it, |e| {
                 e.code
                     .local_get(e.vu)
@@ -1492,8 +1488,8 @@ impl Emitter {
                     .local_get(e.vu)
                     .mem(op::I32_LOAD16_U, 1, field(offset_of!(Vu, itop)));
             }),
-            // The random numbers, XGKICK, the EFU: the interpreter's.
-            0x40..=0x43 | 0x6C | 0x70..=0x7E => self.helper(instr, pc),
+            // The random numbers, MFP, XGKICK, the EFU: the interpreter's.
+            0x40..=0x43 | 0x64 | 0x6C | 0x70..=0x7E => self.helper(instr, pc),
             _ => {}
         }
     }

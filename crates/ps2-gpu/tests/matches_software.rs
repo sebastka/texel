@@ -259,3 +259,39 @@ fn bilinear_triangle() {
     }
     check(gs);
 }
+
+/// A 16×16 CT32 texture at page 4 with mipmap levels after it (TEX1's
+/// MTBA lays out levels 1 to 3), and the given MMIN; MXL 3, MMAG linear.
+fn mipmapped_texture(gs: &mut Gs, mmin: u64) {
+    for (bp, w) in [(128u64, 16u64), (132, 8), (133, 4)] {
+        let texels: Vec<u64> = (0..w * w / 2)
+            .map(|i| (0x8000_0000 | (i * 0x0507_0B0D + bp)) | ((0x8000_0000 | (i * 0x0D0B_0705 + 0x40_2010)) << 32))
+            .collect();
+        upload(gs, bp, psm::CT32, w, w, &texels);
+    }
+    gs.write_reg(reg::TEX1_1, (3 << 2) | (1 << 5) | (mmin << 6) | (1 << 9));
+    gs.write_reg(
+        reg::TEX0_1,
+        128 | (1 << 14) | (4 << 26) | (4 << 30) | (1 << 34) | (1 << 35),
+    );
+}
+
+#[test]
+fn mipmapped_triangles() {
+    for mmin in 2..=5 {
+        let mut gs = gs();
+        mipmapped_texture(&mut gs, mmin);
+        // STQ, its Q falling from 1 to 1/8 and less: every level.
+        gs.write_reg(reg::PRIM, 3 | (1 << 4));
+        for (x, y, s, t, q) in [
+            (0u32, 0u32, 0.0f32, 0.0f32, 1.0f32),
+            (63, 4, 0.2, 0.0, 0.125),
+            (10, 63, 0.0, 0.05, 0.05),
+        ] {
+            gs.write_reg(reg::ST, u64::from(s.to_bits()) | (u64::from(t.to_bits()) << 32));
+            gs.write_reg(reg::RGBAQ, 0x8080_8080 | (u64::from(q.to_bits()) << 32));
+            gs.write_reg(reg::XYZ2, xyz(x, y));
+        }
+        check(gs);
+    }
+}

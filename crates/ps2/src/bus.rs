@@ -632,7 +632,7 @@ impl Bus {
                 let mode = self.reg(GIF_MODE);
                 let mut stat = (mode & 1) | u32::from(self.vif1.mask_path3) << 1 | (mode & 4);
                 if self.path3_waiting() {
-                    let qwc = self.reg(GIF_BASE + QWC) & 0xFFFF;
+                    let qwc = self.qwc(GIF_BASE);
                     let fifo = if qwc == 0 { 16 } else { qwc.min(16) };
                     stat |= 1 << 5 | 1 << 6 | fifo << 24;
                 }
@@ -651,6 +651,10 @@ impl Bus {
                 let vif = if pa == VIF0_STAT { &self.vif0 } else { &self.vif1 };
                 self.regs.get(&pa).copied().unwrap_or(0) | u32::from(vif.int) << 11 | u32::from(vif.stalled) << 10
             }
+            // The VIFs' CODE: the last VIFcode. Batman: Vengeance's
+            // interrupt lifts VIF1's stall only after its own marker code.
+            VIF0_CODE => self.vif0.code,
+            VIF1_CODE => self.vif1.code,
             IPU_CMD => self.ipu.read_cmd().0,
             IPU_CMD_HI => u32::from(self.ipu.read_cmd().1) << 31,
             IPU_CTRL => self.ipu.read_ctrl(),
@@ -666,6 +670,9 @@ impl Bus {
             MCH_RICM | MCH_STATUS => 0,
             MCH_DRD => self.mch.read_drd(),
             D_ENABLER => self.d_enable,
+            // A channel's QWC: 16 bits (it holds 0x10000 a moment after a
+            // start in normal mode with none: 0 to the EE).
+            _ if pa & 0xFF == QWC && dma_channel(pa & !0xFF).is_some() => self.reg(pa) & 0xFFFF,
             _ => match self.regs.get(&pa) {
                 Some(&v) => v,
                 None => {
@@ -757,6 +764,12 @@ impl Bus {
                     let bp = self.ipu.read_bp();
                     log.push((*taken, bp, u64::from(ifc) << 8 | u64::from(fp) | 1 << 62));
                 }
+                // QWC is 16 bits.
+                let value = if pa & 0xFF == QWC && dma_channel(pa & !0xFF).is_some() {
+                    value & 0xFFFF
+                } else {
+                    value
+                };
                 self.regs.insert(pa, value);
                 if let Some(ch @ (SIF0 | SIF1)) = started {
                     self.iop.sif.log_tag(
@@ -780,6 +793,15 @@ impl Bus {
                         let chain = value >> 2 & 3 == 1;
                         let qwc = self.reg(pa + QWC) & 0xFFFF;
                         self.chain_end[ch as usize] = chain && qwc > 0 && (end_tag || irq);
+                        // Started in normal mode with no quadwords, a
+                        // channel moves one, then its count wraps round
+                        // and it moves 0xFFFF more (PCSX2's notes, from
+                        // hardware tests). Kya's movie player starts the
+                        // IPU's input so once a movie's data is all sent,
+                        // and its last FDEC needs those quadwords.
+                        if value >> 2 & 3 == 0 && qwc == 0 && ch != SIF0 && ch != SIF1 {
+                            self.regs.insert(pa + QWC, 0x1_0000);
+                        }
                         self.chain_stack[ch as usize].clear();
                         *self.dma_starts.entry((pa, value & 0x4C)).or_insert(0) += 1;
                         match ch {
@@ -855,6 +877,8 @@ const VIF1_STAT: u32 = 0x1000_3C00;
 const VIF1_FBRST: u32 = 0x1000_3C10;
 const VIF0_ERR: u32 = 0x1000_3820;
 const VIF1_ERR: u32 = 0x1000_3C20;
+const VIF0_CODE: u32 = 0x1000_3880;
+const VIF1_CODE: u32 = 0x1000_3C80;
 const IPU_CMD: u32 = 0x1000_2000;
 const IPU_CMD_HI: u32 = 0x1000_2004;
 const IPU_CTRL: u32 = 0x1000_2010;
@@ -878,6 +902,12 @@ impl Bus {
 
     fn reg(&self, pa: u32) -> u32 {
         self.regs.get(&pa).copied().unwrap_or(0)
+    }
+
+    /// A channel's quadwords left: 16 bits as the EE writes them, or 0x10000
+    /// after a start in normal mode with none (see `hw_write32`).
+    fn qwc(&self, base: u32) -> u32 {
+        self.reg(base + QWC) & 0x1_FFFF
     }
 
     fn dma_complete(&mut self, ch: u32) {
@@ -996,7 +1026,7 @@ impl Bus {
         self.ipu = ipu;
         // Channel 3: the output into memory, in normal mode.
         while self.reg(IPU_FROM) & CHCR_STR != 0 {
-            let qwc = self.reg(IPU_FROM + QWC) & 0xFFFF;
+            let qwc = self.qwc(IPU_FROM);
             if qwc == 0 {
                 self.dma_complete(3);
                 break;
@@ -1021,7 +1051,7 @@ impl Bus {
                 return None;
             }
             let chain = (chcr >> 2) & 3 == 1;
-            let qwc = self.reg(IPU_TO + QWC) & 0xFFFF;
+            let qwc = self.qwc(IPU_TO);
             if qwc == 0 {
                 if !chain || self.chain_end[4] {
                     self.dma_complete(4);
@@ -1196,7 +1226,7 @@ impl Bus {
             }
             let chcr = self.reg(base);
             let chain = (chcr >> 2) & 3 == 1 && ch != 8;
-            let qwc = self.reg(base + QWC) & 0xFFFF;
+            let qwc = self.qwc(base);
             if qwc == 0 {
                 if !chain || self.chain_end[ch as usize] {
                     break;
@@ -1424,6 +1454,24 @@ mod tests {
         assert!(!bus.pal());
     }
 
+    /// A channel started in normal mode with no quadwords moves 0x10000:
+    /// one, then its count wraps round (the IPU's input, here, which takes
+    /// what its FIFO holds).
+    #[test]
+    fn a_normal_start_without_quadwords_moves_0x10000() {
+        let mut bus = Bus::new(&[]);
+        bus.write32(D_CTRL, 1);
+        bus.write32(IPU_TO + MADR, 0x2000);
+        bus.write32(IPU_TO + QWC, 0);
+        bus.write32(IPU_TO, 0x101);
+        assert_ne!(bus.read32(IPU_TO) & CHCR_STR, 0);
+        let (fifo, fp) = bus.ipu.counts();
+        let taken = fifo + fp;
+        assert!(taken > 0);
+        assert_eq!(bus.read32(IPU_TO + QWC), 0x1_0000 - taken);
+        assert_eq!(bus.read32(IPU_TO + MADR), 0x2000 + 16 * taken);
+    }
+
     /// Stopping a running channel by writing CHCR leaves its other fields:
     /// the chain mode and the last tag, which a restart goes on from.
     #[test]
@@ -1594,6 +1642,18 @@ mod tests {
         assert_eq!(bus.read32(GIF_STAT) & 0xE00, 0xE00);
         bus.advance(1);
         assert_eq!(bus.read32(GIF_STAT) & 0xE00, 0);
+    }
+
+    /// VIF1_CODE is the last VIFcode: here a NOP with its IRQ bit, which
+    /// stalls VIF1 (STAT's VIS) until STC.
+    #[test]
+    fn vif_code_is_the_last_vifcode() {
+        let mut bus = Bus::new(&[]);
+        bus.write128(0x1000_5000, 0x8080_0001);
+        assert_eq!(bus.read32(VIF1_CODE), 0x8080_0001);
+        assert_ne!(bus.read32(VIF1_STAT) & 1 << 10, 0);
+        bus.write32(VIF1_FBRST, 8);
+        assert_eq!(bus.read32(VIF1_STAT) & 1 << 10, 0);
     }
 
     #[test]

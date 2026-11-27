@@ -58,6 +58,13 @@ pub struct Ee {
     /// the EE is found polling it (see `note_poll`).
     poll: (u32, u32),
     pub(crate) polling: bool,
+    /// A DI ran: Status.EIE is cleared after the next instruction (the
+    /// DI's write lands an instruction late, so that instruction still
+    /// reads EIE set: the kernel's return to a new program reads Status
+    /// right after a DI and writes it back, leaving interrupts enabled,
+    /// which Jak X's start-up code requires).
+    #[serde(default)]
+    pub(crate) pending_di: bool,
     /// Diagnostics: an instruction to stop at, and the registers the first
     /// time the interpreter reached it.
     #[serde(skip)]
@@ -67,6 +74,19 @@ pub struct Ee {
     pub break_if: Option<(usize, u32)>,
     #[serde(skip)]
     pub break_regs: Option<Box<[u128; 32]>>,
+    /// Diagnostics, when on: at this instruction, how many times each
+    /// (ra, a0, a1, a2, a3) came by.
+    #[serde(skip)]
+    pub arg_log: Option<(u32, Box<ArgLog>)>,
+    /// Diagnostics, when on: how many times the interpreter ran each
+    /// instruction, by address.
+    #[serde(skip)]
+    pub pc_counts: Option<Box<std::collections::HashMap<u32, u64>>>,
+    /// Diagnostics, when on: each change of Status.EIE by a COP0
+    /// instruction (MTC0, EI, DI): the instruction's address, the new
+    /// Status.
+    #[serde(skip)]
+    pub eie_log: Option<Vec<(u32, u32)>>,
     /// An interrupt waits for the next read of INTC_STAT: the EE stops
     /// right after it (as when polling), and the interrupt is taken there.
     #[serde(skip)]
@@ -98,7 +118,7 @@ pub struct Ee {
     #[serde(skip)]
     pub trace: std::collections::VecDeque<(u32, u32, u32, u32)>,
     /// Diagnostics, when on: every syscall by number (v1) and address:
-    /// how many, the last a0, the cycle of the last.
+    /// how many, the last a0, the cycle of the last, the last a1.
     #[serde(skip)]
     pub syscalls: Option<SyscallLog>,
     /// Diagnostics, when on: an address, and its 32-bit loads by EE
@@ -111,7 +131,7 @@ pub struct Ee {
 pub type ReadWatch = (u32, BTreeMap<u32, (u64, u32, u32)>);
 
 /// See `Ee::syscalls`.
-pub type SyscallLog = BTreeMap<(u32, u32), (u64, u32, u64)>;
+pub type SyscallLog = BTreeMap<(u32, u32), (u64, u32, u64, u32)>;
 
 const TRACE_LEN: usize = 64;
 
@@ -131,6 +151,9 @@ fn sext16(v: u16) -> u64 {
     v as i16 as i64 as u64
 }
 
+/// See `Ee::arg_log`: (ra, a0, a1, a2, a3), and how many times.
+pub type ArgLog = std::collections::BTreeMap<[u32; 5], u64>;
+
 impl Ee {
     pub fn new() -> Self {
         Self {
@@ -144,7 +167,11 @@ impl Ee {
             break_at: None,
             break_if: None,
             break_regs: None,
+            arg_log: None,
+            pc_counts: None,
+            eie_log: None,
             delay_pending: false,
+            pending_di: false,
             in_delay: false,
             cop0: Cop0::new(),
             fpu: fpu::Fpu::default(),
@@ -248,10 +275,10 @@ impl Ee {
         self.trace
             .push_back((e as u32, self.current_pc, self.r32(3), self.r32(4)));
         if e == Exception::Syscall {
-            let (n, a0, pc, now) = (self.r32(3), self.r32(4), self.current_pc, self.cycles);
+            let (n, a0, a1, pc, now) = (self.r32(3), self.r32(4), self.r32(5), self.current_pc, self.cycles);
             if let Some(log) = &mut self.syscalls {
                 let entry = log.entry((n, pc)).or_default();
-                *entry = (entry.0 + 1, a0, now);
+                *entry = (entry.0 + 1, a0, now, a1);
             }
         }
         let c = &mut self.cop0;
@@ -298,7 +325,7 @@ impl Ee {
 
     /// Whether the EE spins in its idle loop: then only time passes.
     pub fn idling(&self) -> bool {
-        matches!(self.idle, Some((a, b)) if self.pc >= a && self.pc <= b && !self.delay_pending)
+        matches!(self.idle, Some((a, b)) if self.pc >= a && self.pc <= b && !self.delay_pending && !self.pending_di)
     }
 
     /// Time passes in the idle loop, without running it.
@@ -342,14 +369,25 @@ impl Ee {
         {
             self.break_regs = Some(Box::new(self.gpr));
         }
+        if let Some(counts) = &mut self.pc_counts {
+            *counts.entry(self.pc).or_insert(0) += 1;
+        }
+        if let Some((pc, log)) = &mut self.arg_log
+            && *pc == self.pc
+        {
+            let g = |r: usize| self.gpr[r] as u32;
+            *log.entry([g(31), g(4), g(5), g(6), g(7)]).or_insert(0) += 1;
+        }
         self.in_delay = self.delay_pending;
         self.delay_pending = false;
+        let di = std::mem::take(&mut self.pending_di);
         let instr = match self.cop0.translate(self.pc, false) {
             Ok(pa) => bus.read32(pa),
             Err(fault) => {
                 self.tlb_fault(self.pc, false, fault);
                 self.cycles += 1;
                 self.unticked += 1;
+                self.land_di(di);
                 return;
             }
         };
@@ -358,6 +396,20 @@ impl Ee {
         self.execute(instr, bus);
         self.cycles += 1;
         self.unticked += 1;
+        self.land_di(di);
+    }
+
+    /// The write of a DI run before the instruction just run (see
+    /// `pending_di`).
+    fn land_di(&mut self, di: bool) {
+        if di {
+            self.cop0.regs[cop0::STATUS] &= !cop0::STATUS_EIE;
+            if let Some(log) = &mut self.eie_log
+                && log.len() < 1000
+            {
+                log.push((self.current_pc, self.cop0.regs[cop0::STATUS]));
+            }
+        }
     }
 
     fn execute(&mut self, i: u32, bus: &mut Bus) {
@@ -855,6 +907,18 @@ impl Ee {
 
     fn cop0_op(&mut self, i: u32, rs: u32, rt: u32, rd: u32, bus: &mut Bus) {
         self.flush_ticks();
+        let eie = self.cop0.regs[cop0::STATUS] & cop0::STATUS_EIE;
+        self.cop0_op_inner(i, rs, rt, rd, bus);
+        let status = self.cop0.regs[cop0::STATUS];
+        if let Some(log) = &mut self.eie_log
+            && status & cop0::STATUS_EIE != eie
+            && log.len() < 1000
+        {
+            log.push((self.current_pc, status));
+        }
+    }
+
+    fn cop0_op_inner(&mut self, i: u32, rs: u32, rt: u32, rd: u32, bus: &mut Bus) {
         match rs {
             0x00 => {
                 let v = self.cop0.read(rd, i & 0x7FF);
@@ -882,7 +946,7 @@ impl Ee {
                     self.delay_pending = false;
                 }
                 0x38 => self.cop0.ei(),
-                0x39 => self.cop0.di(),
+                0x39 => self.pending_di |= self.cop0.may_toggle_interrupts(),
                 _ => self.unimplemented("COP0 ?"),
             },
             _ => self.unimplemented("COP0 ?"),

@@ -95,14 +95,49 @@ impl Cop0 {
         enabled && self.regs[CAUSE] & s & 0x8C00 != 0
     }
 
-    /// Count runs at the CPU clock; reaching Compare raises IP7.
+    /// Count runs at the CPU clock; reaching Compare raises IP7. The
+    /// performance counters count too.
     pub fn tick(&mut self, cycles: u32) {
+        self.count_performance(cycles);
         let before = self.regs[COUNT];
         let after = before.wrapping_add(cycles);
         self.regs[COUNT] = after;
         let compare = self.regs[COMPARE];
         if compare.wrapping_sub(before).wrapping_sub(1) < cycles {
             self.set_ip(7, true);
+        }
+    }
+
+    /// The performance counters (PCR0 and PCR1), when PCCR's CTE is set:
+    /// each counts its event in the modes PCCR selects for it (EXL, kernel,
+    /// supervisor, user). Processor cycles and completed instructions (one
+    /// a cycle here) are counted; other events (cache misses, issue
+    /// details) are not modelled. Spyro: Enter the Dragonfly times its
+    /// frames with PCR0 counting cycles: without it, its time stands
+    /// still (its fade-in never ends).
+    fn count_performance(&mut self, cycles: u32) {
+        let pccr = self.perf[0];
+        if pccr & (1 << 31) == 0 {
+            return;
+        }
+        let s = self.regs[STATUS];
+        // The mode bit of counter 0: EXL (bit 1), K (2), S (3), U (4);
+        // counter 1's are 10 bits higher.
+        let mode = if s & (STATUS_EXL | STATUS_ERL) != 0 {
+            1
+        } else {
+            match (s & KSU) >> 3 {
+                0 => 2,
+                1 => 3,
+                _ => 4,
+            }
+        };
+        for (n, shift) in [(1, 0), (2, 10)] {
+            let event = (pccr >> (5 + shift)) & 0x1F;
+            // 1: processor cycles; 12 and 13: instructions completed.
+            if pccr & (1 << (mode + shift)) != 0 && matches!(event, 1 | 12 | 13) {
+                self.perf[n] = self.perf[n].wrapping_add(cycles);
+            }
         }
     }
 
@@ -151,7 +186,7 @@ impl Cop0 {
     }
 
     /// EI and DI work in kernel mode, during exceptions, or with EDI set.
-    fn may_toggle_interrupts(&self) -> bool {
+    pub fn may_toggle_interrupts(&self) -> bool {
         let s = self.regs[STATUS];
         s & STATUS_EDI != 0 || s & (STATUS_EXL | STATUS_ERL) != 0 || s & KSU == 0
     }
@@ -159,12 +194,6 @@ impl Cop0 {
     pub fn ei(&mut self) {
         if self.may_toggle_interrupts() {
             self.regs[STATUS] |= STATUS_EIE;
-        }
-    }
-
-    pub fn di(&mut self) {
-        if self.may_toggle_interrupts() {
-            self.regs[STATUS] &= !STATUS_EIE;
         }
     }
 
@@ -218,5 +247,34 @@ impl Cop0 {
 impl Default for Cop0 {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn performance_counters_count_cycles_in_their_modes() {
+        let mut c = Cop0::new();
+        // User mode, out of exceptions.
+        c.regs[STATUS] = 2 << 3;
+        // PCR0: cycles in EXL, kernel and user modes; PCR1: no event
+        // (Spyro: Enter the Dragonfly's setting).
+        c.write(25, 0, 0x8008_2036);
+        c.write(25, 1, 0);
+        c.write(25, 3, 0);
+        c.tick(1000);
+        assert_eq!(c.read(25, 1), 1000);
+        assert_eq!(c.read(25, 3), 0);
+        // Not in supervisor mode.
+        c.regs[STATUS] = 1 << 3;
+        c.tick(500);
+        assert_eq!(c.read(25, 1), 1000);
+        // Nothing without CTE.
+        c.regs[STATUS] = 2 << 3;
+        c.write(25, 0, 0x0008_2036);
+        c.tick(500);
+        assert_eq!(c.read(25, 1), 1000);
     }
 }

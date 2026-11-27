@@ -60,6 +60,10 @@ pub struct Sio2 {
     /// The first memory card commands, for diagnostics.
     #[serde(skip)]
     pub card_log: Vec<Exchange>,
+    /// Diagnostics, when on: the controllers' commands other than polls,
+    /// the first 500.
+    #[serde(skip)]
+    pub pad_log: Option<Vec<Exchange>>,
     /// Register accesses, for diagnostics: (write, offset, value), the
     /// first ones after transfer 20.
     #[serde(skip)]
@@ -86,6 +90,7 @@ impl Default for Sio2 {
             transfers: 0,
             log: VecDeque::new(),
             card_log: Vec::new(),
+            pad_log: None,
             trace: Vec::new(),
         }
     }
@@ -272,6 +277,13 @@ impl Sio2 {
         let got: Vec<u8> = self.fifo_out.iter().skip(out_before).copied().collect();
         if port >= 2 && self.card_log.len() < 200 {
             self.card_log.push((port, send, receive, bytes.clone(), got.clone()));
+        }
+        if let Some(log) = &mut self.pad_log
+            && port < 2
+            && bytes.get(1) != Some(&0x42)
+            && log.len() < 500
+        {
+            log.push((port, send, receive, bytes.clone(), got.clone()));
         }
         self.log.push_back((port, send, receive, bytes, got));
     }

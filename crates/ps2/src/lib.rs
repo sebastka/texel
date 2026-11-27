@@ -48,6 +48,10 @@ pub struct Ps2 {
     pub iop: Cpu,
     /// IOP cycles owed: the IOP runs an eighth as fast as the EE.
     iop_budget: i64,
+    /// Instructions the IOP ran (diagnostics: its idle loop's time passes
+    /// without them).
+    #[serde(skip)]
+    pub iop_ran: u64,
     /// Fast boot: the executable EELOAD is to start instead of the browser,
     /// until it does; and where EELOAD keeps its target.
     boot: Option<String>,
@@ -122,6 +126,7 @@ impl Ps2 {
             bus,
             iop,
             iop_budget: 0,
+            iop_ran: 0,
             boot: None,
             boot_slot: None,
             boot_failed: false,
@@ -358,7 +363,14 @@ impl Ps2 {
                 if let Some(p) = &mut self.iop_printf {
                     p.check(&self.iop, &self.bus.iop.ram);
                 }
-                self.iop_budget -= i64::from(self.iop.step(&mut self.bus.iop));
+                // A cycle an instruction: the PlayStation's memory waits
+                // (`Cpu::step`'s count) would make the IOP about four times
+                // slower in its kernel's interrupt paths, and starve its
+                // low-priority threads under heavy RPC traffic (Jak X's
+                // ISO thread behind DBCMAN's pad server; see D103).
+                self.iop.step(&mut self.bus.iop);
+                self.iop_ran += 1;
+                self.iop_budget -= 1;
                 // After a first step (which takes a pending interrupt), the
                 // idle loop's time passes without running it.
                 if first && self.iop_idle() {

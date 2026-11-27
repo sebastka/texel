@@ -31,8 +31,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => return Err("not a PlayStation 2 BIOS".into()),
     }
     let mut ps2 = Ps2::new(&bios);
-    if std::env::var("CDVDREADS").is_ok() {
-        ps2.bus.iop.cdvd.read_log = Some(Vec::new());
+    // PADLOG=1: the controllers' commands other than polls.
+    if std::env::var("PADLOG").is_ok() {
+        ps2.bus.iop.sio2.pad_log = Some(Vec::new());
     }
     // What the IOP's modules print; IOPCALLS=1: their calls to the linked
     // imports too.
@@ -41,6 +42,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         && let Some(p) = &mut ps2.iop_printf
     {
         p.calls = Some(Default::default());
+        // IOPPCS=1: the IOP's busiest instructions over the run.
+        if std::env::var("IOPPCS").is_ok() {
+            p.pcs = Some(Default::default());
+        }
+        // IOPTRACE=from,to (hex): the last calls from callers there, in
+        // order, with a0, a1 and sp (which tells threads apart).
+        if let Some((a, b)) = std::env::var("IOPTRACE").ok().and_then(|v| {
+            let (a, b) = v.split_once(',')?;
+            Some((u32::from_str_radix(a, 16).ok()?, u32::from_str_radix(b, 16).ok()?))
+        }) {
+            p.trace = Some(texel_ps2::iop_printf::CallTrace {
+                from: a,
+                to: b,
+                ..Default::default()
+            });
+        }
     }
     // NOGFX=1: draw nothing (faster, when frames do not matter).
     if std::env::var("NOGFX").is_ok() {
@@ -69,6 +86,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ps2.load_state(&std::fs::read(&path)?)?;
         println!("Loaded {path}");
     }
+    // CDVDREADS=1: the drive's reads (after a state is loaded: it would
+    // drop the log).
+    if std::env::var("CDVDREADS").is_ok() {
+        ps2.bus.iop.cdvd.read_log = Some(Vec::new());
+    }
     // IPUTRACE=path: the IPU's input stream (path.bin) and its commands
     // (path.txt), for another decoder to compare.
     if std::env::var("IPUTRACE").is_ok() {
@@ -89,6 +111,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let (r, x) = v.split_once('=')?;
         Some((r.parse().ok()?, u32::from_str_radix(x, 16).ok()?))
     });
+    // EIELOG=1: each change of Status.EIE (by MTC0, EI or DI), with the
+    // instruction's address.
+    if std::env::var("EIELOG").is_ok() {
+        ps2.ee.eie_log = Some(Vec::new());
+    }
+    // PCCOUNT=path: how many times each EE instruction ran, saved there
+    // at the end (address and count, a line each).
+    if std::env::var("PCCOUNT").is_ok() {
+        ps2.ee.pc_counts = Some(Box::default());
+    }
+    // ARGLOG=pc (hex): each (ra, a0-a3) that instruction ran with, and
+    // how often (a function's callers and arguments).
+    if let Some(pc) = std::env::var("ARGLOG")
+        .ok()
+        .and_then(|v| u32::from_str_radix(&v, 16).ok())
+    {
+        ps2.ee.arg_log = Some((pc, Box::default()));
+    }
+    // TEXSNAP=TEX0 (hex): that texture as the first draw with it samples
+    // it, CLUT applied, saved to texsnap.ppm at the end.
+    if let Some(t) = std::env::var("TEXSNAP")
+        .ok()
+        .and_then(|v| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok())
+    {
+        ps2.bus.gs.tex_snap = Some((t, None));
+    }
+    // TIMERLOG=1: the IOP timers' register writes (timer, register, value,
+    // count then).
+    if std::env::var("TIMERLOG").is_ok() {
+        ps2.bus.iop.timers.log = Some(Vec::new());
+    }
     ps2.ee.break_at = std::env::var("BREAK")
         .ok()
         .and_then(|v| u32::from_str_radix(&v, 16).ok());
@@ -119,6 +172,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // EXC).
     if std::env::var("SYSCALLS").is_ok() {
         ps2.ee.syscalls = Some(Default::default());
+    }
+    // GIFTAGS=1: the GIF tags seen, by path (after the run).
+    if std::env::var("GIFTAGS").is_ok() {
+        ps2.bus.gif.tag_log = Some(Vec::new());
+    }
+    // GSREG=hex: the values written to that GS register (after the run).
+    if let Some(r) = std::env::var("GSREG")
+        .ok()
+        .and_then(|v| u8::from_str_radix(&v, 16).ok())
+    {
+        ps2.bus.gs.reg_log = Some((r, Vec::new()));
     }
     // ADDRWATCH=from,to (hex): the EE instructions (or DMA channels,
     // 0xDA00000n) storing there.
@@ -182,6 +246,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut sound: Vec<i16> = Vec::new();
     let total = (seconds * EE_CLOCK as f64) as u64;
     let started = std::time::Instant::now();
+    let iop_ran_before = ps2.iop_ran;
     let (mut ee_printed, mut iop_printed) = (0, 0);
     let mut out = std::io::stdout();
     // Run in tenths of a second, printing the debug port as it fills.
@@ -217,6 +282,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Some((at.parse().ok()?, button))
         })
         .collect();
+    let mut break_saved = false;
     while done < total {
         let now = done as f64 / EE_CLOCK as f64;
         let held = presses
@@ -225,6 +291,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .fold(0, |acc, (_, b)| acc | b);
         ps2.set_pad(0, held, [0x80; 4]);
         ps2.run(slice.min(total - done));
+        // BREAKRAM=path: the EE's memory when BREAK's instruction ran,
+        // saved there once (as near as a slice).
+        if ps2.ee.break_regs.is_some()
+            && !break_saved
+            && let Ok(path) = std::env::var("BREAKRAM")
+        {
+            std::fs::write(&path, &ps2.bus.ram)?;
+            break_saved = true;
+        }
         ps2.bus.iop.spu2.drain_output(&mut sound);
         done += slice;
         if let Some(dir) = &shots
@@ -259,14 +334,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         dump_draws(&mut ps2, n);
     }
     // Where the EE spends its time now: a sample of PCs.
+    // NOSAMPLE=1: skip these samples (they run the EE and the IOP alone,
+    // without timers: dumps then show the state the run ended in).
+    let samples = if std::env::var("NOSAMPLE").is_ok() { 0 } else { 1 };
     let mut pcs: BTreeMap<u32, u32> = BTreeMap::new();
-    for _ in 0..20_000 {
+    for _ in 0..20_000 * samples {
         ps2.ee.step(&mut ps2.bus);
         *pcs.entry(ps2.ee.pc).or_insert(0) += 1;
     }
     // And the IOP's.
     let mut iop_pcs: BTreeMap<u32, u32> = BTreeMap::new();
-    for _ in 0..200_000 {
+    for _ in 0..200_000 * samples {
         ps2.iop.step(&mut ps2.bus.iop);
         *iop_pcs.entry(ps2.iop.pc).or_insert(0) += 1;
     }
@@ -278,6 +356,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         done as f64 / elapsed / 1e6
     );
     println!("PC {:08X}, frames {}", ps2.ee.pc, ps2.bus.frames);
+    // The IOP's busy time (its idle loop's is skipped, not counted).
+    println!(
+        "IOP busy {:.1}% of its {} cycles",
+        (ps2.iop_ran - iop_ran_before) as f64 * 100.0 / (done / 8) as f64,
+        done / 8
+    );
     let (lo, hi) = (
         pcs.keys().next().copied().unwrap_or(0),
         pcs.keys().last().copied().unwrap_or(0),
@@ -324,9 +408,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("  {:08X}: {:08X}", 0x8000_0000 | x, ps2.bus.read32(x));
         }
     }
-    // IOPRAM=path: the IOP's memory, saved there (to disassemble).
+    // IOPRAM=path: the IOP's memory, saved there (to disassemble);
+    // EERAM=path: the EE's.
     if let Ok(path) = std::env::var("IOPRAM") {
         std::fs::write(&path, &ps2.bus.iop.ram)?;
+    }
+    if let Ok(path) = std::env::var("EERAM") {
+        std::fs::write(&path, &ps2.bus.ram)?;
+    }
+    if let (Ok(path), Some(counts)) = (std::env::var("PCCOUNT"), &ps2.ee.pc_counts) {
+        let mut counts: Vec<_> = counts.iter().collect();
+        counts.sort();
+        let text: String = counts.iter().map(|(pc, n)| format!("{pc:08X} {n}\n")).collect();
+        std::fs::write(&path, text)?;
     }
     // IOPFIND=imm: IOP loads and stores with that offset.
     if let Some(imm) = std::env::var("IOPFIND")
@@ -413,9 +507,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let [sr, cause, epc, bad] = ps2.iop.cop0_state();
     println!(
-        "IOP PC {:08X}; Status {sr:08X} Cause {cause:08X} EPC {epc:08X} BadVaddr {bad:08X}; ra {:08X}",
+        "IOP PC {:08X}; Status {sr:08X} Cause {cause:08X} EPC {epc:08X} BadVaddr {bad:08X}; ra {:08X}; cache control {:08X}",
         ps2.iop.pc,
-        ps2.iop.reg(31)
+        ps2.iop.reg(31),
+        ps2.bus.iop.cache_ctrl
     );
     if std::env::var("DUMP").is_ok() {
         // The hottest 4 KiB pages, then the hottest addresses.
@@ -447,6 +542,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let ago = (p.now - at) as f64 * 512.0 / 294_912_000.0;
             println!("  IOP call {lib}#{n} from {ra:08X}: {count} times, last a0 {a0:08X}, {ago:.2} s ago");
         }
+        if let Some(pcs) = &p.pcs {
+            let mut pages: BTreeMap<u32, u64> = BTreeMap::new();
+            for (pc, n) in pcs {
+                *pages.entry(pc & !0xFF).or_insert(0) += n;
+            }
+            let mut pages: Vec<_> = pages.into_iter().collect();
+            pages.sort_by_key(|p| std::cmp::Reverse(p.1));
+            println!(
+                "IOP instructions run, by 256-byte page: {:X?}",
+                &pages[..pages.len().min(30)]
+            );
+        }
+        if let Some(t) = &p.trace {
+            println!(
+                "IOP calls from {:08X}-{:08X}, in order (the last {}):",
+                t.from,
+                t.to,
+                t.calls.len()
+            );
+            for (at, lib, n, ra, a0, a1, sp) in &t.calls {
+                let ago = (p.now - at) as f64 * 512.0 / 294_912_000.0;
+                println!("  {ago:8.4} s ago sp {sp:08X}: {lib}#{n} from {ra:08X} ({a0:08X}, {a1:08X})");
+            }
+        }
     }
     // VU1MEM=from,to (hex, quadwords): VU1's data memory there, at the end.
     if let Some((a, b)) = std::env::var("VU1MEM").ok().and_then(|v| {
@@ -456,6 +575,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ps2.bus.sync_vu1(texel_ps2::vu1q::Why::VuMemory);
         for q in a..b {
             println!("  VU1 {q:03x}: {:08x?}", ps2.bus.vu1.read_q(q));
+        }
+    }
+    if let Some(log) = &ps2.bus.gif.tag_log {
+        println!("GIF tags (path, tag without NLOOP, count):");
+        for (path, tag, n) in log {
+            println!(
+                "  path {} {:016x} {:016x}: {n}",
+                path + 1,
+                *tag as u64,
+                (*tag >> 64) as u64
+            );
+        }
+    }
+    if let Some((r, seen)) = &ps2.bus.gs.reg_log {
+        println!("GS register {r:#04x} written:");
+        for (v, n) in seen {
+            println!("  {v:016X}: {n} times");
         }
     }
     if let Some((a, b, hits)) = &ps2.bus.addr_watch {
@@ -468,8 +604,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("Triangles over {at:?}: {}", hits.len());
         for (v, r) in hits.iter().rev().take(40).rev() {
             println!(
-                "  {v:x?} PRIM {:x} TEX0 {:x} {:x} FRAME {:x} {:x} ALPHA {:x} TEST {:x}",
-                r[0], r[1], r[2], r[3], r[4], r[5], r[6]
+                "  {v:x?} PRIM {:x} TEX0 {:x} {:x} FRAME {:x} {:x} ALPHA {:x} TEST {:x} FOGCOL {:x}",
+                r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7]
             );
         }
     }
@@ -483,12 +619,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("  {pc:08X}: {n} times, last {last:08X}, bits seen {any:08X}");
         }
     }
+    if let Some(log) = &ps2.ee.eie_log {
+        for (pc, status) in log {
+            println!("  EIE {} at {pc:08X}: Status {status:08X}", (status >> 16) & 1);
+        }
+    }
     if let Some(log) = &ps2.ee.syscalls {
         let now = ps2.ee.cycles;
-        for ((n, pc), (count, a0, at)) in log {
+        for ((n, pc), (count, a0, at, a1)) in log {
             let ago = (now - at) as f64 / 294_912_000.0;
             println!(
-                "  syscall {:3} ({n:08X}) at {pc:08X}: {count} times, last a0 {a0:08X}, {ago:.2} s ago",
+                "  syscall {:3} ({n:08X}) at {pc:08X}: {count} times, last a0 {a0:08X}, {ago:.2} s ago, a1 {a1:08X}",
                 *n as i32
             );
         }
@@ -531,7 +672,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ps2.bus.register(0x1000_E000),
         ps2.bus.register(0x1000_E020)
     );
-    println!("IOP SIF writes: {:X?}", sif.iop_writes);
+    println!(
+        "SIF register writes (EE ones at 0x1000 + offset): {:X?}",
+        sif.iop_writes
+    );
     if std::env::var("PACKETS").is_ok() {
         for (dir, p) in &sif.packets {
             println!("  {dir}: {p:08X?}");
@@ -564,6 +708,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("IOP DMA ch{n} busy {c:08X?}");
         }
     }
+    println!(
+        "IOP DMA completions pending (channel, IOP cycles): {:?}; SPU2 auto-DMA {:?}",
+        d.pending, d.adma
+    );
     let i = &ps2.bus.iop.intc;
     println!("IOP INTC stat {:08X} mask {:08X} ctrl {:X}", i.stat, i.mask, i.ctrl);
     let raised: Vec<(usize, u64)> = i.counts.iter().copied().enumerate().filter(|(_, n)| *n > 0).collect();
@@ -597,6 +745,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ps2.bus.register(0x1000_A030),
         ps2.bus.register(0x1000_E000)
     );
+    if let Some((code, opt)) = ps2.bus.ipu.command() {
+        let (fifo, decoder) = ps2.bus.ipu.counts();
+        let [a, b, c, d, e] =
+            [0x1000_B000, 0x1000_B020, 0x1000_B400, 0x1000_B410, 0x1000_B420].map(|a| ps2.bus.read32(a));
+        println!(
+            "  IPU waits in command {code:X} ({opt:07X}), input {fifo}+{decoder} quadwords; from IPU CHCR {a:08X} QWC {b:X}; to IPU CHCR {c:08X} MADR {d:08X} QWC {e:X}"
+        );
+    }
     let ipu = &ps2.bus.ipu;
     println!(
         "IPU commands (BCLR IDEC BDEC VDEC FDEC SETIQ SETVQ CSC PACK SETTH) {:?}, errors {}, busy {}, output {} quadwords",
@@ -605,6 +761,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ipu.busy(),
         ipu.output.len()
     );
+    if let Some((_, Some((w, h, texels)))) = &ps2.bus.gs.tex_snap {
+        let mut out = format!("P6\n{w} {h}\n255\n").into_bytes();
+        for t in texels {
+            out.extend_from_slice(&[*t as u8, (t >> 8) as u8, (t >> 16) as u8]);
+        }
+        std::fs::write("texsnap.ppm", out)?;
+        let mut alpha = format!("P5\n{w} {h}\n255\n").into_bytes();
+        alpha.extend(texels.iter().map(|t| (t >> 24).min(255) as u8));
+        std::fs::write("texsnap_alpha.pgm", alpha)?;
+        println!("Texture snapped: {w}x{h}, texsnap.ppm");
+    }
+    if let Some(log) = &ps2.bus.iop.timers.log {
+        println!("IOP timer writes ({}):", log.len());
+        let shown: Vec<_> = log.iter().filter(|e| e.0 != 4).collect();
+        for (t, r, v, c) in &shown[shown.len().saturating_sub(300)..] {
+            println!("  timer {t} reg {r:X} = {v:08X} (count {c:X})");
+        }
+    }
+    if let Some((pc, log)) = &ps2.ee.arg_log {
+        println!("Calls at {pc:08X} (ra, a0, a1, a2, a3: count), {} kinds:", log.len());
+        for (k, n) in log.iter().take(200) {
+            println!(
+                "  {:08X} {:08X} {:08X} {:08X} {:08X}: {n}",
+                k[0], k[1], k[2], k[3], k[4]
+            );
+        }
+    }
     if let (Some(pc), Some(regs)) = (ps2.ee.break_at, &ps2.ee.break_regs) {
         println!("Registers at {pc:08X}:");
         for (k, r) in regs.iter().enumerate() {
@@ -789,6 +972,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("  SIO2 {} {off:02X} {v:08X}", if *w { "W" } else { "R" });
         }
     }
+    if let Some(log) = &ps2.bus.iop.sio2.pad_log {
+        for (port, send, receive, out, back) in log {
+            println!("  pad port {port} {send}/{receive}: {out:02X?} -> {back:02X?}");
+        }
+    }
     if std::env::var("CARDLOG").is_ok() {
         for (port, send, receive, out, back) in &ps2.bus.iop.sio2.card_log {
             println!("  card port {port} {send}/{receive}: {out:02X?} -> {back:02X?}");
@@ -825,6 +1013,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if let Some(log) = &ps2.bus.iop.cdvd.read_log {
         for &(cmd, lsn, count, left, waiting) in log {
+            if cmd == 0xFB {
+                println!("  SPU2 ADMAS write at {lsn:03X}: {count:04X}");
+                continue;
+            }
             if cmd == 0xFC {
                 println!("    words {lsn:08X} {count:08X} {left:08X} {waiting:08X}");
                 continue;
@@ -1235,13 +1427,13 @@ fn dump_draws(ps2: &mut Ps2, frames: u64) {
         let mut list: Vec<_> = groups.into_iter().collect();
         list.sort_by_key(|(_, (n, _))| std::cmp::Reverse(*n));
         println!("--- draws by state ({} states):", list.len());
-        for ((kind, flags, tex0, tex1, alpha, test, frame), (n, vs)) in list.iter().take(24) {
+        for ((kind, flags, tex0, tex1, alpha, test, frame), (n, vs)) in list.iter().take(200) {
             println!(
                 "  {n:5} kind {kind} prim flags {flags:#05x} TEX0 {tex0:#018x} TEX1 {tex1:#x} ALPHA {alpha:#012x} TEST {test:#07x} FRAME {frame:#012x}"
             );
             for v in vs {
                 println!(
-                    "        vertex xy {:.2},{:.2} z {:#x} rgba {:?} st {:.4},{:.4} q {:.3} uv {:.2},{:.2}",
+                    "        vertex xy {:.2},{:.2} z {:#x} rgba {:?} st {:.4e},{:.4e} q {:.4e} uv {:.2},{:.2}",
                     f64::from(v.x) / 16.0,
                     f64::from(v.y) / 16.0,
                     v.z,

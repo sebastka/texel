@@ -224,3 +224,23 @@ fn multiply_accumulate_mmi() {
     assert_eq!((ee.lo >> 96) as u32, 0);
     assert_eq!((ee.hi >> 96) as u32, -1i32 as u32);
 }
+
+/// DI's write lands an instruction late: the next instruction still reads
+/// EIE set (and writing that back keeps interrupts enabled, as the kernel
+/// does when it starts a program).
+#[test]
+fn di_lands_an_instruction_late() {
+    let di = 0x4200_0039;
+    // MFC0 r1, Status (rd 12); then a NOP.
+    let mfc0 = (0x10 << 26) | (1 << 16) | (12 << 11);
+    let (ee, _) = run(&[di, mfc0, 0], 2, |ee, _| {
+        ee.cop0.regs[cop0::STATUS] = cop0::STATUS_EIE;
+    });
+    assert_ne!(ee.gpr[1] as u32 & cop0::STATUS_EIE, 0);
+    assert_eq!(ee.cop0.regs[cop0::STATUS] & cop0::STATUS_EIE, 0);
+    // In user mode without EDI, DI does nothing.
+    let (ee, _) = run(&[di, 0, 0], 2, |ee, _| {
+        ee.cop0.regs[cop0::STATUS] = cop0::STATUS_EIE | 2 << 3;
+    });
+    assert_ne!(ee.cop0.regs[cop0::STATUS] & cop0::STATUS_EIE, 0);
+}

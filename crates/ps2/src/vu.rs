@@ -241,6 +241,10 @@ pub struct Vu {
     pub top: u16,
     pub itop: u16,
     pub pending_q: PendingQ,
+    /// An EFU result not in P yet, and the cycle it lands at (see
+    /// `special2`); within a program only (it lands when the program ends).
+    #[serde(skip)]
+    pub(crate) pending_p: Option<(u32, u32)>,
     /// Cycles run (instructions and stalls), and when each VF register's
     /// pending result is ready, with the lanes it writes: an instruction
     /// reading one sooner stalls, the hardware's way, which Q's latency
@@ -329,6 +333,7 @@ impl Vu {
             top: 0,
             itop: 0,
             pending_q: PendingQ::default(),
+            pending_p: None,
             cycle: 0,
             vf_ready: [0; 32],
             vf_mask: [0; 32],
@@ -451,6 +456,18 @@ impl Vu {
         if self.pending_q.left != 0 {
             self.q = self.pending_q.value;
             self.pending_q = PendingQ::default();
+        }
+        self.land_p(true);
+    }
+
+    /// The pending EFU result lands in P: when its cycle has come, or at
+    /// once (`now`: WAITP, the next EFU operation, the program's end).
+    fn land_p(&mut self, now: bool) {
+        if let Some((value, at)) = self.pending_p
+            && (now || self.cycle.wrapping_sub(at) as i32 >= 0)
+        {
+            self.p = value;
+            self.pending_p = None;
         }
     }
 
@@ -963,7 +980,10 @@ impl Vu {
             0x41 => self.set_vf(ft, mask, [self.r; 4]),
             0x42 => self.r = 0x3F80_0000 | (vfs[fsf] & 0x7F_FFFF),
             0x43 => self.r = 0x3F80_0000 | ((self.r ^ vfs[fsf]) & 0x7F_FFFF),
-            0x64 => self.set_vf(ft, mask, [self.p; 4]),
+            0x64 => {
+                self.land_p(false);
+                self.set_vf(ft, mask, [self.p; 4]);
+            }
             0x68 => self.set_vi(it, self.top),
             0x69 => self.set_vi(it, self.itop),
             0x6C => {
@@ -991,10 +1011,25 @@ impl Vu {
                     }
                 }
             }
-            // The EFU: results in P at once.
+            // WAITP: P gets the EFU's result.
+            0x7B => self.land_p(true),
+            // The EFU: its result lands in P after its latency (the VU
+            // User's Manual's list, in cycles); P has no interlock: an MFP
+            // sooner reads the P before (only WAITP waits). A new operation
+            // waits for the one under way (it lands first).
             0x70..=0x7E => {
+                self.land_p(true);
                 let v = vfs.map(val);
                 let e = val(vfs[fsf]);
+                let latency = match op {
+                    0x70 => 11,
+                    0x71 | 0x72 | 0x79 => 18,
+                    0x73 => 24,
+                    0x74 | 0x75 | 0x7D => 54,
+                    0x7C => 29,
+                    0x7E => 44,
+                    _ => 12,
+                };
                 let p = match op {
                     0x70 => v[0] * v[0] + v[1] * v[1] + v[2] * v[2],
                     0x71 => 1.0 / (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]),
@@ -1009,9 +1044,9 @@ impl Vu {
                     0x7C => e.sin(),
                     0x7D => e.atan(),
                     0x7E => (-e).exp(),
-                    _ => val(self.p),
+                    _ => return,
                 };
-                self.p = res(p).0;
+                self.pending_p = Some((res(p).0, self.cycle.wrapping_add(latency)));
             }
             _ => {}
         }
@@ -1171,6 +1206,32 @@ mod tests {
             );
             assert_eq!(vu.vf[6], f([want; 4]), "stall: {reads_vf3}");
         }
+    }
+
+    /// An EFU result lands in P after its latency, with no interlock: an
+    /// MFP right after ERCPR reads the P before; after WAITP, the new one
+    /// (the VU User's Manual's WAITP example).
+    #[test]
+    fn efu_results_land_in_p_later() {
+        // ERCPR P, vf1x; MFP.xyzw vf6, P; WAITP; MFP.xyzw vf7, P.
+        let ercpr = (0x40 << 25) | (1 << 11) | (0x1E << 6) | 0x3E;
+        let mfp = |ft: u32| (0x40 << 25) | (0xF << 21) | (ft << 16) | (0x19 << 6) | 0x3C;
+        let waitp = (0x40 << 25) | (0x1E << 6) | 0x3F;
+        let vu = run(
+            &[
+                (NOP, ercpr),
+                (NOP, mfp(6)),
+                (NOP, waitp),
+                (NOP | E, mfp(7)),
+                (NOP, LNOP),
+            ],
+            |vu| {
+                vu.vf[1] = f([4.0; 4]);
+                vu.p = 1f32.to_bits();
+            },
+        );
+        assert_eq!(vu.vf[6], f([1.0; 4]));
+        assert_eq!(vu.vf[7], f([0.25; 4]));
     }
 
     /// In macro mode (the EE's COP2), a VMULQ right after a VDIV reads the

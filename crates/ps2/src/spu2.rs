@@ -260,11 +260,13 @@ impl Spu2 {
         let mut out = String::new();
         for core in 0..2 {
             out += &format!(
-                "SPU2 core {core}: ATTR {:04x} IRQA {:05x} ENDX {:06x} STATX {:04x}\n",
+                "SPU2 core {core}: ATTR {:04x} IRQA {:05x} ENDX {:06x} STATX {:04x} ADMAS {:04x}, auto-DMA samples queued {}\n",
                 self.core_reg(core, reg::ATTR),
                 self.core_addr(core, reg::IRQA),
                 self.cores[core].endx,
-                self.cores[core].statx
+                self.cores[core].statx,
+                self.core_reg(core, reg::ADMAS),
+                self.cores[core].adma.len()
             );
             for (i, v) in self.cores[core].voices.iter().enumerate() {
                 if v.phase != Phase::Off {

@@ -301,6 +301,7 @@ impl Ee {
             if slot.va == self.pc
                 && slot.func != 0
                 && !self.delay_pending
+                && !self.pending_di
                 && slot.mapping == self.cop0.mapping()
                 && u64::from(slot.len) <= left
             {
@@ -329,7 +330,9 @@ impl Ee {
     /// Runs the block at pc if it is compiled and fits in `left` cycles
     /// (compiling it if it is hot): the instructions it ran.
     fn run_block(&mut self, jit: &mut Jit, bus: &mut Bus, left: u64) -> Option<u32> {
-        if self.delay_pending {
+        // In a delay slot, or after a DI (whose write lands after the
+        // next instruction): the interpreter's.
+        if self.delay_pending || self.pending_di {
             jit.stats.delay += 1;
             return None;
         }
@@ -474,6 +477,6 @@ pub mod helpers {
         ee.in_delay = flags & 1 != 0;
         ee.delay_pending = false;
         ee.execute(instr, bus);
-        u32::from(ee.pc != p || ee.next_pc != n || ee.delay_pending || ee.polling)
+        u32::from(ee.pc != p || ee.next_pc != n || ee.delay_pending || ee.polling || ee.pending_di)
     }
 }

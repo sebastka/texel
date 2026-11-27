@@ -41,6 +41,9 @@ pub struct Gif {
     pub find: Option<(u32, u32)>,
     #[serde(skip)]
     pub found: Vec<usize>,
+    /// Diagnostics: the GIF tags seen, by path, and how many times each.
+    #[serde(skip)]
+    pub tag_log: Option<Vec<(usize, u128, u64)>>,
     /// In a `Vu1Engine`: the quadwords received, recorded rather than
     /// sent to the GS (their tags are still read, for where an XGKICK's
     /// packet ends).
@@ -62,6 +65,17 @@ impl Gif {
             c.path(path, qword);
             Self::skip(&mut self.paths[path], qword);
             return;
+        }
+        if self.paths[path].nloop == 0
+            && let Some(log) = self.tag_log.as_mut()
+        {
+            // The tag without its loop count (to fold repeats).
+            let key = qword & !0x7FFF;
+            if let Some(e) = log.iter_mut().find(|(q, k, _)| *q == path && *k == key) {
+                e.2 += 1;
+            } else if log.len() < 256 {
+                log.push((path, key, 1));
+            }
         }
         let p = &mut self.paths[path];
         if p.nloop == 0 {
@@ -102,7 +116,7 @@ impl Gif {
     }
 
     /// A tag: the packet's loops, format and registers; the PRIM it sets,
-    /// if any.
+    /// if any (PACKED only).
     fn tag(p: &mut Path, qword: u128) -> Option<u64> {
         let lo = qword as u64;
         p.nloop = (lo & 0x7FFF) as u32;
@@ -114,7 +128,10 @@ impl Gif {
         };
         p.regs = (qword >> 64) as u64;
         p.index = 0;
-        (lo & (1 << 46) != 0).then_some((lo >> 47) & 0x7FF)
+        // PRE: the PRIM field goes to PRIM, in PACKED mode only (REGLIST
+        // and IMAGE ignore it: TOCA Race Driver 2's text, sent in REGLIST
+        // after a PRIM write of its own, has PRE set with a PRIM of 0).
+        (lo & (1 << 46) != 0 && p.format == 0).then_some((lo >> 47) & 0x7FF)
     }
 
     /// Where a quadword leaves its path, as `write` would, writing nothing.
@@ -337,5 +354,24 @@ mod tests {
         assert!(gif.idle(2));
         assert_eq!(gs.mem.read(0, 0, 1, 1, 1), 0x4030_2010);
         assert_eq!(gs.mem.read(0, 0, 1, 3, 3), 0);
+    }
+
+    /// A REGLIST tag's PRIM field is ignored, PRE or not: PRIM stays as a
+    /// register list set it.
+    #[test]
+    fn reglist_tags_leave_prim() {
+        let mut gs = Gs::default();
+        let mut gif = Gif::default();
+        // REGLIST, NLOOP 1, 2 registers: PRIM (sprite), RGBAQ.
+        gif.write(2, 1 | (1u128 << 58) | (2u128 << 60) | (0x10u128 << 64), &mut gs);
+        gif.write(2, 6, &mut gs);
+        assert_eq!(gs.regs[usize::from(reg::PRIM)], 6);
+        // REGLIST with PRE and a PRIM field of 0 (a point): ignored.
+        gif.write(
+            2,
+            1 | (1 << 15) | (1 << 46) | (1u128 << 58) | (2u128 << 60) | (0x55u128 << 64),
+            &mut gs,
+        );
+        assert_eq!(gs.regs[usize::from(reg::PRIM)], 6);
     }
 }
