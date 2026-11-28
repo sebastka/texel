@@ -26,7 +26,7 @@ getrandom = "0.4.3"
 hex = "0.4.3"
 # zlib's interface to resume decompressing mid-stream (zipped images' seek
 # indexes): the same Rust implementation as flate2's.
-libz-rs-sys = { version = "0.6.8", default-features = false, features = ["std", "rust-allocator"] }
+libz-rs-sys = { version = "0.6.9", default-features = false, features = ["std", "rust-allocator"] }
 quick-xml = "0.42.0"
 ring = "0.17.14"
 reqwest = { version = "0.13.5", default-features = false, features = ["rustls-no-provider", "json", "http2", "query", "form"] }
